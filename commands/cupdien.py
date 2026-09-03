@@ -883,7 +883,81 @@ def register(
                     user_id,
                     customer=customer
                 )
+                                # ============================================================
+                # KIỂM TRA NGAY - KHÔNG BẬT THEO DÕI
+                # ============================================================
 
+                if mode in ("instant_customer", "instant_both"):
+
+                    await event.edit(
+                        "⏳ <b>ĐANG KIỂM TRA...</b>\n\n"
+                        f"🆔 Mã KH: <code>{esc(customer)}</code>\n"
+                        + (
+                            f"📍 Khu vực: <b>{esc(area_name)}</b>\n"
+                            if area_name else ""
+                        ),
+                        parse_mode="html"
+                    )
+
+                    try:
+
+                        tu_ngay, den_ngay = date_range()
+
+                        result = await get_by_customer(
+                            customer,
+                            tu_ngay,
+                            den_ngay
+                        )
+
+                        text = format_result(
+                            result,
+                            area_name=area_name,
+                            customer=customer
+                        )
+
+                        clear_session(
+                            bot,
+                            user_id
+                        )
+
+                        await event.edit(
+                            text,
+                            buttons=[
+                                [
+                                    Button.inline(
+                                        "🔙 Quay lại",
+                                        b"power:instant"
+                                    )
+                                ]
+                            ],
+                            parse_mode="html"
+                        )
+
+                    except Exception as e:
+
+                        clear_session(
+                            bot,
+                            user_id
+                        )
+
+                        await event.edit(
+                            "❌ <b>Không thể kiểm tra</b>\n\n"
+                            f"🆔 Mã KH: <code>{esc(customer)}</code>\n\n"
+                            f"⚠️ <code>{esc(e)}</code>",
+                            buttons=[
+                                [
+                                    Button.inline(
+                                        "🔙 Quay lại",
+                                        b"power:instant"
+                                    )
+                                ]
+                            ],
+                            parse_mode="html"
+                        )
+
+                    await event.answer()
+
+                    return
                 # ------------------------------------------------
                 # CUSTOMER ONLY
                 # ------------------------------------------------
@@ -1216,60 +1290,7 @@ def register(
                     "mode"
                 ) == "instant_customer"
 
-                if instant:
-
-                    clear_session(
-                        bot,
-                        user_id
-                    )
-
-                    await event.edit(
-                        "⏳ <b>ĐANG KIỂM TRA...</b>\n\n"
-                        f"🆔 <code>{esc(customer)}</code>",
-                        parse_mode="html"
-                    )
-
-                    try:
-
-                        tu_ngay, den_ngay = date_range()
-
-                        result = await get_by_customer(
-                            customer,
-                            tu_ngay,
-                            den_ngay
-                        )
-
-                        text = format_result(
-                            result,
-                            area_name=area_name,
-                            customer=customer
-                        )
-
-                        await event.edit(
-                            text,
-                            buttons=[
-                                [
-                                    Button.inline(
-                                        "🔙 Quay lại",
-                                        b"power:instant"
-                                    )
-                                ]
-                            ],
-                            parse_mode="html"
-                        )
-
-                    except Exception as e:
-
-                        await event.edit(
-                            "❌ <b>Không thể kiểm tra</b>\n\n"
-                            f"🆔 <code>{esc(customer)}</code>\n\n"
-                            f"⚠️ <code>{esc(e)}</code>",
-                            parse_mode="html"
-                        )
-
-                    await event.answer()
-
-                    return
+                
 
             # =================================================
             # INSTANT BOTH

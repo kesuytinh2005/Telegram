@@ -144,37 +144,38 @@ async def stop_user_tasks(user_id: int):
 # REPLACE USER TASK
 # ============================================================
 
-async def replace_user_tasks(
-    user_id: int,
-    coro,
-) -> asyncio.Task:
+async def replace_user_tasks(user_id: int, coro=None):
     """
-    Hủy task cũ của user rồi tạo task mới.
+    Hủy task cũ của user.
 
-    Ví dụ:
+    Nếu có coro:
+        - Hủy task cũ
+        - Tạo task mới
 
-        await replace_user_tasks(
-            user_id,
-            download_worker(...)
-        )
+    Nếu không có coro:
+        - Chỉ hủy task cũ
 
-    Khi lệnh mới chạy:
-        task cũ -> CANCEL
-        task mới -> RUN
+    Dùng được cho cả:
+
+        await replace_user_tasks(user_id)
+
+    và:
+
+        await replace_user_tasks(user_id, worker())
     """
 
     async with _TASK_LOCK:
 
-        # ----------------------------------------------------
+        # ====================================================
         # HỦY TASK CŨ
-        # ----------------------------------------------------
+        # ====================================================
 
         old_task = _USER_TASKS.pop(user_id, None)
 
         if old_task is not None and not old_task.done():
 
             logger.info(
-                "[TASK MANAGER] Replacing old task of user %s",
+                "[TASK MANAGER] Cancelling old task of user %s",
                 user_id
             )
 
@@ -182,18 +183,32 @@ async def replace_user_tasks(
 
             try:
                 await old_task
+
             except asyncio.CancelledError:
                 pass
+
             except Exception as e:
                 logger.warning(
-                    "[TASK MANAGER] Old task user %s error: %s",
+                    "[TASK MANAGER] Old task %s stopped with error: %s",
                     user_id,
                     e,
                 )
 
-        # ----------------------------------------------------
+        # ====================================================
+        # KHÔNG CÓ TASK MỚI
+        # ====================================================
+
+        if coro is None:
+            logger.info(
+                "[TASK MANAGER] User %s: old task stopped",
+                user_id
+            )
+
+            return None
+
+        # ====================================================
         # TẠO TASK MỚI
-        # ----------------------------------------------------
+        # ====================================================
 
         task = asyncio.create_task(coro)
 
@@ -204,7 +219,7 @@ async def replace_user_tasks(
         )
 
         logger.info(
-            "[TASK MANAGER] Started new task for user %s",
+            "[TASK MANAGER] User %s: new task started",
             user_id
         )
 

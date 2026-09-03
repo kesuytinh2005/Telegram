@@ -230,34 +230,54 @@ async def replace_user_tasks(user_id: int, coro=None):
 # TRACK CURRENT TASK
 # ============================================================
 
-def track_current_task(
-    user_id: int,
-    task: asyncio.Task,
-):
+def track_current_task(user_id: int, task=None):
     """
-    Đăng ký một asyncio.Task đã được tạo từ bên ngoài.
+    Đăng ký task hiện tại của user.
 
-    Dùng khi code hiện tại của bạn đã có:
+    Có thể gọi cả 2 kiểu:
 
-        task = asyncio.create_task(...)
+        track_current_task(user_id)
+
+    hoặc:
+
+        track_current_task(user_id, task)
+
+    Nếu không truyền task -> tự lấy asyncio.current_task().
     """
+
+    if task is None:
+        task = asyncio.current_task()
+
+    if task is None:
+        logger.warning(
+            "[TASK MANAGER] Cannot find current task for user %s",
+            user_id
+        )
+        return None
 
     old_task = _USER_TASKS.get(user_id)
 
+    # Nếu task cũ khác task hiện tại thì hủy task cũ
     if old_task is not None and old_task is not task:
+
         if not old_task.done():
             old_task.cancel()
 
     _USER_TASKS[user_id] = task
 
-    task.add_done_callback(
-        lambda t: _task_done_callback(user_id, t)
-    )
+    # Chỉ thêm callback nếu chưa hoàn thành
+    if not task.done():
+        task.add_done_callback(
+            lambda t: _task_done_callback(user_id, t)
+        )
 
     logger.info(
-        "[TASK MANAGER] Tracking task for user %s",
-        user_id
+        "[TASK MANAGER] Tracking task for user %s: %s",
+        user_id,
+        task.get_name()
     )
+
+    return task
 
 
 # ============================================================

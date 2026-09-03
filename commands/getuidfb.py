@@ -656,7 +656,37 @@ def esc(value):
         str(value)
     )
 
+# ============================================================
+# LỌC FACEBOOK UID SAU KHI API TRẢ RESULT
+# ============================================================
 
+def clean_facebook_uid(value):
+
+    if value is None:
+        return None
+
+    # Chuyển về string
+    value = str(value).strip()
+
+    if not value:
+        return None
+
+    # Chỉ lấy chuỗi số liên tục
+    match = re.search(
+        r"(?<!\d)\d+(?!\d)",
+        value
+    )
+
+    if not match:
+        return None
+
+    uid = match.group(0)
+
+    # Facebook UID phải là số
+    if not uid.isdigit():
+        return None
+
+    return uid
 # ============================================================
 # FORMAT KẾT QUẢ
 # ============================================================
@@ -1064,6 +1094,31 @@ def register(
                     url,
                     notify_bot
                 )
+
+                # ============================================================
+                # LỌC UID SAU KHI GET RESULT
+                # Không thay đổi API / get_uid()
+                # ============================================================
+
+                if result.get("uid"):
+
+                    clean_uid = clean_facebook_uid(
+                        result.get("uid")
+                    )
+
+                    if clean_uid:
+
+                        result["uid"] = clean_uid
+                        result["success"] = True
+
+                    else:
+
+                        result["uid"] = None
+                        result["success"] = False
+
+                        result["error"] = (
+                            "UID trả về không hợp lệ."
+                        )
 
                 results.append(
                     result

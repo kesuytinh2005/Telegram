@@ -1,9 +1,14 @@
+# ============================================================
+# commands/__init__.py
+# ============================================================
+
 from commands import (
     start,
     stop,
     download,
     getuidfb,
     cupdien,
+    tiktok,
 )
 
 
@@ -18,6 +23,7 @@ def register_all(
         download,
         getuidfb,
         cupdien,
+        tiktok,
     ]
 
     for module in modules:

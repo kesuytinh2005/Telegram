@@ -1,11 +1,21 @@
 # ============================================================
 # commands/download.py
-# DRAGON BOT - DOWNLOAD
+# DRAGON BOT - DOWNLOAD CENTER
+#
+# TikTok:
+#   /download
+#       -> TikTok
+#           -> Tải video
+#           -> Tải profile / playlist
+#
+# TikTok playlist/profile sẽ gọi trực tiếp tiktok.py
 # ============================================================
 
 import os
 import re
 import asyncio
+import inspect
+
 import yt_dlp
 
 from datetime import datetime
@@ -13,12 +23,15 @@ from datetime import datetime
 from telethon import events, Button
 from telethon.tl.types import DocumentAttributeVideo
 
+from core.task_manager import (
+    replace_user_tasks,
+    track_current_task,
+)
+
 
 # ============================================================
 # COMMAND INFO
 # ============================================================
-
-from core.task_manager import replace_user_tasks, track_current_task
 
 COMMAND_INFO = {
     "command": "download",
@@ -26,7 +39,8 @@ COMMAND_INFO = {
     "title": "Tải Video",
 
     "description": (
-        "Tải video từ nhiều nền tảng bằng yt-dlp."
+        "Tải video từ nhiều nền tảng bằng yt-dlp "
+        "và module TikTok riêng."
     ),
 
     "usage": "/download",
@@ -37,10 +51,11 @@ COMMAND_INFO = {
 
     "details": [
         "Gửi /download để mở menu tải.",
-        "Có thể tải video đơn hoặc profile/playlist/channel.",
-        "TikTok profile chỉ cần nhập username.",
-        "YouTube channel có thể nhập @username.",
-        "Dùng /stop để thoát chế độ download.",
+        "TikTok video dùng trình tải video.",
+        "TikTok profile/playlist chạy bằng tiktok.py.",
+        "YouTube video dùng yt-dlp.",
+        "YouTube playlist/channel dùng yt-dlp.",
+        "Dùng /stop để dừng tiến trình.",
     ],
 
     "supported": [
@@ -85,7 +100,9 @@ def set_session(
         {}
     )
 
-    current.update(kwargs)
+    current.update(
+        kwargs
+    )
 
     return current
 
@@ -158,8 +175,8 @@ def tiktok_menu():
         ],
         [
             Button.inline(
-                "📚 Tải profile",
-                b"dl:tt_profile"
+                "📚 Tải profile / playlist",
+                b"dl:tt_playlist"
             ),
         ],
         [
@@ -208,7 +225,7 @@ MAIN_TEXT = """
 
 🎵 <b>TIKTOK</b>
 ├ 🎬 Tải video
-└ 📚 Tải profile bằng username
+└ 📚 Tải profile / playlist
 
 ▶️ <b>YOUTUBE</b>
 ├ 🎬 Tải video
@@ -241,19 +258,11 @@ def clean_username(text):
 
     text = text.strip()
 
-    text = text.replace(
-        "https://www.tiktok.com/@",
-        ""
-    )
-
-    text = text.replace(
-        "https://www.tiktok.com/",
-        ""
-    )
-
-    text = text.replace(
-        "http://www.tiktok.com/@",
-        ""
+    text = re.sub(
+        r"^https?://(www\.)?tiktok\.com/@?",
+        "",
+        text,
+        flags=re.I
     )
 
     text = text.replace(
@@ -299,7 +308,10 @@ def format_size(value):
     if not value:
         return "❓"
 
-    size = float(value)
+    try:
+        size = float(value)
+    except Exception:
+        return "❓"
 
     for unit in (
         "B",
@@ -310,7 +322,10 @@ def format_size(value):
     ):
 
         if size < 1024:
-            return f"{size:.2f} {unit}"
+
+            return (
+                f"{size:.2f} {unit}"
+            )
 
         size /= 1024
 
@@ -322,7 +337,10 @@ def format_duration(value):
     if not value:
         return "❓"
 
-    value = int(value)
+    try:
+        value = int(value)
+    except Exception:
+        return "❓"
 
     hours, remain = divmod(
         value,
@@ -335,6 +353,7 @@ def format_duration(value):
     )
 
     if hours:
+
         return (
             f"{hours}h "
             f"{minutes}m "
@@ -368,6 +387,7 @@ def make_caption(info):
             pass
 
     else:
+
         upload_date = "❓"
 
     tags = info.get(
@@ -458,29 +478,42 @@ def make_caption(info):
 def base_options():
 
     return {
-        "format": "bestvideo+bestaudio/best",
 
-        "merge_output_format": "mp4",
+        "format":
+            "bestvideo+bestaudio/best",
 
-        "quiet": True,
+        "merge_output_format":
+            "mp4",
 
-        "no_warnings": True,
+        "quiet":
+            True,
 
-        "ignoreerrors": False,
+        "no_warnings":
+            True,
 
-        "retries": 5,
+        "ignoreerrors":
+            False,
 
-        "fragment_retries": 5,
+        "retries":
+            5,
 
-        "file_access_retries": 5,
+        "fragment_retries":
+            5,
 
-        "extractor_retries": 3,
+        "file_access_retries":
+            5,
 
-        "socket_timeout": 30,
+        "extractor_retries":
+            3,
 
-        "concurrent_fragment_downloads": 1,
+        "socket_timeout":
+            30,
 
-        "noplaylist": True,
+        "concurrent_fragment_downloads":
+            1,
+
+        "noplaylist":
+            True,
 
         "outtmpl": (
             "downloads/"
@@ -500,16 +533,20 @@ def tiktok_options():
 
     options.update({
 
-        # TikTok thay đổi response khá thường xuyên
         "extractor_args": {
+
             "tiktok": {
+
                 "app_name": [
                     "musical_ly"
                 ],
-            }
+
+            },
+
         },
 
         "http_headers": {
+
             "User-Agent": (
                 "Mozilla/5.0 "
                 "(Linux; Android 15; Mobile) "
@@ -538,6 +575,7 @@ def youtube_options():
     options.update({
 
         "http_headers": {
+
             "User-Agent": (
                 "Mozilla/5.0 "
                 "(Linux; Android 15; Mobile) "
@@ -549,12 +587,17 @@ def youtube_options():
         },
 
         "extractor_args": {
+
             "youtube": {
+
                 "player_client": [
-                    "android",
+                    "android"
                 ]
+
             }
+
         },
+
     })
 
     return options
@@ -583,6 +626,7 @@ async def download_one(
     try:
 
         if options is None:
+
             options = base_options()
 
         os.makedirs(
@@ -730,13 +774,10 @@ async def download_one(
             f"[DOWNLOAD ERROR] {e}"
         )
 
-        error_text = str(e)
-
         await msg.edit(
             "❌ <b>KHÔNG THỂ TẢI VIDEO</b>\n\n"
-            f"⚠️ <code>{error_text[:2500]}</code>\n\n"
-            "💡 Nếu là TikTok, hãy thử lại sau "
-            "vài giây.",
+            f"⚠️ <code>{str(e)[:2500]}</code>\n\n"
+            "💡 Nếu là TikTok, hãy thử lại sau.",
             parse_mode="html"
         )
 
@@ -751,6 +792,7 @@ async def download_one(
                 if os.path.exists(
                     filepath
                 ):
+
                     os.remove(
                         filepath
                     )
@@ -790,52 +832,37 @@ async def process_tiktok_video(
 
 
 # ============================================================
-# TIKTOK PROFILE
+# TIKTOK PLAYLIST / PROFILE
+#
+# QUAN TRỌNG:
+#
+# Không xử lý TikTok profile tại đây.
+#
+# download.py chỉ gọi tiktok.py.
 # ============================================================
 
-# ============================================================
-# TIKTOK PROFILE
-# DOWNLOAD TOÀN BỘ VIDEO PROFILE
-# ============================================================
-
-# ============================================================
-# TIKTOK PROFILE
-# DOWNLOAD -> SEND NGAY -> DELETE
-# ============================================================
-
-# ============================================================
-# TIKTOK PROFILE
-# QUÉT LINK -> TẢI TỪNG VIDEO -> GỬI TELEGRAM -> XÓA FILE
-# ============================================================
-
-async def process_tiktok_profile(
+async def process_tiktok_playlist(
     event,
-    username,
+    text,
     bot,
     notify_bot=None
 ):
 
-    username = clean_username(
-        username
-    )
+    user_id = event.sender_id
 
-    if not username:
+    text = text.strip()
+
+    if not text:
 
         await event.reply(
-            "❌ <b>Username không hợp lệ.</b>",
+            "❌ <b>Username / link TikTok không hợp lệ.</b>",
             parse_mode="html"
         )
 
         return
 
-    user_id = event.sender_id
-
-    profile_url = (
-        f"https://www.tiktok.com/@{username}"
-    )
-
     # ========================================================
-    # SESSION
+    # KIỂM TRA SESSION
     # ========================================================
 
     session = get_session(
@@ -847,649 +874,326 @@ async def process_tiktok_profile(
 
         return
 
+    if not session.get(
+        "running",
+        False
+    ):
+
+        return
+
     # ========================================================
-    # MESSAGE
+    # IMPORT TIKTOK.PY
     # ========================================================
-
-    msg = await event.reply(
-        "╭────────────────────────────╮\n"
-        "│   📚 <b>TIKTOK PROFILE</b>   │\n"
-        "╰────────────────────────────╯\n\n"
-
-        f"👤 <b>Username:</b> "
-        f"<code>@{username}</code>\n\n"
-
-        "🔎 <b>Đang quét danh sách video...</b>\n"
-        "⏳ Vui lòng chờ...",
-        parse_mode="html"
-    )
-
-    temp_dir = None
 
     try:
 
-        # ====================================================
-        # BƯỚC 1
-        # CHỈ LẤY DANH SÁCH VIDEO
-        # ====================================================
-
-        scan_options = {
-            "extract_flat": True,
-            "quiet": True,
-        }
-
-        # ====================================================
-        # SCAN PROFILE
-        # ====================================================
-
-        def scan_profile():
-
-            with yt_dlp.YoutubeDL(
-                scan_options
-            ) as ydl:
-
-                return ydl.extract_info(
-                    profile_url,
-                    download=False
-                )
-
-        info = await asyncio.to_thread(
-            scan_profile
-        )
-
-        if not info:
-
-            await msg.edit(
-                "❌ <b>KHÔNG THỂ ĐỌC PROFILE</b>\n\n"
-                f"👤 <code>@{username}</code>\n\n"
-                "⚠️ yt-dlp không lấy được dữ liệu "
-                "từ TikTok.",
-                parse_mode="html"
-            )
-
-            return
-
-        # ====================================================
-        # LẤY ENTRIES
-        # ====================================================
-
-        entries = info.get(
-            "entries"
-        ) or []
-
-        # Loại entry rỗng
-        entries = [
-            entry
-            for entry in entries
-            if entry
-        ]
-
-        if not entries:
-
-            await msg.edit(
-                "⚠️ <b>KHÔNG TÌM THẤY VIDEO</b>\n\n"
-                f"👤 <code>@{username}</code>\n\n"
-                "TikTok không trả về danh sách video.",
-                parse_mode="html"
-            )
-
-            return
-
-        # ====================================================
-        # TÁCH URL VIDEO
-        #
-        # ƯU TIÊN webpage_url
-        # SAU ĐÓ url
-        # ====================================================
-
-        video_urls = []
-
-        for entry in entries:
-
-            video_url = (
-                entry.get("webpage_url")
-                or entry.get("url")
-            )
-
-            # ------------------------------------------------
-            # Một số trường hợp extract_flat chỉ trả về ID
-            # ------------------------------------------------
-
-            if (
-                not video_url
-                and entry.get("id")
-            ):
-
-                video_url = (
-                    f"https://www.tiktok.com/@{username}"
-                    f"/video/{entry['id']}"
-                )
-
-            if not video_url:
-                continue
-
-            # ------------------------------------------------
-            # Nếu URL không phải HTTP
-            # thì bỏ
-            # ------------------------------------------------
-
-            if not str(
-                video_url
-            ).startswith(
-                (
-                    "http://",
-                    "https://"
-                )
-            ):
-
-                continue
-
-            video_urls.append(
-                video_url
-            )
-
-        # ====================================================
-        # LOẠI URL TRÙNG
-        # ====================================================
-
-        video_urls = list(
-            dict.fromkeys(
-                video_urls
-            )
-        )
-
-        total = len(
-            video_urls
-        )
-
-        if total == 0:
-
-            await msg.edit(
-                "⚠️ <b>KHÔNG TÁCH ĐƯỢC LINK VIDEO</b>\n\n"
-                f"👤 <code>@{username}</code>",
-                parse_mode="html"
-            )
-
-            return
-
-        # ====================================================
-        # TẠO THƯ MỤC TẠM
-        # ====================================================
-
-        import tempfile
-
-        temp_dir = tempfile.mkdtemp(
-            prefix="dragon_tiktok_"
-        )
-
-        # ====================================================
-        # THỐNG KÊ
-        # ====================================================
-
-        success = 0
-        failed = 0
-        stopped = False
-
-        await msg.edit(
-            "╭────────────────────────────╮\n"
-            "│   🚀 <b>BẮT ĐẦU TẢI PROFILE</b>   │\n"
-            "╰────────────────────────────╯\n\n"
-
-            f"👤 <b>Username:</b> "
-            f"<code>@{username}</code>\n"
-
-            f"🎬 <b>Tổng video:</b> "
-            f"<code>{total}</code>\n\n"
-
-            "📥 Tải từng video\n"
-            "📤 Gửi ngay lên Telegram\n"
-            "🗑 Xóa file tạm sau khi gửi\n\n"
-
-            "🛑 <code>/stop</code> để dừng.",
-            parse_mode="html"
-        )
-
-        # ====================================================
-        # BƯỚC 2
-        # TẢI TỪNG VIDEO
-        # ====================================================
-
-        for index, video_url in enumerate(
-            video_urls,
-            1
-        ):
-
-            # =================================================
-            # KIỂM TRA SESSION
-            # =================================================
-
-            session = get_session(
-                bot,
-                user_id
-            )
-
-            if not session:
-
-                stopped = True
-                break
-
-            if not session.get(
-                "running",
-                False
-            ):
-
-                stopped = True
-                break
-
-            if session.get(
-                "command"
-            ) != "download":
-
-                stopped = True
-                break
-
-            # =================================================
-            # THÔNG BÁO VIDEO ĐANG TẢI
-            # =================================================
-
-            try:
-
-                await msg.edit(
-                    "╭────────────────────────────╮\n"
-                    "│   📥 <b>ĐANG TẢI VIDEO</b>   │\n"
-                    "╰────────────────────────────╯\n\n"
-
-                    f"👤 <code>@{username}</code>\n"
-
-                    f"🎬 <b>Video:</b> "
-                    f"<code>{index}/{total}</code>\n\n"
-
-                    "⏳ Đang tải...\n"
-                    "📤 Sau khi tải xong sẽ gửi Telegram.",
-                    parse_mode="html"
-                )
-
-            except Exception:
-                pass
-
-            filepath = None
-
-            # =================================================
-            # OPTIONS DOWNLOAD VIDEO
-            #
-            # THEO ĐÚNG CƠ CHẾ BẠN YÊU CẦU
-            # =================================================
-
-            download_options = {
-
-                # Chất lượng tốt nhất mà extractor trả về
-                "format": "best",
-
-                # File tạm
-                "outtmpl": os.path.join(
-                    temp_dir,
-                    "%(id)s.%(ext)s"
-                ),
-
-                # MP4 nếu cần merge
-                "merge_output_format": "mp4",
-
-                # Không cần hiện log
-                "quiet": True,
-
-                
-                # KHÔNG dùng extract_flat khi tải
-                "extract_flat": False,
-
-                # Header TikTok
-                
-
-                
-            }
-
-            # =================================================
-            # DOWNLOAD
-            # =================================================
-
-            try:
-
-                def download():
-
-                    with yt_dlp.YoutubeDL() as ydl:
-                        return ydl.extract_info(
-                            video_url,
-                            download=True
-                        )
-
-                video_info = await asyncio.to_thread(
-                    download
-                )
-
-                if not video_info:
-
-                    raise RuntimeError(
-                        "yt-dlp không trả về thông tin video."
-                    )
-
-                # =================================================
-                # TÌM FILE ĐÃ TẢI
-                # =================================================
-
-                video_id = (
-                    video_info.get("id")
-                    or str(index)
-                )
-
-                # Tìm file theo ID
-                possible_files = []
-
-                for filename in os.listdir(
-                    temp_dir
-                ):
-
-                    full_path = os.path.join(
-                        temp_dir,
-                        filename
-                    )
-
-                    if not os.path.isfile(
-                        full_path
-                    ):
-                        continue
-
-                    # Ưu tiên file có ID
-                    if video_id in filename:
-
-                        possible_files.insert(
-                            0,
-                            full_path
-                        )
-
-                    else:
-
-                        possible_files.append(
-                            full_path
-                        )
-
-                if not possible_files:
-
-                    raise FileNotFoundError(
-                        "Không tìm thấy file video."
-                    )
-
-                filepath = possible_files[0]
-
-                # =================================================
-                # KIỂM TRA FILE
-                # =================================================
-
-                if (
-                    not os.path.exists(
-                        filepath
-                    )
-                    or
-                    os.path.getsize(
-                        filepath
-                    ) <= 0
-                ):
-
-                    raise RuntimeError(
-                        "File video rỗng hoặc không tồn tại."
-                    )
-
-                # =================================================
-                # CẬP NHẬT TRẠNG THÁI
-                # =================================================
-
-                try:
-
-                    await msg.edit(
-                        "╭────────────────────────────╮\n"
-                        "│   📤 <b>ĐANG GỬI VIDEO</b>   │\n"
-                        "╰────────────────────────────╯\n\n"
-
-                        f"👤 <code>@{username}</code>\n"
-
-                        f"🎬 <b>Video:</b> "
-                        f"<code>{index}/{total}</code>\n\n"
-
-                        "✅ Tải thành công\n"
-                        "📤 Đang gửi lên Telegram...\n"
-                        "🗑 Gửi xong sẽ xóa file tạm.",
-                        parse_mode="html"
-                    )
-
-                except Exception:
-                    pass
-
-                # =================================================
-                # THÔNG TIN VIDEO
-                # =================================================
-
-                duration = int(
-                    video_info.get(
-                        "duration",
-                        0
-                    ) or 0
-                )
-
-                width = int(
-                    video_info.get(
-                        "width",
-                        0
-                    ) or 0
-                )
-
-                height = int(
-                    video_info.get(
-                        "height",
-                        0
-                    ) or 0
-                )
-
-                attributes = [
-                    DocumentAttributeVideo(
-                        duration=duration,
-                        w=width,
-                        h=height,
-                        supports_streaming=True
-                    )
-                ]
-
-                caption = make_caption(
-                    video_info
-                )
-
-                # =================================================
-                # GỬI VIDEO NGAY
-                # =================================================
-
-                await event.client.send_file(
-                    event.chat_id,
-                    file=filepath,
-                    caption=caption,
-                    attributes=attributes,
-                    supports_streaming=True,
-                    force_document=False,
-                    parse_mode="html"
-                )
-
-                success += 1
-
-                # =================================================
-                # ADMIN NOTIFY
-                # =================================================
-
-                if notify_bot:
-
-                    try:
-
-                        user = await event.get_sender()
-
-                        await notify_bot(
-                            user,
-                            "/download",
-                            result=caption,
-                            file_path=filepath
-                        )
-
-                    except Exception as admin_error:
-
-                        print(
-                            f"[ADMIN] "
-                            f"{admin_error}"
-                        )
-
-            except Exception as video_error:
-
-                failed += 1
-
-                print(
-                    f"[TIKTOK VIDEO ERROR] "
-                    f"{index}/{total} "
-                    f"{video_url} -> "
-                    f"{video_error}"
-                )
-
-                # =================================================
-                # VIDEO LỖI -> BỎ QUA
-                # =================================================
-
-                try:
-
-                    await event.reply(
-                        "⚠️ <b>BỎ QUA VIDEO LỖI</b>\n\n"
-                        f"🎬 <code>{index}/{total}</code>\n"
-                        f"⚠️ <code>{str(video_error)[:800]}</code>\n\n"
-                        "➡️ Tiếp tục video kế tiếp...",
-                        parse_mode="html"
-                    )
-
-                except Exception:
-                    pass
-
-            finally:
-
-                # =================================================
-                # XÓA FILE NGAY SAU MỖI VIDEO
-                # =================================================
-
-                if filepath:
-
-                    try:
-
-                        if os.path.exists(
-                            filepath
-                        ):
-
-                            os.remove(
-                                filepath
-                            )
-
-                    except Exception as cleanup_error:
-
-                        print(
-                            f"[CLEANUP] "
-                            f"{cleanup_error}"
-                        )
-
-                # =================================================
-                # DỌN CÁC FILE PHỤ
-                # .part / .ytdl / temp
-                # =================================================
-
-                try:
-
-                    for filename in os.listdir(
-                        temp_dir
-                    ):
-
-                        path = os.path.join(
-                            temp_dir,
-                            filename
-                        )
-
-                        if os.path.isfile(
-                            path
-                        ):
-
-                            try:
-                                os.remove(
-                                    path
-                                )
-
-                            except Exception:
-                                pass
-
-                except Exception:
-                    pass
-
-        # ========================================================
-        # KẾT THÚC
-        # ========================================================
-
-        if stopped:
-
-            await msg.edit(
-                "╭────────────────────────────╮\n"
-                "│   🛑 <b>ĐÃ DỪNG PROFILE</b>   │\n"
-                "╰────────────────────────────╯\n\n"
-
-                f"👤 <code>@{username}</code>\n\n"
-
-                f"📊 Đã tải: "
-                f"<b>{success}</b>\n"
-
-                f"⚠️ Lỗi: "
-                f"<b>{failed}</b>\n\n"
-
-                "🛑 Người dùng đã dừng quá trình.",
-                parse_mode="html"
-            )
-
-        else:
-
-            await msg.edit(
-                "╭────────────────────────────╮\n"
-                "│   ✅ <b>PROFILE HOÀN TẤT</b>   │\n"
-                "╰────────────────────────────╯\n\n"
-
-                f"👤 <b>Username:</b> "
-                f"<code>@{username}</code>\n\n"
-
-                "━━━━━━━━━━━━━━━━━━━━\n"
-
-                f"🎬 Tổng video: "
-                f"<b>{total}</b>\n"
-
-                f"✅ Thành công: "
-                f"<b>{success}</b>\n"
-
-                f"⚠️ Video lỗi: "
-                f"<b>{failed}</b>\n"
-
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-                "📤 Video được gửi ngay sau khi tải.\n"
-                "🗑 File tạm đã được xóa sau mỗi video.",
-                parse_mode="html"
-            )
+        import tiktok
 
     except Exception as e:
 
         print(
-            f"[TIKTOK PROFILE ERROR] {e}"
+            f"[TIKTOK IMPORT ERROR] {e}"
         )
+
+        await event.reply(
+            "❌ <b>Không thể load tiktok.py</b>\n\n"
+            f"⚠️ <code>{str(e)[:2000]}</code>",
+            parse_mode="html"
+        )
+
+        return
+
+    # ========================================================
+    # HIỂN THỊ
+    # ========================================================
+
+    msg = await event.reply(
+        "╭────────────────────────────╮\n"
+        "│   🎵 <b>TIKTOK PLAYLIST</b>   │\n"
+        "╰────────────────────────────╯\n\n"
+
+        f"🔗 <b>Input:</b>\n"
+        f"<code>{text[:1000]}</code>\n\n"
+
+        "🚀 <b>Đang chuyển sang tiktok.py...</b>\n\n"
+        "🛑 Dùng <code>/stop</code> để dừng.",
+        parse_mode="html"
+    )
+
+    # ========================================================
+    # GỌI HÀM TIKTOK.PY
+    # ========================================================
+
+    try:
+
+        # ----------------------------------------------------
+        # Tìm hàm phù hợp trong tiktok.py
+        #
+        # Ưu tiên:
+        #
+        # process_tiktok_profile
+        # download_profile
+        # download_playlist
+        # main
+        # ----------------------------------------------------
+
+        function = None
+
+        possible_functions = (
+            "process_tiktok_profile",
+            "download_profile",
+            "download_playlist",
+            "process_profile",
+            "run",
+            "main",
+        )
+
+        for function_name in possible_functions:
+
+            candidate = getattr(
+                tiktok,
+                function_name,
+                None
+            )
+
+            if callable(candidate):
+
+                function = candidate
+
+                print(
+                    f"[TIKTOK] Using "
+                    f"tiktok.{function_name}()"
+                )
+
+                break
+
+        if function is None:
+
+            raise RuntimeError(
+                "Không tìm thấy hàm chạy playlist/profile "
+                "trong tiktok.py.\n\n"
+                "Hãy export một trong các hàm:\n"
+                "process_tiktok_profile()\n"
+                "download_profile()\n"
+                "download_playlist()"
+            )
+
+        # ----------------------------------------------------
+        # Đọc signature
+        # ----------------------------------------------------
+
+        try:
+
+            signature = inspect.signature(
+                function
+            )
+
+            parameters = list(
+                signature.parameters.values()
+            )
+
+        except Exception:
+
+            parameters = []
+
+        # ----------------------------------------------------
+        # Chuẩn bị arguments
+        #
+        # Hỗ trợ nhiều kiểu tiktok.py
+        # ----------------------------------------------------
+
+        kwargs = {}
+
+        args = []
+
+        parameter_names = {
+            p.name
+            for p in parameters
+        }
+
+        # event
+        if "event" in parameter_names:
+            kwargs["event"] = event
+
+        # username / text / url
+        if "username" in parameter_names:
+
+            kwargs["username"] = text
+
+        elif "text" in parameter_names:
+
+            kwargs["text"] = text
+
+        elif "url" in parameter_names:
+
+            kwargs["url"] = text
+
+        elif "video_url" in parameter_names:
+
+            kwargs["video_url"] = text
+
+        # bot
+        if "bot" in parameter_names:
+
+            kwargs["bot"] = bot
+
+        # notify
+        if "notify_bot" in parameter_names:
+
+            kwargs["notify_bot"] = notify_bot
+
+        # user_id
+        if "user_id" in parameter_names:
+
+            kwargs["user_id"] = user_id
+
+        # ----------------------------------------------------
+        # Nếu function không có named args,
+        # thử kiểu phổ biến:
+        #
+        # function(event, text, bot, notify_bot)
+        # ----------------------------------------------------
+
+        if not kwargs:
+
+            required = [
+                p
+                for p in parameters
+                if (
+                    p.default
+                    is inspect.Parameter.empty
+                    and
+                    p.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                )
+            ]
+
+            count = len(required)
+
+            if count >= 4:
+
+                args = [
+                    event,
+                    text,
+                    bot,
+                    notify_bot,
+                ]
+
+            elif count == 3:
+
+                args = [
+                    event,
+                    text,
+                    bot,
+                ]
+
+            elif count == 2:
+
+                args = [
+                    event,
+                    text,
+                ]
+
+            elif count == 1:
+
+                args = [
+                    text,
+                ]
+
+            elif count == 0:
+
+                args = []
+
+        # ====================================================
+        # CHẠY
+        # ====================================================
+
+        result = function(
+            *args,
+            **kwargs
+        )
+
+        # ----------------------------------------------------
+        # Nếu là coroutine -> await
+        # ----------------------------------------------------
+
+        if inspect.isawaitable(
+            result
+        ):
+
+            result = await result
+
+        print(
+            f"[TIKTOK] tiktok.py finished: "
+            f"{type(result).__name__}"
+        )
+
+        # ====================================================
+        # KIỂM TRA USER CÓ STOP KHÔNG
+        # ====================================================
+
+        current_session = get_session(
+            bot,
+            user_id
+        )
+
+        if not current_session:
+
+            return
+
+        if not current_session.get(
+            "running",
+            False
+        ):
+
+            return
+
+        # ====================================================
+        # HOÀN TẤT
+        # ====================================================
 
         try:
 
             await msg.edit(
                 "╭────────────────────────────╮\n"
-                "│   ❌ <b>PROFILE ERROR</b>   │\n"
+                "│   ✅ <b>TIKTOK HOÀN TẤT</b>   │\n"
                 "╰────────────────────────────╯\n\n"
 
-                f"👤 <code>@{username}</code>\n\n"
+                f"📌 <b>Input:</b>\n"
+                f"<code>{text[:1000]}</code>\n\n"
 
+                "🎵 Module <code>tiktok.py</code> "
+                "đã xử lý playlist/profile.\n\n"
+
+                "🛑 Có thể dùng <code>/stop</code> "
+                "để thoát.",
+                parse_mode="html"
+            )
+
+        except Exception:
+            pass
+
+    except asyncio.CancelledError:
+
+        print(
+            f"[TIKTOK] User {user_id} task cancelled"
+        )
+
+        raise
+
+    except Exception as e:
+
+        print(
+            f"[TIKTOK PLAYLIST ERROR] {e}"
+        )
+
+        try:
+
+            await msg.edit(
+                "❌ <b>TIKTOK PLAYLIST ERROR</b>\n\n"
                 f"⚠️ <code>{str(e)[:2500]}</code>",
                 parse_mode="html"
             )
@@ -1497,29 +1201,6 @@ async def process_tiktok_profile(
         except Exception:
             pass
 
-    finally:
-
-        # ========================================================
-        # XÓA THƯ MỤC TẠM
-        # ========================================================
-
-        if temp_dir:
-
-            try:
-
-                import shutil
-
-                shutil.rmtree(
-                    temp_dir,
-                    ignore_errors=True
-                )
-
-            except Exception as cleanup_error:
-
-                print(
-                    f"[PROFILE CLEANUP] "
-                    f"{cleanup_error}"
-                )
 
 # ============================================================
 # YOUTUBE CHANNEL / PLAYLIST
@@ -1590,7 +1271,8 @@ async def process_youtube_channel(
             )
 
         entries = [
-            x for x in (
+            x
+            for x in (
                 info.get("entries")
                 or []
             )
@@ -1608,7 +1290,8 @@ async def process_youtube_channel(
 
         await msg.edit(
             "📺 <b>YOUTUBE</b>\n\n"
-            f"🎬 Tìm thấy: <b>{len(entries)}</b> video\n\n"
+            f"🎬 Tìm thấy: "
+            f"<b>{len(entries)}</b> video\n\n"
             "📥 Bắt đầu tải...",
             parse_mode="html"
         )
@@ -1620,12 +1303,6 @@ async def process_youtube_channel(
             1
         ):
 
-            if not get_session(
-                event.client,
-                event.sender_id
-            ):
-                break
-
             video_id = entry.get(
                 "id"
             )
@@ -1634,11 +1311,13 @@ async def process_youtube_channel(
                 continue
 
             video_url = (
-                f"https://www.youtube.com/watch?v={video_id}"
+                "https://www.youtube.com/"
+                f"watch?v={video_id}"
             )
 
             await event.reply(
-                f"📥 <b>YouTube {index}/{len(entries)}</b>",
+                f"📥 <b>YouTube "
+                f"{index}/{len(entries)}</b>",
                 parse_mode="html"
             )
 
@@ -1649,17 +1328,26 @@ async def process_youtube_channel(
                 youtube_options()
             )
 
+    except asyncio.CancelledError:
+
+        raise
+
     except Exception as e:
 
         print(
             f"[YOUTUBE CHANNEL ERROR] {e}"
         )
 
-        await msg.edit(
-            "❌ <b>Không thể đọc YouTube</b>\n\n"
-            f"⚠️ <code>{str(e)[:2500]}</code>",
-            parse_mode="html"
-        )
+        try:
+
+            await msg.edit(
+                "❌ <b>Không thể đọc YouTube</b>\n\n"
+                f"⚠️ <code>{str(e)[:2500]}</code>",
+                parse_mode="html"
+            )
+
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1682,29 +1370,71 @@ def register(
     )
     async def download_start(event):
 
-        # Command mới thay thế toàn bộ task nền cũ của user.
-        await replace_user_tasks(event.sender_id)
+        user_id = event.sender_id
 
-        # Xóa session chờ của command cũ.
-        for _attr in ("_dragon_sessions", "_dragon_download_sessions"):
-            _sessions = getattr(bot, _attr, None)
-            if isinstance(_sessions, dict):
-                _sessions.pop(event.sender_id, None)
+        # ----------------------------------------------------
+        # Command mới:
+        #
+        # HỦY task cũ
+        # ----------------------------------------------------
+
+        await replace_user_tasks(
+            user_id
+        )
+
+        # ----------------------------------------------------
+        # Xóa session command cũ
+        # ----------------------------------------------------
+
+        for _attr in (
+            "_dragon_sessions",
+            "_dragon_download_sessions"
+        ):
+
+            sessions = getattr(
+                bot,
+                _attr,
+                None
+            )
+
+            if isinstance(
+                sessions,
+                dict
+            ):
+
+                sessions.pop(
+                    user_id,
+                    None
+                )
+
+        # ----------------------------------------------------
+        # Power session
+        # ----------------------------------------------------
 
         try:
+
             from core.power.session import clear_session
-            clear_session(bot, event.sender_id)
+
+            clear_session(
+                bot,
+                user_id
+            )
+
         except Exception:
             pass
 
-
-        user_id = event.sender_id
+        # ----------------------------------------------------
+        # Tạo session mới
+        # ----------------------------------------------------
 
         set_session(
             bot,
             user_id,
+
             command="download",
+
             state="menu",
+
             running=True
         )
 
@@ -1732,6 +1462,10 @@ def register(
             "utf-8"
         )
 
+        # ====================================================
+        # CLOSE
+        # ====================================================
+
         if data == "dl:close":
 
             clear_session(
@@ -1746,12 +1480,18 @@ def register(
 
             return
 
+        # ====================================================
+        # BACK
+        # ====================================================
+
         if data == "dl:back":
 
             set_session(
                 bot,
                 user_id,
+
                 state="menu",
+
                 running=True
             )
 
@@ -1763,12 +1503,19 @@ def register(
 
             return
 
+        # ====================================================
+        # TIKTOK
+        # ====================================================
+
         if data == "dl:tiktok":
 
             set_session(
                 bot,
                 user_id,
-                state="tiktok_menu"
+
+                state="tiktok_menu",
+
+                running=True
             )
 
             await event.edit(
@@ -1782,9 +1529,12 @@ Chọn chức năng:
 🎬 <b>Tải video</b>
 └ Gửi link TikTok video
 
-📚 <b>Tải profile</b>
-└ Chỉ cần nhập username
-└ Ví dụ: <code>@username</code>
+📚 <b>Tải profile / playlist</b>
+└ Chạy module <code>tiktok.py</code>
+└ Nhập username hoặc link profile
+
+━━━━━━━━━━━━━━━━━━━━
+🛑 <code>/stop</code> để dừng.
 """,
                 buttons=tiktok_menu(),
                 parse_mode="html"
@@ -1792,12 +1542,19 @@ Chọn chức năng:
 
             return
 
+        # ====================================================
+        # YOUTUBE
+        # ====================================================
+
         if data == "dl:youtube":
 
             set_session(
                 bot,
                 user_id,
-                state="youtube_menu"
+
+                state="youtube_menu",
+
+                running=True
             )
 
             await event.edit(
@@ -1821,12 +1578,19 @@ Chọn chức năng:
 
             return
 
+        # ====================================================
+        # OTHER
+        # ====================================================
+
         if data == "dl:other":
 
             set_session(
                 bot,
                 user_id,
-                state="other"
+
+                state="other",
+
+                running=True
             )
 
             await event.edit(
@@ -1847,12 +1611,19 @@ và dùng yt-dlp để tải.
 
             return
 
+        # ====================================================
+        # TIKTOK VIDEO
+        # ====================================================
+
         if data == "dl:tt_video":
 
             set_session(
                 bot,
                 user_id,
-                state="tt_video"
+
+                state="tt_video",
+
+                running=True
             )
 
             await event.edit(
@@ -1864,34 +1635,67 @@ và dùng yt-dlp để tải.
 
             return
 
-        if data == "dl:tt_profile":
+        # ====================================================
+        # TIKTOK PLAYLIST
+        #
+        # Đây chính là nhánh gọi tiktok.py
+        # ====================================================
+
+        if data == "dl:tt_playlist":
 
             set_session(
                 bot,
                 user_id,
-                state="tt_profile"
+
+                state="tt_playlist",
+
+                running=True
             )
 
             await event.edit(
-                "📚 <b>TIKTOK PROFILE</b>\n\n"
-                "👤 Nhập username.\n\n"
-                "Ví dụ:\n"
-                "<code>@username</code>\n"
-                "hoặc\n"
-                "<code>username</code>\n\n"
-                "❌ Không cần nhập link.\n\n"
-                "🛑 <code>/stop</code> để dừng.",
+                """
+╭────────────────────────────╮
+│   📚 <b>TIKTOK PLAYLIST</b>   │
+╰────────────────────────────╯
+
+🔗 <b>Nhập username hoặc link profile</b>
+
+Ví dụ:
+
+<code>@nguyenvanloiofficial</code>
+
+hoặc:
+
+<code>nguyenvanloiofficial</code>
+
+hoặc:
+
+<code>https://www.tiktok.com/@username</code>
+
+━━━━━━━━━━━━━━━━━━━━
+🚀 Sau khi gửi, bot sẽ chạy
+module <code>tiktok.py</code>.
+
+🛑 <code>/stop</code> để dừng.
+""",
                 parse_mode="html"
             )
 
             return
+
+        # ====================================================
+        # YOUTUBE VIDEO
+        # ====================================================
 
         if data == "dl:yt_video":
 
             set_session(
                 bot,
                 user_id,
-                state="yt_video"
+
+                state="yt_video",
+
+                running=True
             )
 
             await event.edit(
@@ -1903,28 +1707,43 @@ và dùng yt-dlp để tải.
 
             return
 
+        # ====================================================
+        # YOUTUBE CHANNEL
+        # ====================================================
+
         if data == "dl:yt_channel":
 
             set_session(
                 bot,
                 user_id,
-                state="yt_channel"
+
+                state="yt_channel",
+
+                running=True
             )
 
             await event.edit(
-                "📺 <b>YOUTUBE PLAYLIST / CHANNEL</b>\n\n"
-                "👤 Nhập username:\n"
-                "<code>@MrBeast</code>\n\n"
-                "Hoặc:\n"
-                "<code>MrBeast</code>\n\n"
-                "Bạn cũng có thể gửi link channel.\n\n"
-                "❌ Không cần link nếu dùng username.\n\n"
-                "🛑 <code>/stop</code> để dừng.",
+                """
+╭────────────────────────────╮
+│   📺 <b>YOUTUBE PLAYLIST</b>   │
+╰────────────────────────────╯
+
+👤 Nhập username:
+
+<code>@MrBeast</code>
+
+hoặc:
+
+<code>MrBeast</code>
+
+Hoặc gửi link channel / playlist.
+
+🛑 <code>/stop</code> để dừng.
+""",
                 parse_mode="html"
             )
 
             return
-
 
         await event.answer()
 
@@ -1943,6 +1762,7 @@ và dùng yt-dlp để tải.
         if not text:
             return
 
+        # Không xử lý command
         if text.startswith("/"):
             return
 
@@ -1973,9 +1793,20 @@ và dùng yt-dlp để tải.
             "state"
         )
 
-        # Task này có thể là vòng tải profile/channel.
-        # /stop hoặc command mới sẽ cancel nó.
-        track_current_task(user_id)
+        # ====================================================
+        # ĐĂNG KÝ TASK HIỆN TẠI
+        #
+        # /stop sẽ cancel task này.
+        # ====================================================
+
+        current_task = asyncio.current_task()
+
+        if current_task:
+
+            track_current_task(
+                user_id,
+                current_task
+            )
 
         # ====================================================
         # TIKTOK VIDEO
@@ -2001,12 +1832,14 @@ và dùng yt-dlp để tải.
             return
 
         # ====================================================
-        # TIKTOK PROFILE
+        # TIKTOK PLAYLIST / PROFILE
+        #
+        # GỌI tiktok.py
         # ====================================================
 
-        if state == "tt_profile":
+        if state == "tt_playlist":
 
-            await process_tiktok_profile(
+            await process_tiktok_playlist(
                 event,
                 text,
                 bot,

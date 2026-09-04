@@ -54,32 +54,7 @@ logger = logging.getLogger(__name__)
 # COMMAND INFO
 # ============================================================
 
-COMMAND_INFO = {
-    "command": "tiktok",
-    "category": "🎵 TIKTOK",
-    "title": "TikTok Scanner",
 
-    "description": (
-        "Quét profile TikTok, lưu database và "
-        "tải video HD bằng TikWM."
-    ),
-
-    "usage": "/tiktok",
-
-    "examples": [
-        "/tiktok",
-    ],
-
-    "details": [
-        "Gửi username hoặc link TikTok.",
-        "Bot quét profile.",
-        "Video được lưu vào SQLite.",
-        "Photo được ghi vào file riêng.",
-        "Có checkpoint để tiếp tục.",
-        "TikWM được ưu tiên khi download.",
-        "Dùng /stop để dừng.",
-    ],
-}
 
 
 # ============================================================

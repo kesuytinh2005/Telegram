@@ -24,23 +24,16 @@
 # Tải video 2
 #    ↓
 # Gửi video 2 ngay
-#    ↓
-# ...
+#
+# TASK:
+#   download.py quản lý task chính.
+#   File này KHÔNG replace_user_tasks().
 #
 # Không:
 #   - Playwright
 #   - Selenium
 #   - Port
 #   - Server trung gian
-#
-# Engine:
-#   1. yt-dlp -> scan profile
-#   2. TikWM -> download media
-#   3. yt-dlp -> fallback
-#
-# Task manager:
-#   download.py là nơi quản lý task chính.
-#   File này KHÔNG replace_user_tasks().
 # ============================================================
 
 import asyncio
@@ -358,7 +351,7 @@ def init_tiktok_database():
 
 
 # ============================================================
-# STATE GET
+# STATE
 # ============================================================
 
 def state_get(
@@ -388,10 +381,6 @@ def state_get(
 
         conn.close()
 
-
-# ============================================================
-# STATE SET
-# ============================================================
 
 def state_set(
     key,
@@ -442,11 +431,9 @@ def clean_username(
     if not username:
         return None
 
-    username = str(username).strip()
-
-    # --------------------------------------------------------
-    # TikTok URL
-    # --------------------------------------------------------
+    username = str(
+        username
+    ).strip()
 
     if "tiktok.com/" in username.lower():
 
@@ -638,7 +625,7 @@ def save_video(
 
 
 # ============================================================
-# COUNT ALL
+# COUNT
 # ============================================================
 
 def count_videos():
@@ -757,10 +744,6 @@ def get_download_record(
 
         conn.close()
 
-
-# ============================================================
-# SET DOWNLOAD RECORD
-# ============================================================
 
 def set_download_record(
     video_id,
@@ -981,7 +964,9 @@ def parse_tikwm_data(
     data
 ):
 
-    images = data.get("images")
+    images = data.get(
+        "images"
+    )
 
     if (
         isinstance(images, list)
@@ -1169,10 +1154,14 @@ def download_media(
 
         try:
 
-            if os.path.exists(part_path):
+            if os.path.exists(
+                part_path
+            ):
 
                 try:
-                    os.remove(part_path)
+                    os.remove(
+                        part_path
+                    )
                 except Exception:
                     pass
 
@@ -1297,7 +1286,7 @@ def download_media(
 
             if attempt < MEDIA_RETRIES:
 
-                time.sleep(
+                delay = (
                     min(
                         30,
                         2 ** attempt
@@ -1308,6 +1297,25 @@ def download_media(
                         2
                     )
                 )
+
+                end_time = (
+                    time.monotonic()
+                    + delay
+                )
+
+                while (
+                    time.monotonic()
+                    < end_time
+                ):
+
+                    if (
+                        stop_checker
+                        and stop_checker()
+                    ):
+
+                        raise asyncio.CancelledError
+
+                    time.sleep(0.25)
 
     return {
         "success": False,
@@ -1339,10 +1347,6 @@ def photo_file(
     )
 
 
-# ============================================================
-# ERROR LOG
-# ============================================================
-
 def error_file(
     username
 ):
@@ -1366,6 +1370,7 @@ def read_logged_urls(
     if not os.path.exists(
         filepath
     ):
+
         return result
 
     try:
@@ -1391,9 +1396,13 @@ def read_logged_urls(
                 )
 
                 if url:
-                    result.add(url)
+
+                    result.add(
+                        url
+                    )
 
     except Exception:
+
         pass
 
     return result
@@ -1410,6 +1419,7 @@ def append_unique(
     )
 
     if value in existing:
+
         return False
 
     with open(
@@ -1506,6 +1516,7 @@ def remove_error(
     if not os.path.exists(
         filepath
     ):
+
         return
 
     try:
@@ -1532,7 +1543,9 @@ def remove_error(
 
             if value != video_url:
 
-                new_lines.append(line)
+                new_lines.append(
+                    line
+                )
 
         with open(
             filepath,
@@ -1552,7 +1565,7 @@ def remove_error(
 
 
 # ============================================================
-# YT-DLP PROFILE
+# YT-DLP PROFILE OPTIONS
 # ============================================================
 
 def profile_options():
@@ -1671,7 +1684,9 @@ def scan_profile_sync(
                     if not entry:
                         continue
 
-                    video_id = entry.get("id")
+                    video_id = entry.get(
+                        "id"
+                    )
 
                     if not video_id:
                         continue
@@ -1687,7 +1702,9 @@ def scan_profile_sync(
                         )
                     )
 
-                    item = dict(entry)
+                    item = dict(
+                        entry
+                    )
 
                     item[
                         "webpage_url"
@@ -1703,7 +1720,9 @@ def scan_profile_sync(
                         username
                     )
 
-                    save_video(item)
+                    save_video(
+                        item
+                    )
 
                     count += 1
 
@@ -1775,8 +1794,6 @@ def scan_profile_sync(
                     SCAN_DELAY_MAX
                 )
 
-            # Không sleep 20 giây một cục.
-            # Cho /stop phản ứng nhanh hơn.
             end_time = (
                 time.monotonic()
                 + delay
@@ -1831,7 +1848,9 @@ def download_one_tikwm(
         data
     )
 
-    media_type = parsed["type"]
+    media_type = parsed[
+        "type"
+    ]
 
     # --------------------------------------------------------
     # PHOTO
@@ -2089,13 +2108,6 @@ def download_one_ytdlp(
 
 # ============================================================
 # DOWNLOAD ONE VIDEO
-#
-# Hàm này dùng để:
-#
-#   tải 1 video
-#   trả về path
-#
-# Sau đó asyncio worker sẽ SEND NGAY.
 # ============================================================
 
 def download_one_video_sync(
@@ -2134,7 +2146,7 @@ def download_one_video_sync(
     )
 
     # --------------------------------------------------------
-    # File đã có
+    # FILE ĐÃ CÓ
     # --------------------------------------------------------
 
     if os.path.exists(
@@ -2177,7 +2189,9 @@ def download_one_video_sync(
                 stop_checker
             )
 
-            if result.get("type") == "video":
+            if result.get(
+                "type"
+            ) == "video":
 
                 result.update({
                     "video_id": video_id,
@@ -2187,7 +2201,6 @@ def download_one_video_sync(
 
                 return result
 
-            # Photo thì không gửi bằng send_file video.
             return {
                 "success": True,
                 "type": "photo",
@@ -2226,7 +2239,9 @@ def download_one_video_sync(
                 stop_checker
             )
 
-            if fallback.get("success"):
+            if fallback.get(
+                "success"
+            ):
 
                 set_download_record(
                     video_id,
@@ -2274,9 +2289,7 @@ def download_one_video_sync(
 
 
 # ============================================================
-# SEND ONE VIDEO
-#
-# Video tải xong -> gửi ngay.
+# SEND VIDEO
 # ============================================================
 
 async def send_downloaded_video(
@@ -2288,24 +2301,25 @@ async def send_downloaded_video(
     total
 ):
 
-    if not path or not os.path.exists(path):
+    if (
+        not path
+        or
+        not os.path.exists(path)
+    ):
 
         raise RuntimeError(
             "Không tìm thấy file video."
         )
 
-    size = os.path.getsize(path)
+    size = os.path.getsize(
+        path
+    )
 
     if size <= 0:
 
         raise RuntimeError(
             "File video rỗng."
         )
-
-    title = (
-        f"@{username} • "
-        f"{index}/{total}"
-    )
 
     caption = (
         "🎵 <b>TIKTOK</b>\n\n"
@@ -2325,7 +2339,7 @@ async def send_downloaded_video(
 
 
 # ============================================================
-# FORMAT DOWNLOAD PROGRESS
+# PROGRESS TEXT
 # ============================================================
 
 def format_download_progress(
@@ -2371,8 +2385,7 @@ def format_download_progress(
 # ============================================================
 # SCAN WORKER
 #
-# KHÔNG replace task.
-# KHÔNG tạo task khác.
+# download.py đã quản lý task.
 # ============================================================
 
 async def scan_worker(
@@ -2384,7 +2397,9 @@ async def scan_worker(
 
     user_id = event.sender_id
 
-    sessions = get_sessions(bot)
+    sessions = get_sessions(
+        bot
+    )
 
     try:
 
@@ -2416,7 +2431,9 @@ async def scan_worker(
             stopped
         )
 
-        if result.get("complete"):
+        if result.get(
+            "complete"
+        ):
 
             total = int(
                 result.get(
@@ -2424,10 +2441,6 @@ async def scan_worker(
                     0
                 )
             )
-
-            # ------------------------------------------------
-            # NÚT TẢI TẤT CẢ
-            # ------------------------------------------------
 
             buttons = []
 
@@ -2499,12 +2512,13 @@ async def scan_worker(
             await message.edit(
                 "🛑 <b>Đã dừng quét TikTok.</b>\n\n"
                 f"👤 @{html.escape(username)}\n\n"
-                f"💾 Database vẫn giữ dữ liệu "
-                f"đã scan được.",
+                "💾 Database vẫn giữ dữ liệu "
+                "đã scan được.",
                 parse_mode="html"
             )
 
         except Exception:
+
             pass
 
         raise
@@ -2524,6 +2538,7 @@ async def scan_worker(
             )
 
         except Exception:
+
             pass
 
     finally:
@@ -2534,27 +2549,15 @@ async def scan_worker(
 
         if session:
 
-            session["processing"] = False
-
-            # Không xóa session ở đây.
-            # Vì nút TẢI TẤT CẢ cần username.
-            #
-            # download.py / stop sẽ xử lý
-            # session tiếp theo.
+            session[
+                "processing"
+            ] = False
 
 
 # ============================================================
 # DOWNLOAD ALL WORKER
 #
-# QUAN TRỌNG:
-#
-# Mỗi video:
-#
-#   DOWNLOAD
-#      ↓
-#   SEND NGAY
-#
-# Không đợi tải hết rồi mới gửi.
+# TẢI → GỬI → TẢI → GỬI
 # ============================================================
 
 async def download_all_worker(
@@ -2566,7 +2569,9 @@ async def download_all_worker(
 
     user_id = event.sender_id
 
-    sessions = get_sessions(bot)
+    sessions = get_sessions(
+        bot
+    )
 
     username = clean_username(
         username
@@ -2589,9 +2594,28 @@ async def download_all_worker(
             f"@{username} trong database."
         )
 
-    total = len(rows)
+    total = len(
+        rows
+    )
+
+    # --------------------------------------------------------
+    # QUAN TRỌNG:
+    #
+    # Không ghi đè notify_bot.
+    # Không cần replace task.
+    # --------------------------------------------------------
+
+    old_session = sessions.get(
+        user_id,
+        {}
+    )
+
+    notify_bot = old_session.get(
+        "notify_bot"
+    )
 
     sessions[user_id] = {
+
         "command":
             "tiktok_download",
 
@@ -2608,12 +2632,7 @@ async def download_all_worker(
             "download",
 
         "notify_bot":
-            sessions.get(
-                user_id,
-                {}
-            ).get(
-                "notify_bot"
-            )
+            notify_bot
     }
 
     downloaded = 0
@@ -2648,6 +2667,7 @@ async def download_all_worker(
             )
 
             if not session:
+
                 return True
 
             return not session.get(
@@ -2655,9 +2675,9 @@ async def download_all_worker(
                 False
             )
 
-        # ----------------------------------------------------
-        # LOOP TỪNG VIDEO
-        # ----------------------------------------------------
+        # ====================================================
+        # LOOP
+        # ====================================================
 
         for index, row in enumerate(
             rows,
@@ -2681,12 +2701,11 @@ async def download_all_worker(
                 )
             )
 
-            current_progress = 0
             current_size = 0
             current_total = 0
 
             # ------------------------------------------------
-            # MESSAGE PROGRESS
+            # PROGRESS EDIT
             # ------------------------------------------------
 
             async def edit_progress(
@@ -2728,7 +2747,7 @@ async def download_all_worker(
                     pass
 
             # ------------------------------------------------
-            # CALLBACK TỪ THREAD
+            # THREAD PROGRESS
             # ------------------------------------------------
 
             loop = asyncio.get_running_loop()
@@ -2738,7 +2757,6 @@ async def download_all_worker(
                 total_size
             ):
 
-                nonlocal current_progress
                 nonlocal current_size
                 nonlocal current_total
 
@@ -2750,7 +2768,7 @@ async def download_all_worker(
 
                 if total_size:
 
-                    current_progress = (
+                    percent = (
                         current
                         /
                         total_size
@@ -2760,18 +2778,24 @@ async def download_all_worker(
 
                 else:
 
-                    current_progress = 0
+                    percent = 0
 
                 try:
 
-                    asyncio.run_coroutine_threadsafe(
-                        edit_progress(
-                            current_progress,
-                            current_size,
-                            current_total
-                        ),
-                        loop
+                    future = (
+                        asyncio.run_coroutine_threadsafe(
+                            edit_progress(
+                                percent,
+                                current_size,
+                                current_total
+                            ),
+                            loop
+                        )
                     )
+
+                    # Không block thread chờ Telegram.
+                    # Future chỉ được tạo để coroutine chạy.
+                    del future
 
                 except Exception:
 
@@ -2791,14 +2815,25 @@ async def download_all_worker(
                     stopped
                 )
 
-                if result.get("type") == "photo":
+                if stopped():
+
+                    raise asyncio.CancelledError
+
+                # ------------------------------------------------
+                # PHOTO
+                # ------------------------------------------------
+
+                if result.get(
+                    "type"
+                ) == "photo":
 
                     photos += 1
 
-                    # Photo không gửi bằng video.
-                    # Chỉ ghi log.
-
                     continue
+
+                # ------------------------------------------------
+                # FILE
+                # ------------------------------------------------
 
                 path = result.get(
                     "path"
@@ -2821,9 +2856,7 @@ async def download_all_worker(
                     downloaded += 1
 
                 # ------------------------------------------------
-                # QUAN TRỌNG:
-                #
-                # TẢI XONG -> GỬI NGAY
+                # TẢI XONG → GỬI NGAY
                 # ------------------------------------------------
 
                 await send_downloaded_video(
@@ -2836,7 +2869,7 @@ async def download_all_worker(
                 )
 
                 # ------------------------------------------------
-                # Sau khi gửi xong mới sang video kế tiếp.
+                # GỬI XONG → VIDEO TIẾP
                 # ------------------------------------------------
 
                 try:
@@ -2853,13 +2886,13 @@ async def download_all_worker(
 
                         "✅ <b>Đã tải + gửi video.</b>\n\n"
 
-                        f"📊 Đã gửi: "
+                        f"📤 Đã gửi: "
                         f"<b>{downloaded + skipped}</b>\n"
 
                         f"⏳ Còn lại: "
                         f"<b>{total - index}</b>\n\n"
 
-                        "🚀 Đang chuyển sang video tiếp theo...",
+                        "🚀 Đang chuyển video tiếp theo...",
                         parse_mode="html"
                     )
 
@@ -2904,14 +2937,10 @@ async def download_all_worker(
 
                     pass
 
-                # ------------------------------------------------
-                # Không dừng cả profile chỉ vì 1 video lỗi.
-                # ------------------------------------------------
-
                 continue
 
         # ====================================================
-        # HOÀN TẤT
+        # COMPLETE
         # ====================================================
 
         await message.edit(
@@ -2940,6 +2969,7 @@ async def download_all_worker(
 
             await message.edit(
                 "🛑 <b>ĐÃ DỪNG TẢI TIKTOK</b>\n\n"
+
                 f"👤 @{html.escape(username)}\n\n"
 
                 f"📦 Tổng: <b>{total}</b>\n"
@@ -2975,6 +3005,7 @@ async def download_all_worker(
             )
 
         except Exception:
+
             pass
 
     finally:
@@ -2985,17 +3016,19 @@ async def download_all_worker(
 
         if session:
 
-            session["processing"] = False
+            session[
+                "processing"
+            ] = False
 
-            session["running"] = False
+            session[
+                "running"
+            ] = False
 
 
 # ============================================================
-# PUBLIC API
+# PUBLIC API - SCAN
 #
 # download.py gọi hàm này.
-#
-# KHÔNG replace task ở đây.
 # ============================================================
 
 async def process_tiktok_profile(
@@ -3020,7 +3053,9 @@ async def process_tiktok_profile(
 
     user_id = event.sender_id
 
-    sessions = get_sessions(bot)
+    sessions = get_sessions(
+        bot
+    )
 
     sessions[user_id] = {
 
@@ -3049,12 +3084,6 @@ async def process_tiktok_profile(
         parse_mode="html"
     )
 
-    # --------------------------------------------------------
-    # KHÔNG replace_user_tasks()
-    #
-    # download.py đã quản lý task.
-    # --------------------------------------------------------
-
     await scan_worker(
         bot,
         event,
@@ -3064,16 +3093,23 @@ async def process_tiktok_profile(
 
 
 # ============================================================
-# PUBLIC API
+# PUBLIC API - DOWNLOAD
 #
-# Dùng khi download.py muốn bắt đầu download.
+# SỬA LỖI:
+#
+# Không dùng:
+#     if message is None
+#
+# vì message chưa tồn tại.
+#
+# Hàm này tự tạo message từ event.reply().
 # ============================================================
 
 async def start_tiktok_download(
     bot,
     event,
     username,
-    notify_bot=None,
+    notify_bot=None
 ):
 
     username = clean_username(
@@ -3091,7 +3127,9 @@ async def start_tiktok_download(
 
     user_id = event.sender_id
 
-    sessions = get_sessions(bot)
+    sessions = get_sessions(
+        bot
+    )
 
     sessions[user_id] = {
 
@@ -3114,13 +3152,17 @@ async def start_tiktok_download(
             notify_bot
     }
 
-    if message is None:
+    # --------------------------------------------------------
+    # LUÔN tạo message mới.
+    #
+    # Không sử dụng event.message.
+    # --------------------------------------------------------
 
-        message = await event.reply(
-            "⏳ <b>Đang chuẩn bị tải TikTok...</b>\n\n"
-            f"👤 <code>@{html.escape(username)}</code>",
-            parse_mode="html"
-        )
+    message = await event.reply(
+        "⏳ <b>Đang chuẩn bị tải TikTok...</b>\n\n"
+        f"👤 <code>@{html.escape(username)}</code>",
+        parse_mode="html"
+    )
 
     await download_all_worker(
         bot,
@@ -3140,16 +3182,14 @@ process_tiktok_download = (
 
 
 # ============================================================
-# BUTTON HANDLER
+# CALLBACK HELPER
 #
-# download.py có thể gọi:
+# LƯU Ý:
 #
-#   await tiktok.handle_callback(...)
+# download.py là nơi quản lý task.
 #
-# Hoặc tự xử lý callback.
-#
-# Hàm này giúp tiktok.py có thể độc lập xử lý
-# nút TẢI TẤT CẢ.
+# Hàm này KHÔNG trực tiếp chạy worker.
+# Nó chỉ xử lý callback nếu nơi khác cần gọi.
 # ============================================================
 
 async def handle_callback(
@@ -3170,10 +3210,22 @@ async def handle_callback(
             errors="ignore"
         )
 
-    data = str(data)
+    data = str(
+        data
+    )
 
     # ========================================================
     # TẢI TẤT CẢ
+    #
+    # Không chạy worker trực tiếp tại đây.
+    #
+    # download.py nên:
+    #
+    # await replace_user_tasks(
+    #     user_id,
+    #     run_tiktok_download_all(...)
+    # )
+    #
     # ========================================================
 
     if data.startswith(
@@ -3202,41 +3254,38 @@ async def handle_callback(
             "🚀 Bắt đầu tải tất cả video..."
         )
 
-        user_id = event.sender_id
-
-        sessions = get_sessions(
-            bot
-        )
-
         # ----------------------------------------------------
-        # Không replace task ở đây.
+        # Không event.message
+        # Không download_all_worker trực tiếp.
         #
-        # Callback phải được download.py đưa vào
-        # task manager.
+        # Nếu callback này được gọi độc lập,
+        # dùng get_message() an toàn.
         # ----------------------------------------------------
 
-        sessions[user_id] = {
+        message = None
 
-            "command":
-                "tiktok_download",
+        try:
 
-            "username":
-                username,
+            message = await event.get_message()
 
-            "running":
-                True,
+        except Exception:
 
-            "processing":
-                True,
+            message = None
 
-            "source":
-                "download",
+        if message is None:
 
-            "notify_bot":
-                notify_bot
-        }
+            message = await event.respond(
+                "⏳ <b>Đang chuẩn bị tải TikTok...</b>",
+                parse_mode="html"
+            )
 
-        message = event.message
+        # ----------------------------------------------------
+        # Chạy trực tiếp chỉ để tương thích API cũ.
+        #
+        # download.py hiện tại nên ưu tiên:
+        # start_tiktok_download()
+        # thông qua replace_user_tasks().
+        # ----------------------------------------------------
 
         await download_all_worker(
             bot,
@@ -3264,9 +3313,23 @@ async def handle_callback(
             username
         )
 
+        if not username:
+
+            await event.answer(
+                "Username không hợp lệ.",
+                alert=True
+            )
+
+            return True
+
         await event.answer(
             "🔄 Đang quét lại..."
         )
+
+        # ----------------------------------------------------
+        # Callback event không dùng event.message.
+        # process_tiktok_profile tự event.reply().
+        # ----------------------------------------------------
 
         await process_tiktok_profile(
             bot,
@@ -3288,7 +3351,6 @@ async def handle_callback(
 #   /tiktokdownload
 #
 # Entry point:
-#
 #   /download
 # ============================================================
 

@@ -6,55 +6,45 @@
 # Tương thích:
 #   - Telethon
 #   - core.task_manager
-#   - commands.register_all()
+#   - commands.download
+#
+# ENTRY POINT CHÍNH:
+#
+#   process_tiktok_profile(
+#       bot=bot,
+#       event=event,
+#       username=username,
+#       notify_bot=notify_bot
+#   )
 #
 # Không sử dụng:
 #   - Playwright
 #   - Selenium
 #
 # Engine:
-#   1. TikWM API
-#   2. yt-dlp fallback
+#   1. yt-dlp -> scan profile
+#   2. TikWM -> download media
+#   3. yt-dlp -> fallback download
 # ============================================================
 
 import asyncio
-import csv
-import json
 import logging
 import os
 import random
-import re
 import sqlite3
 import time
-import traceback
 
 from datetime import datetime
-from urllib.parse import urlparse
 
 import requests
 import yt_dlp
 
-from telethon import events
-
 from core.task_manager import (
-    replace_user_tasks,
     track_current_task,
     untrack_current_task,
 )
 
-
-# ============================================================
-# LOG
-# ============================================================
-
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# COMMAND INFO
-# ============================================================
-
-
 
 
 # ============================================================
@@ -66,7 +56,6 @@ BASE_DIR = os.path.dirname(
         os.path.abspath(__file__)
     )
 )
-
 
 DATA_DIR = os.path.join(
     BASE_DIR,
@@ -82,7 +71,6 @@ DOWNLOAD_DIR = os.path.join(
     BASE_DIR,
     "downloads"
 )
-
 
 os.makedirs(
     DATA_DIR,
@@ -217,6 +205,8 @@ MEDIA_HEADERS = {
 
 # ============================================================
 # SESSION STORAGE
+#
+# Dùng chung với download.py
 # ============================================================
 
 SESSION_KEY = (
@@ -246,6 +236,21 @@ def get_sessions(bot):
         )
 
     return sessions
+
+
+def clear_session(
+    bot,
+    user_id
+):
+
+    sessions = get_sessions(
+        bot
+    )
+
+    sessions.pop(
+        user_id,
+        None
+    )
 
 
 # ============================================================
@@ -355,7 +360,7 @@ def init_tiktok_database():
 
 
 # ============================================================
-# STATE
+# STATE GET
 # ============================================================
 
 def state_get(
@@ -379,6 +384,7 @@ def state_get(
         ).fetchone()
 
         if row is None:
+
             return default
 
         return row["value"]
@@ -387,6 +393,10 @@ def state_get(
 
         conn.close()
 
+
+# ============================================================
+# STATE SET
+# ============================================================
 
 def state_set(
     key,
@@ -436,11 +446,12 @@ def save_video(
     info
 ):
 
-    video_id = (
-        info.get("id")
+    video_id = info.get(
+        "id"
     )
 
     if not video_id:
+
         return
 
     now = datetime.utcnow().isoformat()
@@ -503,7 +514,9 @@ def save_video(
 
                 info.get(
                     "webpage_url"
-                ) or info.get(
+                )
+                or
+                info.get(
                     "url"
                 ),
 
@@ -561,7 +574,7 @@ def save_video(
 
 
 # ============================================================
-# COUNT
+# COUNT ALL VIDEOS
 # ============================================================
 
 def count_videos():
@@ -587,7 +600,7 @@ def count_videos():
 
 
 # ============================================================
-# GET VIDEOS
+# GET ALL VIDEOS
 # ============================================================
 
 def get_all_videos():
@@ -602,6 +615,43 @@ def get_all_videos():
             FROM videos
             ORDER BY rowid ASC
             """
+        ).fetchall()
+
+        return rows
+
+    finally:
+
+        conn.close()
+
+
+# ============================================================
+# GET VIDEOS BY USERNAME
+# ============================================================
+
+def get_videos_by_username(
+    username
+):
+
+    username = clean_username(
+        username
+    )
+
+    conn = db_connect()
+
+    try:
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM videos
+            WHERE uploader = ?
+               OR uploader_id = ?
+            ORDER BY rowid ASC
+            """,
+            (
+                username,
+                username,
+            )
         ).fetchall()
 
         return rows
@@ -640,6 +690,10 @@ def get_download_record(
 
         conn.close()
 
+
+# ============================================================
+# SET DOWNLOAD RECORD
+# ============================================================
 
 def set_download_record(
     video_id,
@@ -714,7 +768,41 @@ def clean_username(
 ):
 
     if not username:
+
         return None
+
+    username = (
+        str(username)
+        .strip()
+    )
+
+    # --------------------------------------------------------
+    # Link TikTok
+    # --------------------------------------------------------
+
+    if "tiktok.com/" in username:
+
+        try:
+
+            parsed = urlparse(
+                username
+            )
+
+            path = (
+                parsed.path
+                .strip("/")
+            )
+
+            if path.startswith("@"):
+
+                username = (
+                    path
+                    .split("/", 1)[0]
+                )
+
+        except Exception:
+
+            pass
 
     username = (
         username
@@ -731,6 +819,7 @@ def clean_username(
     )
 
     if not username:
+
         return None
 
     return username
@@ -749,6 +838,7 @@ def build_profile_url(
     )
 
     if not username:
+
         return None
 
     return (
@@ -770,6 +860,10 @@ def build_video_url(
         username
     )
 
+    if not username or not video_id:
+
+        return None
+
     return (
         f"https://www.tiktok.com/"
         f"@{username}/video/{video_id}"
@@ -777,7 +871,7 @@ def build_video_url(
 
 
 # ============================================================
-# SESSION
+# HTTP SESSION
 # ============================================================
 
 def create_http_session():
@@ -800,13 +894,16 @@ def is_rate_limited(
 ):
 
     if response is None:
+
         return False
 
-    return response.status_code == 429
+    return (
+        response.status_code == 429
+    )
 
 
 # ============================================================
-# TIKWM API
+# TIKWM LOOKUP
 # ============================================================
 
 def tikwm_lookup(
@@ -849,7 +946,7 @@ def tikwm_lookup(
                 )
 
                 logger.warning(
-                    "[TIKWM] 429 - retry %s/%s",
+                    "[TIKWM] 429 retry %s/%s",
                     attempt,
                     TIKWM_API_RETRIES
                 )
@@ -897,13 +994,9 @@ def tikwm_lookup(
             ):
 
                 message = (
-                    payload.get(
-                        "msg"
-                    )
+                    payload.get("msg")
                     or
-                    payload.get(
-                        "message"
-                    )
+                    payload.get("message")
                     or
                     f"code={code}"
                 )
@@ -932,7 +1025,7 @@ def tikwm_lookup(
             last_error = e
 
             logger.warning(
-                "[TIKWM] attempt %s/%s: %s",
+                "[TIKWM] attempt=%s/%s error=%s",
                 attempt,
                 TIKWM_API_RETRIES,
                 e
@@ -940,7 +1033,7 @@ def tikwm_lookup(
 
             if attempt < TIKWM_API_RETRIES:
 
-                time.sleep(
+                delay = (
                     min(
                         45,
                         2 ** attempt
@@ -950,6 +1043,10 @@ def tikwm_lookup(
                         0.3,
                         1.5
                     )
+                )
+
+                time.sleep(
+                    delay
                 )
 
     raise RuntimeError(
@@ -971,10 +1068,10 @@ def parse_tikwm_data(
         "images"
     )
 
-    if isinstance(
-        images,
-        list
-    ) and images:
+    if (
+        isinstance(images, list)
+        and images
+    ):
 
         images = [
             str(x).strip()
@@ -1012,7 +1109,7 @@ def parse_tikwm_data(
 
 
 # ============================================================
-# FILE NAME
+# OUTPUT PATH
 # ============================================================
 
 def video_output_path(
@@ -1023,6 +1120,10 @@ def video_output_path(
     username = clean_username(
         username
     )
+
+    if not username:
+
+        username = "unknown"
 
     folder = os.path.join(
         DOWNLOAD_DIR,
@@ -1049,8 +1150,13 @@ def format_bytes(
 ):
 
     try:
-        value = float(value)
+
+        value = float(
+            value
+        )
+
     except Exception:
+
         return "0 B"
 
     units = [
@@ -1089,14 +1195,17 @@ def progress_bar(
     if total <= 0:
 
         return (
-            "[" +
-            "#" * width +
-            "]"
+            "["
+            + "#" * width
+            + "]"
         )
 
     ratio = min(
         1,
-        current / total
+        max(
+            0,
+            current / total
+        )
     )
 
     filled = int(
@@ -1106,7 +1215,8 @@ def progress_bar(
     return (
         "["
         + "#" * filled
-        + "-" * (
+        + "-"
+        * (
             width - filled
         )
         + "]"
@@ -1121,7 +1231,8 @@ def download_media(
     session,
     media_url,
     output_path,
-    progress_callback=None
+    progress_callback=None,
+    stop_checker=None
 ):
 
     part_path = (
@@ -1136,21 +1247,27 @@ def download_media(
         MEDIA_RETRIES + 1
     ):
 
-        try:
+        if (
+            stop_checker
+            and stop_checker()
+        ):
 
-            # ----------------------------------------------
-            # Nếu part cũ quá trình trước thì xóa.
-            # ----------------------------------------------
+            raise asyncio.CancelledError
+
+        try:
 
             if os.path.exists(
                 part_path
             ):
 
                 try:
+
                     os.remove(
                         part_path
                     )
+
                 except Exception:
+
                     pass
 
             with session.get(
@@ -1181,7 +1298,15 @@ def download_media(
                         chunk_size=MEDIA_CHUNK_SIZE
                     ):
 
+                        if (
+                            stop_checker
+                            and stop_checker()
+                        ):
+
+                            raise asyncio.CancelledError
+
                         if not chunk:
+
                             continue
 
                         file.write(
@@ -1198,10 +1323,6 @@ def download_media(
                                 downloaded,
                                 total
                             )
-
-                # ------------------------------------------
-                # Kiểm tra file
-                # ------------------------------------------
 
                 if not os.path.exists(
                     part_path
@@ -1221,10 +1342,6 @@ def download_media(
                         "File tải về rỗng."
                     )
 
-                # ------------------------------------------
-                # Rename atomic
-                # ------------------------------------------
-
                 os.replace(
                     part_path,
                     output_path
@@ -1236,12 +1353,30 @@ def download_media(
                     "size": size,
                 }
 
+        except asyncio.CancelledError:
+
+            try:
+
+                if os.path.exists(
+                    part_path
+                ):
+
+                    os.remove(
+                        part_path
+                    )
+
+            except Exception:
+
+                pass
+
+            raise
+
         except Exception as e:
 
             last_error = e
 
             logger.warning(
-                "[MEDIA] attempt %s/%s: %s",
+                "[MEDIA] attempt=%s/%s error=%s",
                 attempt,
                 MEDIA_RETRIES,
                 e
@@ -1258,6 +1393,7 @@ def download_media(
                     )
 
             except Exception:
+
                 pass
 
             if attempt < MEDIA_RETRIES:
@@ -1280,11 +1416,11 @@ def download_media(
         "success": False,
         "path": None,
         "size": 0,
-        "error": str(
-            last_error
-        )
-        if last_error
-        else "Download failed."
+        "error":
+            str(last_error)
+            if last_error
+            else
+            "Download failed."
     }
 
 
@@ -1345,6 +1481,7 @@ def read_logged_urls(
                 line = line.strip()
 
                 if not line:
+
                     continue
 
                 url = (
@@ -1355,6 +1492,7 @@ def read_logged_urls(
                 )
 
                 if url:
+
                     result.add(
                         url
                     )
@@ -1381,6 +1519,7 @@ def append_unique(
     )
 
     if value in existing:
+
         return False
 
     with open(
@@ -1406,7 +1545,7 @@ def append_unique(
 
 
 # ============================================================
-# APPEND PHOTOS
+# SAVE PHOTO LINKS
 # ============================================================
 
 def save_photo_links(
@@ -1427,15 +1566,16 @@ def save_photo_links(
 
     for image_url in images:
 
-        image_url = (
-            str(image_url)
-            .strip()
-        )
+        image_url = str(
+            image_url
+        ).strip()
 
         if not image_url:
+
             continue
 
         if image_url in existing:
+
             continue
 
         with open(
@@ -1540,7 +1680,7 @@ def remove_error(
     except Exception:
 
         logger.exception(
-            "[ERROR LOG] remove error failed"
+            "[ERROR LOG] remove failed"
         )
 
 
@@ -1573,12 +1713,11 @@ def profile_options():
         "noplaylist": False,
 
         "playlistend": None,
-
     }
 
 
 # ============================================================
-# SCAN PROFILE
+# SCAN PROFILE SYNC
 # ============================================================
 
 def scan_profile_sync(
@@ -1617,7 +1756,10 @@ def scan_profile_sync(
         SCAN_RETRIES + 1
     ):
 
-        if stop_checker and stop_checker():
+        if (
+            stop_checker
+            and stop_checker()
+        ):
 
             raise asyncio.CancelledError
 
@@ -1654,7 +1796,10 @@ def scan_profile_sync(
 
                 for entry in entries:
 
-                    if stop_checker and stop_checker():
+                    if (
+                        stop_checker
+                        and stop_checker()
+                    ):
 
                         raise asyncio.CancelledError
 
@@ -1685,12 +1830,17 @@ def scan_profile_sync(
                         entry
                     )
 
-                    item["webpage_url"] = (
-                        entry_url
-                    )
+                    item[
+                        "webpage_url"
+                    ] = entry_url
 
                     item.setdefault(
                         "uploader",
+                        username
+                    )
+
+                    item.setdefault(
+                        "uploader_id",
                         username
                     )
 
@@ -1706,11 +1856,6 @@ def scan_profile_sync(
                             count,
                             video_id
                         )
-
-                # ------------------------------------------
-                # CHỈ COMPLETE KHI ITERATOR KẾT THÚC BÌNH
-                # THƯỜNG
-                # ------------------------------------------
 
                 state_set(
                     complete_key,
@@ -1749,7 +1894,8 @@ def scan_profile_sync(
             logger.warning(
                 "[TIKTOK SCAN] "
                 "attempt=%s/%s "
-                "rate=%s error=%s",
+                "rate=%s "
+                "error=%s",
                 attempt,
                 SCAN_RETRIES,
                 rate_limited,
@@ -1783,16 +1929,16 @@ def scan_profile_sync(
         "complete": False,
         "count": count_videos(),
         "username": username,
-        "error": str(
-            last_error
-        )
-        if last_error
-        else "Scan failed."
+        "error":
+            str(last_error)
+            if last_error
+            else
+            "Scan failed."
     }
 
 
 # ============================================================
-# DOWNLOAD ONE VIDEO - TIKWM
+# DOWNLOAD ONE - TIKWM
 # ============================================================
 
 def download_one_tikwm(
@@ -1800,7 +1946,8 @@ def download_one_tikwm(
     username,
     video_id,
     video_url,
-    progress_callback=None
+    progress_callback=None,
+    stop_checker=None
 ):
 
     data = tikwm_lookup(
@@ -1863,10 +2010,6 @@ def download_one_tikwm(
         video_id
     )
 
-    # ========================================================
-    # FILE ĐÃ TỒN TẠI
-    # ========================================================
-
     if os.path.exists(
         output_path
     ):
@@ -1895,15 +2038,12 @@ def download_one_tikwm(
                 "existing": True,
             }
 
-    # ========================================================
-    # DOWNLOAD
-    # ========================================================
-
     result = download_media(
         session,
         media_url,
         output_path,
-        progress_callback
+        progress_callback,
+        stop_checker
     )
 
     if not result["success"]:
@@ -1952,8 +2092,16 @@ def download_one_tikwm(
 def download_one_ytdlp(
     username,
     video_id,
-    video_url
+    video_url,
+    stop_checker=None
 ):
+
+    if (
+        stop_checker
+        and stop_checker()
+    ):
+
+        raise asyncio.CancelledError
 
     output_path = video_output_path(
         username,
@@ -2004,13 +2152,7 @@ def download_one_ytdlp(
 
         "noplaylist":
             True,
-
     }
-
-    # --------------------------------------------------------
-    # Cookie chỉ bật nếu cấu hình TRUE.
-    # Không hardcode cookie.
-    # --------------------------------------------------------
 
     if (
         USE_YTDLP_COOKIES
@@ -2036,6 +2178,13 @@ def download_one_ytdlp(
                 ]
             )
 
+        if (
+            stop_checker
+            and stop_checker()
+        ):
+
+            raise asyncio.CancelledError
+
         if os.path.exists(
             output_path
         ):
@@ -2058,6 +2207,10 @@ def download_one_ytdlp(
                 "yt-dlp không tạo được file."
         }
 
+    except asyncio.CancelledError:
+
+        raise
+
     except Exception as e:
 
         return {
@@ -2067,7 +2220,7 @@ def download_one_ytdlp(
 
 
 # ============================================================
-# DOWNLOAD ALL
+# DOWNLOAD ALL SYNC
 # ============================================================
 
 def download_all_sync(
@@ -2080,7 +2233,19 @@ def download_all_sync(
         username
     )
 
-    rows = get_all_videos()
+    rows = get_videos_by_username(
+        username
+    )
+
+    # --------------------------------------------------------
+    # Fallback:
+    # DB cũ của bạn có thể chưa lưu uploader đúng.
+    # Khi đó lấy toàn bộ database.
+    # --------------------------------------------------------
+
+    if not rows:
+
+        rows = get_all_videos()
 
     total = len(
         rows
@@ -2090,19 +2255,37 @@ def download_all_sync(
 
         return {
             "success": False,
-            "error":
+            "total": 0,
+            "downloaded": 0,
+            "photo": 0,
+            "error": 0,
+            "skipped": 0,
+            "fallback": 0,
+            "message":
                 "Database chưa có video."
         }
 
     session = create_http_session()
 
     stats = {
-        "total": total,
-        "downloaded": 0,
-        "photo": 0,
-        "error": 0,
-        "skipped": 0,
-        "fallback": 0,
+
+        "total":
+            total,
+
+        "downloaded":
+            0,
+
+        "photo":
+            0,
+
+        "error":
+            0,
+
+        "skipped":
+            0,
+
+        "fallback":
+            0,
     }
 
     try:
@@ -2112,7 +2295,10 @@ def download_all_sync(
             start=1
         ):
 
-            if stop_checker and stop_checker():
+            if (
+                stop_checker
+                and stop_checker()
+            ):
 
                 raise asyncio.CancelledError
 
@@ -2129,9 +2315,13 @@ def download_all_sync(
                 )
             )
 
-            # ------------------------------------------------
-            # Check file
-            # ------------------------------------------------
+            if not video_url:
+
+                stats[
+                    "error"
+                ] += 1
+
+                continue
 
             output_path = video_output_path(
                 username,
@@ -2176,36 +2366,48 @@ def download_all_sync(
 
                     continue
 
-            # ------------------------------------------------
-            # TikWM
-            # ------------------------------------------------
+            # =================================================
+            # TIKWM
+            # =================================================
 
             try:
+
+                def media_progress(
+                    current,
+                    total_size
+                ):
+
+                    if not progress_callback:
+
+                        return
+
+                    percent = (
+                        (
+                            current /
+                            total_size
+                        )
+                        * 100
+                        if total_size
+                        else 0
+                    )
+
+                    progress_callback(
+                        index,
+                        total,
+                        video_id,
+                        "download",
+                        percent,
+                        current,
+                        total_size
+                    )
 
                 result = download_one_tikwm(
                     session,
                     username,
                     video_id,
                     video_url,
-                    progress_callback=lambda current, total_size:
-                        progress_callback(
-                            index,
-                            total,
-                            video_id,
-                            "download",
-                            (
-                                (
-                                    current /
-                                    total_size
-                                ) * 100
-                                if total_size
-                                else 0
-                            ),
-                            current,
-                            total_size
-                        )
-                        if progress_callback
-                        else None
+                    media_progress,
+                    stop_checker
                 )
 
                 if result["type"] == "photo":
@@ -2219,10 +2421,6 @@ def download_all_sync(
                     stats[
                         "downloaded"
                     ] += 1
-
-                # --------------------------------------------
-                # Delay
-                # --------------------------------------------
 
                 time.sleep(
                     random.uniform(
@@ -2246,16 +2444,17 @@ def download_all_sync(
                     tikwm_error
                 )
 
-            # ------------------------------------------------
+            # =================================================
             # YT-DLP FALLBACK
-            # ------------------------------------------------
+            # =================================================
 
             if USE_YTDLP_FALLBACK:
 
                 fallback = download_one_ytdlp(
                     username,
                     video_id,
-                    video_url
+                    video_url,
+                    stop_checker
                 )
 
                 if fallback["success"]:
@@ -2287,9 +2486,9 @@ def download_all_sync(
 
                     continue
 
-            # ------------------------------------------------
+            # =================================================
             # ERROR
-            # ------------------------------------------------
+            # =================================================
 
             stats[
                 "error"
@@ -2381,6 +2580,19 @@ def format_progress(
 
 # ============================================================
 # SCAN WORKER
+#
+# QUAN TRỌNG:
+# Worker này KHÔNG gọi replace_user_tasks().
+#
+# download.py đã tạo task:
+#
+#   replace_user_tasks(
+#       user_id,
+#       process_tiktok_profile(...)
+#   )
+#
+# process_tiktok_profile()
+# sẽ trực tiếp chạy worker này.
 # ============================================================
 
 async def scan_worker(
@@ -2417,20 +2629,18 @@ async def scan_worker(
 
                 return True
 
-            if not session.get(
+            return not session.get(
                 "running",
                 False
-            ):
-
-                return True
-
-            return False
+            )
 
         def progress(
             count,
             video_id
         ):
 
+            # Có thể mở rộng progress
+            # scan sau này.
             return
 
         await message.edit(
@@ -2451,7 +2661,10 @@ async def scan_worker(
             "complete"
         ):
 
-            total = count_videos()
+            total = result.get(
+                "count",
+                0
+            )
 
             await message.edit(
                 "╭────────────────────────╮\n"
@@ -2462,15 +2675,16 @@ async def scan_worker(
 
                 "📊 <b>KẾT QUẢ</b>\n\n"
 
-                f"🎬 Video: "
+                f"🎬 Video mới/lưu: "
                 f"<b>{total}</b>\n\n"
 
                 "✅ Scan: <b>COMPLETE</b>\n\n"
 
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-                f"📥 Dùng:\n"
-                f"<code>/tiktokdownload {username}</code>",
+                "📚 Database đã cập nhật.\n"
+                "📥 Bạn có thể tiếp tục tải "
+                "profile từ menu Download.",
                 parse_mode="html"
             )
 
@@ -2479,10 +2693,12 @@ async def scan_worker(
             await message.edit(
                 "⚠️ <b>Scan chưa hoàn tất.</b>\n\n"
                 f"👤 @{username}\n"
-                f"📦 Đã lưu: {count_videos()}\n\n"
+                f"📦 Database: "
+                f"{count_videos()} video\n\n"
                 "❌ Profile chưa được đánh dấu "
                 "<b>COMPLETE</b>.\n\n"
-                f"⚠️ {result.get('error', 'Unknown error')}",
+                f"⚠️ "
+                f"{result.get('error', 'Unknown error')}",
                 parse_mode="html"
             )
 
@@ -2500,6 +2716,7 @@ async def scan_worker(
             )
 
         except Exception:
+
             pass
 
         raise
@@ -2519,9 +2736,24 @@ async def scan_worker(
             )
 
         except Exception:
+
             pass
 
     finally:
+
+        session = sessions.get(
+            user_id
+        )
+
+        if session:
+
+            session[
+                "processing"
+            ] = False
+
+            session[
+                "running"
+            ] = False
 
         untrack_current_task(
             user_id,
@@ -2569,14 +2801,10 @@ async def download_worker(
 
                 return True
 
-            if not session.get(
+            return not session.get(
                 "running",
                 False
-            ):
-
-                return True
-
-            return False
+            )
 
         async def update(
             text
@@ -2603,7 +2831,10 @@ async def download_worker(
                 )
 
             except Exception:
+
                 pass
+
+        loop = asyncio.get_running_loop()
 
         def progress(
             index,
@@ -2629,7 +2860,7 @@ async def download_worker(
 
                 asyncio.run_coroutine_threadsafe(
                     update(text),
-                    asyncio.get_running_loop()
+                    loop
                 )
 
             except Exception:
@@ -2637,8 +2868,14 @@ async def download_worker(
                 pass
 
         total = len(
-            get_all_videos()
+            get_videos_by_username(
+                username
+            )
         )
+
+        if total == 0:
+
+            total = count_videos()
 
         await message.edit(
             "╭────────────────────────╮\n"
@@ -2661,6 +2898,20 @@ async def download_worker(
             progress,
             stopped
         )
+
+        if not result.get(
+            "success"
+        ):
+
+            await message.edit(
+                "⚠️ <b>Không thể tải TikTok.</b>\n\n"
+                f"<code>"
+                f"{result.get('message', result.get('error', 'Unknown error'))}"
+                f"</code>",
+                parse_mode="html"
+            )
+
+            return
 
         await message.edit(
             "╭────────────────────────╮\n"
@@ -2717,6 +2968,7 @@ async def download_worker(
             )
 
         except Exception:
+
             pass
 
         raise
@@ -2736,9 +2988,24 @@ async def download_worker(
             )
 
         except Exception:
+
             pass
 
     finally:
+
+        session = sessions.get(
+            user_id
+        )
+
+        if session:
+
+            session[
+                "processing"
+            ] = False
+
+            session[
+                "running"
+            ] = False
 
         untrack_current_task(
             user_id,
@@ -2747,43 +3014,55 @@ async def download_worker(
 
 
 # ============================================================
-# START SESSION
+# PUBLIC API
+#
+# ĐÂY LÀ HÀM DOWNLOAD.PY GỌI
 # ============================================================
 
-async def start_session(
+async def process_tiktok_profile(
     bot,
     event,
-    command,
-    username
+    username,
+    notify_bot=None
 ):
 
     user_id = event.sender_id
+
+    username = clean_username(
+        username
+    )
+
+    if not username:
+
+        await event.reply(
+            "❌ <b>Username TikTok không hợp lệ.</b>",
+            parse_mode="html"
+        )
+
+        return
 
     sessions = get_sessions(
         bot
     )
 
     # --------------------------------------------------------
-    # Dừng task cũ + xóa session cũ
-    # --------------------------------------------------------
-
-    await replace_user_tasks(
-        user_id
-    )
-
-    sessions.pop(
-        user_id,
-        None
-    )
-
-    # --------------------------------------------------------
-    # Session mới
+    # Không replace_user_tasks() ở đây.
+    #
+    # download.py đã quản lý task:
+    #
+    # replace_user_tasks(
+    #     user_id,
+    #     process_tiktok_profile(...)
+    # )
+    #
+    # Nếu gọi replace_user_tasks() lần nữa ở đây,
+    # task hiện tại có thể tự hủy.
     # --------------------------------------------------------
 
     sessions[user_id] = {
 
         "command":
-            command,
+            "tiktok",
 
         "username":
             username,
@@ -2793,43 +3072,121 @@ async def start_session(
 
         "processing":
             True,
+
+        "source":
+            "download",
+
+        "notify_bot":
+            notify_bot,
     }
 
     message = await event.reply(
-        "⏳ <b>Đang khởi động TikTok...</b>",
+        "⏳ <b>Đang khởi động TikTok...</b>\n\n"
+        f"👤 <code>@{username}</code>",
         parse_mode="html"
     )
 
     # --------------------------------------------------------
-    # Tạo worker
+    # process_tiktok_profile() chính là task mà download.py
+    # đang quản lý.
+    #
+    # Vì vậy chạy worker trực tiếp.
     # --------------------------------------------------------
 
-    if command == "scan":
+    await scan_worker(
+        bot,
+        event,
+        username,
+        message
+    )
 
-        coro = scan_worker(
-            bot,
-            event,
-            username,
-            message
+
+# ============================================================
+# PUBLIC API:
+# TẢI TOÀN BỘ VIDEO ĐÃ SCAN
+#
+# Có thể dùng sau này nếu download.py cần.
+# ============================================================
+
+async def process_tiktok_download(
+    bot,
+    event,
+    username,
+    notify_bot=None
+):
+
+    user_id = event.sender_id
+
+    username = clean_username(
+        username
+    )
+
+    if not username:
+
+        await event.reply(
+            "❌ <b>Username TikTok không hợp lệ.</b>",
+            parse_mode="html"
         )
 
-    else:
+        return
 
-        coro = download_worker(
-            bot,
-            event,
+    sessions = get_sessions(
+        bot
+    )
+
+    sessions[user_id] = {
+
+        "command":
+            "tiktok_download",
+
+        "username":
             username,
-            message
-        )
 
-    await replace_user_tasks(
-        user_id,
-        coro
+        "running":
+            True,
+
+        "processing":
+            True,
+
+        "source":
+            "download",
+
+        "notify_bot":
+            notify_bot,
+    }
+
+    message = await event.reply(
+        "⏳ <b>Đang chuẩn bị tải TikTok...</b>\n\n"
+        f"👤 <code>@{username}</code>",
+        parse_mode="html"
+    )
+
+    await download_worker(
+        bot,
+        event,
+        username,
+        message
     )
 
 
 # ============================================================
 # REGISTER
+#
+# QUAN TRỌNG:
+#
+# Không còn:
+#   /tiktok
+#   /tiktokdownload
+#
+# Vì toàn bộ flow đi qua:
+#
+#   /download
+#       ↓
+#   TikTok
+#       ↓
+#   Playlist / Profile
+#       ↓
+#   process_tiktok_profile()
 # ============================================================
 
 def register(
@@ -2837,228 +3194,24 @@ def register(
     notify_bot
 ):
 
-    # ========================================================
-    # INIT DATABASE
-    # ========================================================
-
     init_tiktok_database()
 
-    sessions = get_sessions(
-        bot
+    logger.info(
+        "[TIKTOK] Database initialized."
     )
 
-    # ========================================================
-    # /tiktok
-    # ========================================================
-
-    @bot.on(
-        events.NewMessage(
-            pattern=r"^/tiktok(?:@\w+)?(?:\s+(.+))?$"
-        )
+    logger.info(
+        "[TIKTOK] Standalone commands disabled."
     )
-    async def tiktok_command(
-        event
-    ):
 
-        username = (
-            event.pattern_match.group(
-                1
-            )
-        )
-
-        if not username:
-
-            # ------------------------------------------------
-            # Chờ username
-            # ------------------------------------------------
-
-            await replace_user_tasks(
-                event.sender_id
-            )
-
-            sessions.pop(
-                event.sender_id,
-                None
-            )
-
-            sessions[
-                event.sender_id
-            ] = {
-
-                "command":
-                    "tiktok",
-
-                "running":
-                    True,
-
-                "processing":
-                    False,
-            }
-
-            await event.reply(
-                "╭────────────────────────╮\n"
-                "│   🎵 <b>TIKTOK SCANNER</b>  │\n"
-                "╰────────────────────────╯\n\n"
-
-                "📥 <b>Gửi username TikTok.</b>\n\n"
-
-                "Ví dụ:\n"
-                "<code>@nguyenvanloiofficial</code>\n\n"
-
-                "Hoặc:\n"
-                "<code>"
-                "https://www.tiktok.com/"
-                "@nguyenvanloiofficial"
-                "</code>\n\n"
-
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-                "⚡ Bot sẽ:\n"
-                "• Quét profile\n"
-                "• Lưu SQLite\n"
-                "• Checkpoint\n"
-                "• Không giới hạn video\n"
-                "• Retry 429\n\n"
-
-                "🛑 <code>/stop</code> → Dừng",
-                parse_mode="html"
-            )
-
-            return
-
-        username = clean_username(
-            username
-        )
-
-        if not username:
-
-            await event.reply(
-                "❌ Username TikTok không hợp lệ."
-            )
-
-            return
-
-        await start_session(
-            bot,
-            event,
-            "scan",
-            username
-        )
-
-    # ========================================================
-    # NHẬN USERNAME
-    # ========================================================
-
-    @bot.on(
-        events.NewMessage()
-    )
-    async def receive_username(
-        event
-    ):
-
-        user_id = event.sender_id
-
-        text = (
-            event.raw_text
-            .strip()
-        )
-
-        if not text:
-            return
-
-        if text.startswith("/"):
-            return
-
-        session = sessions.get(
-            user_id
-        )
-
-        if not session:
-            return
-
-        if session.get(
-            "command"
-        ) != "tiktok":
-
-            return
-
-        if session.get(
-            "processing"
-        ):
-
-            return
-
-        username = clean_username(
-            text
-        )
-
-        if not username:
-
-            return
-
-        session[
-            "processing"
-        ] = True
-
-        await start_session(
-            bot,
-            event,
-            "scan",
-            username
-        )
-
-    # ========================================================
-    # /tiktokdownload
-    # ========================================================
-
-    @bot.on(
-        events.NewMessage(
-            pattern=r"^/tiktokdownload(?:@\w+)?(?:\s+(.+))?$"
-        )
-    )
-    async def tiktok_download(
-        event
-    ):
-
-        username = (
-            event.pattern_match.group(
-                1
-            )
-        )
-
-        if not username:
-
-            await event.reply(
-                "╭────────────────────────╮\n"
-                "│   📥 <b>TIKTOK DOWNLOAD</b> │\n"
-                "╰────────────────────────╯\n\n"
-
-                "Dùng:\n"
-                "<code>/tiktokdownload username</code>\n\n"
-
-                "Ví dụ:\n"
-                "<code>/tiktokdownload "
-                "nguyenvanloiofficial</code>",
-                parse_mode="html"
-            )
-
-            return
-
-        username = clean_username(
-            username
-        )
-
-        if not username:
-
-            await event.reply(
-                "❌ Username TikTok không hợp lệ."
-            )
-
-            return
-
-        await start_session(
-            bot,
-            event,
-            "download",
-            username
-        )
+    # Không đăng ký event handler ở đây.
+    #
+    # Không có:
+    #   @bot.on(...)
+    #
+    # cho /tiktok.
+    #
+    # Không có:
+    #   /tiktokdownload.
+    #
+    # download.py là entry point duy nhất.

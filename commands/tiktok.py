@@ -3074,7 +3074,6 @@ async def start_tiktok_download(
     event,
     username,
     notify_bot=None,
-    message=None
 ):
 
     username = clean_username(

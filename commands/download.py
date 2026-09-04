@@ -415,7 +415,6 @@ async def run_tiktok_download_all(
             event=event,
             username=username,
             notify_bot=notify_bot,
-            message=event.message
         )
 
         if asyncio.iscoroutine(result):

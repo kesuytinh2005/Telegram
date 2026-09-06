@@ -3501,7 +3501,7 @@ def register(
     # ========================================================
     # NHẬN LINK FACEBOOK
     # ========================================================
-        def extract_urls(text):
+    def extract_urls(text):
         """
         Extract nhiều Facebook URLs từ text Telegram.
         Không can thiệp vào FacebookResolver/V15.

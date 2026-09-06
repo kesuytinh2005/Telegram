@@ -3501,7 +3501,58 @@ def register(
     # ========================================================
     # NHẬN LINK FACEBOOK
     # ========================================================
+        def extract_urls(text):
+        """
+        Extract nhiều Facebook URLs từ text Telegram.
+        Không can thiệp vào FacebookResolver/V15.
+        """
+        if not text:
+            return []
 
+        matches = re.findall(
+            r'https?://[^\s<>"\']+',
+            str(text),
+            flags=re.IGNORECASE,
+        )
+
+        urls = []
+        seen = set()
+
+        for url in matches:
+            url = url.strip()
+
+            # Xóa punctuation bị dính khi người dùng gửi:
+            # https://facebook.com/xxx)
+            url = url.rstrip('.,!?;:)]}\'"')
+
+            if not url:
+                continue
+
+            try:
+                parsed = urlparse(url)
+                host = (parsed.netloc or '').lower().split(':')[0]
+
+                if not (
+                    host == 'facebook.com'
+                    or host.endswith('.facebook.com')
+                    or host == 'fb.com'
+                    or host.endswith('.fb.com')
+                    or host == 'fb.watch'
+                ):
+                    continue
+
+            except Exception:
+                continue
+
+            key = url.lower()
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            urls.append(url)
+
+        return urls
     @bot.on(
         events.NewMessage()
     )

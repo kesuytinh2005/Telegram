@@ -68,8 +68,6 @@ from telethon import events, Button
 
 from core.task_manager import (
     replace_user_tasks,
-    track_current_task,
-    untrack_current_task,
 )
 # ============================================================
 # VERSION
@@ -2516,9 +2514,245 @@ class FacebookResolver:
 # ============================================================
 # TELEGRAM FORMAT HELPERS
 # ============================================================
+def tg_escape(value: Any) -> str:
+    return html.escape(
+        clean_text(value),
+        quote=False,
+    )
+def field_line(
+    label: str,
+    value: Any,
+) -> Optional[str]:
+    value = clean_text(value)
+    if not value:
+        return None
+    return (
+        f"<b>{tg_escape(label)}</b>: "
+        f"<code>{tg_escape(shorten_id(value))}</code>"
+    )
+def format_result(
+    result: Result,
+    elapsed: float,
+) -> str:
+    lines = []
+    lines.append(
+        f"<b>🔎 FB UID / ENTITY RESOLVER "
+        f"{VERSION}</b>"
+    )
+    lines.append("")
+    status_icon = (
+        "✅"
+        if result.success
+        else "⚠️"
+    )
+    lines.append(
+        f"{status_icon} <b>STATUS:</b> "
+        f"<code>{tg_escape(result.status)}</code>"
+    )
+    lines.append(
+        f"🎯 <b>CONFIDENCE:</b> "
+        f"<code>{result.confidence}%</code>"
+    )
+    lines.append(
+        f"⏱ <b>TIME:</b> "
+        f"<code>{elapsed:.2f}s</code>"
+    )
+    lines.append("")
+    # --------------------------------------------------------
+    # MAIN UID
+    # --------------------------------------------------------
+    if result.user_uid:
+        verification = (
+            "VERIFIED"
+            if result.user_uid_verified
+            else "FOUND / NOT FULLY VERIFIED"
+        )
+        lines.append(
+            "👤 <b>USER UID:</b> "
+            f"<code>{tg_escape(result.user_uid)}</code>"
+        )
+        lines.append(
+            "🛡 <b>VERIFICATION:</b> "
+            f"<code>{verification}</code>"
+        )
+    else:
+        lines.append(
+            "👤 <b>USER UID:</b> "
+            "<code>NOT FOUND</code>"
+        )
+    # --------------------------------------------------------
+    # URL TYPE
+    # --------------------------------------------------------
+    lines.append("")
+    lines.append(
+        "🌐 <b>URL TYPE:</b> "
+        f"<code>{tg_escape(result.url_type)}</code>"
+    )
+    lines.append(
+        "🏷 <b>ENTITY TYPE:</b> "
+        f"<code>{tg_escape(result.entity_type)}</code>"
+    )
+    lines.append(
+        "👥 <b>PUBLISHER TYPE:</b> "
+        f"<code>{tg_escape(result.publisher_type)}</code>"
+    )
+    # --------------------------------------------------------
+    # USER / PUBLISHER
+    # --------------------------------------------------------
+    if result.publisher_username:
+        lines.append(
+            "📛 <b>USERNAME:</b> "
+            f"<code>@{tg_escape(result.publisher_username)}</code>"
+        )
+    if result.publisher_id:
+        lines.append(
+            "🆔 <b>PUBLISHER ID:</b> "
+            f"<code>{tg_escape(result.publisher_id)}</code>"
+        )
+    # --------------------------------------------------------
+    # PAGE / GROUP
+    # --------------------------------------------------------
+    if result.page_id:
+        lines.append(
+            "📄 <b>PAGE ID:</b> "
+            f"<code>{tg_escape(result.page_id)}</code>"
+        )
+    if result.group_id:
+        lines.append(
+            "👥 <b>GROUP ID:</b> "
+            f"<code>{tg_escape(result.group_id)}</code>"
+        )
+    # --------------------------------------------------------
+    # CONTENT IDs
+    # --------------------------------------------------------
+    content_fields = [
+        ("POST ID", result.post_id),
+        ("VIDEO ID", result.video_id),
+        ("REEL ID", result.reel_id),
+        ("PHOTO ID", result.photo_id),
+        ("STORY ID", result.story_id),
+        ("MEDIA FBID", result.media_fbid),
+        ("ACTOR ID", result.actor_id),
+        ("ENTITY ID", result.entity_id),
+        ("DECODED ID", result.decoded_id),
+    ]
+    for label, value in content_fields:
+        line = field_line(
+            label,
+            value,
+        )
+        if line:
+            lines.append(line)
+    # --------------------------------------------------------
+    # TITLE
+    # --------------------------------------------------------
+    if result.title:
+        lines.append("")
+        lines.append(
+            "📝 <b>TITLE:</b> "
+            f"{tg_escape(truncate(result.title, 350))}"
+        )
+    # --------------------------------------------------------
+    # RESOLVED URL
+    # --------------------------------------------------------
+    if result.resolved_url:
+        lines.append("")
+        lines.append(
+            "🔗 <b>RESOLVED:</b>\n"
+            f"<code>{tg_escape(truncate(result.resolved_url, 700))}</code>"
+        )
+    # --------------------------------------------------------
+    # WARNINGS
+    # --------------------------------------------------------
+    if result.warnings:
+        lines.append("")
+        lines.append(
+            "⚠️ <b>WARNINGS:</b>"
+        )
+        for warning in result.warnings[:5]:
+            lines.append(
+                "• "
+                + tg_escape(
+                    truncate(
+                        warning,
+                        250,
+                    )
+                )
+            )
+    # --------------------------------------------------------
+    # EVIDENCE
+    # --------------------------------------------------------
+    evidence_count = len(
+        result.evidence
+    )
+    lines.append("")
+    lines.append(
+        "📊 <b>EVIDENCE:</b> "
+        f"<code>{evidence_count}</code> "
+        "signals"
+    )
+    lines.append(
+        "📡 <b>PAGES:</b> "
+        f"<code>{len(result.crawl_chain)}</code>"
+    )
+    output = "\n".join(
+        lines
+    )
+    if len(output) > MAX_TELEGRAM_MESSAGE:
+        output = output[
+            :MAX_TELEGRAM_MESSAGE - 30
+        ]
+        output += (
+            "\n\n<i>...</i>"
+        )
+    return output
 # ============================================================
-# DRAGON BOT - GETUIDFB COMMAND ADAPTER
+# TELEGRAM BOT
 # ============================================================
+# ============================================================
+# TELETHON BOT ADAPTER
+# ============================================================
+
+START_TEXT = """
+<b>🔎 FB UID / ENTITY RESOLVER V15 ULTRA</b>
+
+Bot phân tích URL Facebook bằng HTTP public.
+
+<b>Không sử dụng:</b>
+• Playwright
+• Selenium
+• Cookie
+• Access Token
+• Facebook Login
+
+<b>Lệnh:</b>
+<code>/getuidfb URL</code>
+
+<b>Ví dụ:</b>
+<code>/getuidfb https://www.facebook.com/username</code>
+
+Bạn cũng có thể gửi trực tiếp một URL Facebook cho bot.
+
+<b>Hỗ trợ:</b>
+• Profile / User
+• Page
+• Group
+• Post
+• Reel
+• Video
+• Photo
+• Story
+• share/p
+• share/v
+• share/r
+• pfbid
+• media_fbid
+• actor_id
+• profile_id
+• entity_id
+• UID verification
+"""
+
 
 # ============================================================
 # COMMAND INFO
@@ -2538,9 +2772,15 @@ COMMAND_INFO = {
         "/getuidfb https://facebook.com/username/posts/123456789",
         "/getuidfb https://facebook.com/reel/123456789",
     ],
+    "details": (
+        "HTTP-only Facebook public resolver. "
+        "Hỗ trợ phân tích profile, page, group, "
+        "post, reel, video, photo, story, share URL, "
+        "pfbid, media_fbid, actor_id, profile_id "
+        "và xác minh UID bằng nhiều nguồn bằng chứng."
+    ),
     "supported": [
-        "Profile",
-        "User",
+        "Profile / User",
         "Page",
         "Group",
         "Post",
@@ -2563,753 +2803,310 @@ COMMAND_INFO = {
 
 
 # ============================================================
-# CONFIG
+# /start
 # ============================================================
 
-GETUIDFB_TIMEOUT = DEFAULT_TIMEOUT
-GETUIDFB_MAX_PAGES = DEFAULT_MAX_PAGES
-GETUIDFB_CONCURRENCY = DEFAULT_CONCURRENCY
-
-
-# ============================================================
-# TELEGRAM HTML HELPERS
-# ============================================================
-
-def tg_html(value):
-    """
-    Escape text để dùng với parse_mode='html'.
-    """
-
-    if value is None:
-        return ""
-
-    return html.escape(
-        clean_text(value),
-        quote=False,
-    )
-
-
-def tg_code(value):
-    """
-    Escape text bên trong <code>.
-    """
-
-    return (
-        "<code>"
-        + tg_html(value)
-        + "</code>"
-    )
-
-
-def tg_bold(value):
-    return (
-        "<b>"
-        + tg_html(value)
-        + "</b>"
-    )
-
-
-def tg_truncate(
-    value,
-    length=500,
-):
-    value = clean_text(value)
-
-    if len(value) <= length:
-        return value
-
-    return (
-        value[:length - 3]
-        + "..."
+async def start_command(event):
+    await event.reply(
+        START_TEXT,
+        parse_mode="html",
+        link_preview=False,
     )
 
 
 # ============================================================
-# FORMAT RESULT
+# /help
 # ============================================================
 
-def field_line(
-    label,
-    value,
-):
-    value = clean_text(value)
-
-    if not value:
-        return None
-
-    return (
-        f"🔹 <b>{tg_html(label)}</b>: "
-        f"{tg_code(tg_truncate(value, 100))}"
+async def help_command(event):
+    await event.reply(
+        START_TEXT,
+        parse_mode="html",
+        link_preview=False,
     )
-
-
-def format_result(
-    result: Result,
-    elapsed: float,
-) -> str:
-
-    lines = []
-
-    # ========================================================
-    # HEADER
-    # ========================================================
-
-    lines.append(
-        f"🔎 <b>FB UID / ENTITY RESOLVER "
-        f"{tg_html(VERSION)}</b>"
-    )
-
-    lines.append("")
-
-    # ========================================================
-    # STATUS
-    # ========================================================
-
-    status_icon = (
-        "✅"
-        if result.success
-        else "⚠️"
-    )
-
-    lines.append(
-        f"{status_icon} <b>STATUS:</b> "
-        f"{tg_code(result.status)}"
-    )
-
-    lines.append(
-        f"🎯 <b>CONFIDENCE:</b> "
-        f"{tg_code(str(result.confidence) + '%')}"
-    )
-
-    lines.append(
-        f"⏱ <b>TIME:</b> "
-        f"{tg_code(f'{elapsed:.2f}s')}"
-    )
-
-    lines.append("")
-
-    # ========================================================
-    # USER UID
-    # ========================================================
-
-    if result.user_uid:
-
-        verification = (
-            "VERIFIED"
-            if result.user_uid_verified
-            else "FOUND / NOT FULLY VERIFIED"
-        )
-
-        lines.append(
-            "👤 <b>USER UID:</b> "
-            f"{tg_code(result.user_uid)}"
-        )
-
-        lines.append(
-            "🛡 <b>VERIFICATION:</b> "
-            f"{tg_code(verification)}"
-        )
-
-    else:
-
-        lines.append(
-            "👤 <b>USER UID:</b> "
-            "<code>NOT FOUND</code>"
-        )
-
-    # ========================================================
-    # TYPE
-    # ========================================================
-
-    lines.append("")
-
-    lines.append(
-        "🌐 <b>URL TYPE:</b> "
-        f"{tg_code(result.url_type)}"
-    )
-
-    lines.append(
-        "🏷 <b>ENTITY TYPE:</b> "
-        f"{tg_code(result.entity_type)}"
-    )
-
-    lines.append(
-        "👥 <b>PUBLISHER TYPE:</b> "
-        f"{tg_code(result.publisher_type)}"
-    )
-
-    # ========================================================
-    # USER / PUBLISHER
-    # ========================================================
-
-    if result.publisher_username:
-
-        lines.append(
-            "📛 <b>USERNAME:</b> "
-            f"{tg_code('@' + result.publisher_username)}"
-        )
-
-    if result.publisher_id:
-
-        lines.append(
-            "🆔 <b>PUBLISHER ID:</b> "
-            f"{tg_code(result.publisher_id)}"
-        )
-
-    # ========================================================
-    # PAGE / GROUP
-    # ========================================================
-
-    if result.page_id:
-
-        lines.append(
-            "📄 <b>PAGE ID:</b> "
-            f"{tg_code(result.page_id)}"
-        )
-
-    if result.group_id:
-
-        lines.append(
-            "👥 <b>GROUP ID:</b> "
-            f"{tg_code(result.group_id)}"
-        )
-
-    # ========================================================
-    # CONTENT IDS
-    # ========================================================
-
-    content_fields = [
-        ("POST ID", result.post_id),
-        ("VIDEO ID", result.video_id),
-        ("REEL ID", result.reel_id),
-        ("PHOTO ID", result.photo_id),
-        ("STORY ID", result.story_id),
-        ("MEDIA FBID", result.media_fbid),
-        ("ACTOR ID", result.actor_id),
-        ("ENTITY ID", result.entity_id),
-        ("DECODED ID", result.decoded_id),
-    ]
-
-    for label, value in content_fields:
-
-        line = field_line(
-            label,
-            value,
-        )
-
-        if line:
-            lines.append(line)
-
-    # ========================================================
-    # TITLE
-    # ========================================================
-
-    if result.title:
-
-        lines.append("")
-
-        lines.append(
-            "📝 <b>TITLE:</b> "
-            f"{tg_html(tg_truncate(result.title, 350))}"
-        )
-
-    # ========================================================
-    # RESOLVED URL
-    # ========================================================
-
-    if result.resolved_url:
-
-        lines.append("")
-
-        lines.append(
-            "🔗 <b>RESOLVED URL:</b>\n"
-            f"{tg_code(tg_truncate(result.resolved_url, 700))}"
-        )
-
-    # ========================================================
-    # WARNINGS
-    # ========================================================
-
-    if result.warnings:
-
-        lines.append("")
-
-        lines.append(
-            "⚠️ <b>WARNINGS:</b>"
-        )
-
-        for warning in result.warnings[:5]:
-
-            lines.append(
-                "• "
-                + tg_html(
-                    tg_truncate(
-                        warning,
-                        250,
-                    )
-                )
-            )
-
-    # ========================================================
-    # EVIDENCE
-    # ========================================================
-
-    lines.append("")
-
-    lines.append(
-        "📊 <b>EVIDENCE:</b> "
-        f"{tg_code(str(len(result.evidence)))} "
-        "signals"
-    )
-
-    lines.append(
-        "📡 <b>PAGES:</b> "
-        f"{tg_code(str(len(result.crawl_chain)))}"
-    )
-
-    output = "\n".join(lines)
-
-    # ========================================================
-    # TELEGRAM MESSAGE LIMIT
-    # ========================================================
-
-    if len(output) > MAX_TELEGRAM_MESSAGE:
-
-        output = (
-            output[
-                :MAX_TELEGRAM_MESSAGE - 50
-            ]
-            + "\n\n<i>...</i>"
-        )
-
-    return output
 
 
 # ============================================================
 # PROCESS FACEBOOK URL
 # ============================================================
 
-async def _run_getuidfb(
-    event,
-    url,
-    processing_message,
-):
-
-    user_id = event.sender_id
-
-    started = time.perf_counter()
-
-    # ========================================================
-    # ĐĂNG KÝ TASK HIỆN TẠI
-    # ========================================================
-
-    current_task = asyncio.current_task()
-
-    if current_task is not None:
-
-        track_current_task(
-            user_id,
-            current_task,
-        )
-
-    try:
-
-        # ====================================================
-        # NEW RESOLVER
-        # ====================================================
-
-        resolver = FacebookResolver(
-            timeout=GETUIDFB_TIMEOUT,
-            max_pages=GETUIDFB_MAX_PAGES,
-            concurrency=GETUIDFB_CONCURRENCY,
-        )
-
-        # ====================================================
-        # RESOLVE
-        # ====================================================
-
-        result = await resolver.resolve(
-            url
-        )
-
-        elapsed = (
-            time.perf_counter()
-            - started
-        )
-
-        output = format_result(
-            result,
-            elapsed,
-        )
-
-        # ====================================================
-        # BUTTONS
-        # ====================================================
-
-        buttons = []
-
-        # ----------------------------------------------------
-        # PROFILE
-        # ----------------------------------------------------
-
-        if (
-            result.user_uid
-            and is_numeric_id(
-                result.user_uid
-            )
-        ):
-
-            buttons.append(
-                [
-                    Button.url(
-                        "👤 Mở Profile",
-                        (
-                            "https://www.facebook.com/"
-                            + result.user_uid
-                        ),
-                    )
-                ]
-            )
-
-        # ----------------------------------------------------
-        # USERNAME
-        # ----------------------------------------------------
-
-        if result.publisher_username:
-
-            username_url = (
-                "https://www.facebook.com/"
-                + quote(
-                    result.publisher_username,
-                    safe="._-",
-                )
-            )
-
-            buttons.append(
-                [
-                    Button.url(
-                        "📛 Mở Username",
-                        username_url,
-                    )
-                ]
-            )
-
-        # ----------------------------------------------------
-        # RESOLVED URL
-        # ----------------------------------------------------
-
-        if (
-            result.resolved_url
-            and is_http_url(
-                result.resolved_url
-            )
-        ):
-
-            buttons.append(
-                [
-                    Button.url(
-                        "🔗 Mở URL",
-                        result.resolved_url,
-                    )
-                ]
-            )
-
-        # ====================================================
-        # UPDATE MESSAGE
-        # ====================================================
-
-        try:
-
-            await processing_message.edit(
-                output,
-                parse_mode="html",
-                buttons=(
-                    buttons
-                    if buttons
-                    else None
-                ),
-                link_preview=False,
-            )
-
-        except Exception as edit_error:
-
-            print(
-                "[GETUIDFB EDIT ERROR]",
-                repr(edit_error),
-            )
-
-            await event.reply(
-                output,
-                parse_mode="html",
-                buttons=(
-                    buttons
-                    if buttons
-                    else None
-                ),
-                link_preview=False,
-            )
-
-    except asyncio.CancelledError:
-
-        # ====================================================
-        # TASK BỊ /start, /stop HOẶC URL MỚI HỦY
-        # ====================================================
-
-        print(
-            f"[GETUIDFB] "
-            f"Task cancelled user={user_id}"
-        )
-
-        try:
-
-            await processing_message.edit(
-                "🛑 <b>Tác vụ đã được dừng.</b>",
-                parse_mode="html",
-            )
-
-        except Exception:
-            pass
-
-        raise
-
-    except Exception as exc:
-
-        elapsed = (
-            time.perf_counter()
-            - started
-        )
-
-        print(
-            "[GETUIDFB ERROR]",
-            repr(exc),
-        )
-
-        error_text = (
-            "❌ <b>GETUIDFB ERROR</b>\n\n"
-            f"🔴 <b>Error:</b> "
-            f"{tg_code(str(exc)[:1200])}\n"
-            f"⏱ <b>Time:</b> "
-            f"{tg_code(f'{elapsed:.2f}s')}"
-        )
-
-        try:
-
-            await processing_message.edit(
-                error_text,
-                parse_mode="html",
-            )
-
-        except Exception:
-
-            try:
-
-                await event.reply(
-                    error_text,
-                    parse_mode="html",
-                )
-
-            except Exception:
-                pass
-
-    finally:
-
-        # ====================================================
-        # CHỈ UNTRACK NẾU ĐÂY VẪN LÀ TASK HIỆN TẠI
-        # ====================================================
-
-        try:
-
-            untrack_current_task(
-                user_id,
-                current_task,
-            )
-
-        except Exception:
-            pass
-
-
-# ============================================================
-# PROCESS URL
-# ============================================================
-
 async def process_facebook_url(
     event,
-    url,
+    url: str,
 ):
+    """
+    Telethon adapter.
 
-    if not event:
-        return
-
-    # ========================================================
-    # CLEAN URL
-    # ========================================================
+    KHÔNG thay đổi FacebookResolver.
+    KHÔNG thay đổi V15 engine.
+    Chỉ thay Telegram framework.
+    """
 
     url = strip_url_punctuation(
         clean_text(url)
     )
 
     if not url:
-
-        await event.reply(
-            "❌ <b>Không tìm thấy URL.</b>",
-            parse_mode="html",
-        )
-
         return
 
-    # ========================================================
-    # NORMALIZE
-    # ========================================================
+    normalized = normalize_url(url)
 
-    normalized = normalize_url(
-        url
+    if not is_http_url(normalized):
+        await event.reply(
+            "❌ URL không hợp lệ."
+        )
+        return
+
+    if not is_fb_host_or_redirect(normalized):
+        await event.reply(
+            "❌ Đây không phải URL Facebook."
+        )
+        return
+
+    # --------------------------------------------------------
+    # PROCESSING MESSAGE
+    # --------------------------------------------------------
+
+    processing_message = await event.reply(
+        "⏳ <b>Đang phân tích Facebook...</b>\n"
+        "HTTP public resolver đang thu thập "
+        "các bằng chứng UID/entity.",
+        parse_mode="html",
+        link_preview=False,
     )
 
-    if not normalized:
+    started = time.perf_counter()
 
-        await event.reply(
-            "❌ <b>URL không hợp lệ.</b>",
-            parse_mode="html",
-        )
-
-        return
-
-    # ========================================================
-    # FACEBOOK CHECK
-    # ========================================================
-
-    if not is_fb_host_or_redirect(
-        normalized
-    ):
-
-        await event.reply(
-            "❌ <b>Đây không phải URL Facebook.</b>",
-            parse_mode="html",
-        )
-
-        return
-
-    # ========================================================
-    # PROCESSING MESSAGE
-    # ========================================================
-
-    try:
-
-        processing_message = await event.reply(
-            "⏳ <b>Đang phân tích Facebook...</b>\n\n"
-            "🌐 HTTP public resolver đang "
-            "thu thập bằng chứng UID / Entity...",
-            parse_mode="html",
-            link_preview=False,
-        )
-
-    except Exception as exc:
-
-        print(
-            "[GETUIDFB SEND ERROR]",
-            repr(exc),
-        )
-
-        return
-
-    # ========================================================
+    # --------------------------------------------------------
     # WORKER
-    #
-    # Mỗi user chỉ có một task.
-    #
-    # URL mới:
-    #   -> task cũ bị cancel
-    #   -> task mới chạy
-    #
-    # User khác:
-    #   -> không ảnh hưởng
-    # ========================================================
+    # --------------------------------------------------------
 
     async def worker():
-
-        await _run_getuidfb(
-            event,
-            normalized,
-            processing_message,
-        )
-
-    try:
-
-        task = await replace_user_tasks(
-            event.sender_id,
-            worker(),
-        )
-
-        if task is None:
-
-            await processing_message.edit(
-                "❌ <b>Không thể tạo tác vụ.</b>",
-                parse_mode="html",
-            )
-
-    except Exception as exc:
-
-        print(
-            "[GETUIDFB TASK ERROR]",
-            repr(exc),
-        )
+        resolver = None
 
         try:
+            # ------------------------------------------------
+            # NEW RESOLVER PER REQUEST
+            #
+            # Giữ nguyên thiết kế V15:
+            # mỗi request có resolver riêng,
+            # tránh state dùng chung giữa users.
+            # ------------------------------------------------
 
-            await processing_message.edit(
-                "❌ <b>Không thể khởi động resolver.</b>\n\n"
-                f"{tg_code(str(exc)[:1000])}",
-                parse_mode="html",
+            resolver = FacebookResolver(
+                timeout=DEFAULT_TIMEOUT,
+                max_pages=DEFAULT_MAX_PAGES,
+                concurrency=DEFAULT_CONCURRENCY,
             )
 
-        except Exception:
-            pass
+            result = await resolver.resolve(
+                normalized
+            )
+
+            elapsed = (
+                time.perf_counter()
+                - started
+            )
+
+            output = format_result(
+                result,
+                elapsed,
+            )
+
+            # ------------------------------------------------
+            # TELEGRAM INLINE BUTTONS
+            # ------------------------------------------------
+
+            buttons = []
+
+            # USER UID
+            if (
+                result.user_uid
+                and is_numeric_id(
+                    result.user_uid
+                )
+            ):
+                profile_url = (
+                    "https://www.facebook.com/"
+                    + result.user_uid
+                )
+
+                buttons.append([
+                    Button.url(
+                        "👤 Mở Profile",
+                        profile_url,
+                    )
+                ])
+
+            # USERNAME
+            if result.publisher_username:
+                username_url = (
+                    "https://www.facebook.com/"
+                    + quote(
+                        result.publisher_username,
+                        safe="._-",
+                    )
+                )
+
+                buttons.append([
+                    Button.url(
+                        "📛 Mở Username",
+                        username_url,
+                    )
+                ])
+
+            # RESOLVED URL
+            if (
+                result.resolved_url
+                and is_http_url(
+                    result.resolved_url
+                )
+            ):
+                buttons.append([
+                    Button.url(
+                        "🔗 Mở URL",
+                        result.resolved_url,
+                    )
+                ])
+
+            # ------------------------------------------------
+            # EDIT PROCESSING MESSAGE
+            # ------------------------------------------------
+
+            await processing_message.edit(
+                output,
+                parse_mode="html",
+                link_preview=False,
+                buttons=buttons or None,
+            )
+
+        except asyncio.CancelledError:
+            # ------------------------------------------------
+            # User gửi URL mới.
+            # task_manager sẽ cancel task cũ.
+            #
+            # Không gửi lỗi "Resolver Error" khi bị cancel.
+            # ------------------------------------------------
+
+            raise
+
+        except Exception as exc:
+            elapsed = (
+                time.perf_counter()
+                - started
+            )
+
+            error_text = (
+                "❌ <b>Resolver Error</b>\n\n"
+                "<b>Error:</b> "
+                f"<code>"
+                f"{tg_escape(str(exc)[:1000])}"
+                f"</code>\n"
+                "<b>Time:</b> "
+                f"<code>{elapsed:.2f}s</code>"
+            )
+
+            try:
+                await processing_message.edit(
+                    error_text,
+                    parse_mode="html",
+                )
+            except Exception:
+                try:
+                    await event.reply(
+                        error_text,
+                        parse_mode="html",
+                    )
+                except Exception:
+                    pass
+
+        finally:
+            # ------------------------------------------------
+            # CLOSE HTTP CLIENT / RESOLVER RESOURCES
+            # ------------------------------------------------
+            #
+            # FacebookResolver V15 hiện tại có thể tự quản lý
+            # HTTPClient trong resolve().
+            #
+            # Không tự gọi close ở đây nếu class hiện tại
+            # không expose close().
+            # ------------------------------------------------
+
+            resolver = None
+
+    # --------------------------------------------------------
+    # TASK MANAGER
+    # --------------------------------------------------------
+    #
+    # QUAN TRỌNG:
+    # Không gọi track_current_task() bên trong worker.
+    #
+    # replace_user_tasks() đã tạo + đăng ký task.
+    #
+    # User mới:
+    #   URL A -> task A
+    #   URL B -> cancel task A + chạy task B
+    #
+    # User khác:
+    #   task riêng, không ảnh hưởng nhau.
+    # --------------------------------------------------------
+
+    await replace_user_tasks(
+        event.sender_id,
+        worker(),
+    )
 
 
 # ============================================================
 # /getuidfb
 # ============================================================
 
-async def getuidfb_handler(
-    event,
-):
-
-    if not event.raw_text:
-        return
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/getuidfb(?:\s+.+)?$"
+    )
+)
+async def getuidfb_command(event):
 
     text = (
         event.raw_text
         or ""
     ).strip()
 
-    # ========================================================
-    # BỎ COMMAND
-    # ========================================================
+    if not text:
+        return
+
+    # --------------------------------------------------------
+    # /getuidfb
+    # --------------------------------------------------------
 
     parts = text.split(
         maxsplit=1
     )
 
     if len(parts) < 2:
-
         await event.reply(
             "❗ <b>Cú pháp:</b>\n\n"
-            "<code>/getuidfb https://facebook.com/username</code>",
+            "<code>"
+            "/getuidfb "
+            "https://www.facebook.com/username"
+            "</code>",
             parse_mode="html",
         )
-
         return
 
     argument = parts[1].strip()
 
-    # ========================================================
-    # EXTRACT URL
-    # ========================================================
+    # --------------------------------------------------------
+    # Extract URL
+    # --------------------------------------------------------
 
     url = extract_url(
         argument
     )
 
+    # Nếu extract_url() không bắt được,
+    # thử nguyên argument.
     if not url:
         url = argument
 
@@ -3323,9 +3120,10 @@ async def getuidfb_handler(
 # DIRECT FACEBOOK URL
 # ============================================================
 
-async def direct_facebook_handler(
-    event,
-):
+@bot.on(
+    events.NewMessage()
+)
+async def direct_url_handler(event):
 
     text = (
         event.raw_text
@@ -3335,166 +3133,36 @@ async def direct_facebook_handler(
     if not text:
         return
 
-    # ========================================================
-    # KHÔNG XỬ LÝ COMMAND
-    # ========================================================
+    # --------------------------------------------------------
+    # Không xử lý command.
+    #
+    # /start
+    # /help
+    # /getuidfb
+    # ...
+    # --------------------------------------------------------
 
     if text.startswith("/"):
         return
 
-    # ========================================================
-    # EXTRACT FACEBOOK URL
-    # ========================================================
+    # --------------------------------------------------------
+    # Extract Facebook URL
+    # --------------------------------------------------------
 
     url = extract_url(
         text
     )
 
-    # Không có Facebook URL -> bỏ qua
     if not url:
         return
+
+    # --------------------------------------------------------
+    # Chỉ gửi Facebook URL mới chạy resolver.
+    #
+    # process_facebook_url() tiếp tục validate host.
+    # --------------------------------------------------------
 
     await process_facebook_url(
         event,
         url,
-    )
-
-
-# ============================================================
-# REGISTER
-# ============================================================
-
-def register(
-    bot,
-    notify_bot=None,
-):
-    """
-    Đăng ký /getuidfb vào DRAGON BOT.
-
-    Bot chính gọi:
-
-        module.register(bot, notify_bot)
-
-    Không tạo Telegram Application.
-    Không đọc BOT_TOKEN.
-    Không chạy polling.
-    """
-
-    # ========================================================
-    # /getuidfb
-    # ========================================================
-
-    @bot.on(
-        events.NewMessage(
-            pattern=r"^/getuidfb(?:\s+.+)?$",
-        )
-    )
-    async def getuidfb_command(
-        event,
-    ):
-
-        try:
-
-            await getuidfb_handler(
-                event
-            )
-
-        except asyncio.CancelledError:
-
-            raise
-
-        except Exception as exc:
-
-            print(
-                "[GETUIDFB COMMAND ERROR]",
-                repr(exc),
-            )
-
-            try:
-
-                await event.reply(
-                    "❌ <b>Lỗi xử lý /getuidfb.</b>\n\n"
-                    f"{tg_code(str(exc)[:1000])}",
-                    parse_mode="html",
-                )
-
-            except Exception:
-                pass
-
-    # ========================================================
-    # DIRECT FACEBOOK URL
-    # ========================================================
-
-    @bot.on(
-        events.NewMessage()
-    )
-    async def direct_facebook_url(
-        event,
-    ):
-
-        try:
-
-            # -----------------------------------------------
-            # Không xử lý command
-            # -----------------------------------------------
-
-            text = (
-                event.raw_text
-                or ""
-            ).strip()
-
-            if not text:
-                return
-
-            if text.startswith("/"):
-                return
-
-            # -----------------------------------------------
-            # Chỉ bắt Facebook URL
-            # -----------------------------------------------
-
-            url = extract_url(
-                text
-            )
-
-            if not url:
-                return
-
-            # -----------------------------------------------
-            # Chạy resolver
-            # -----------------------------------------------
-
-            await process_facebook_url(
-                event,
-                url,
-            )
-
-        except asyncio.CancelledError:
-
-            raise
-
-        except Exception as exc:
-
-            print(
-                "[GETUIDFB DIRECT ERROR]",
-                repr(exc),
-            )
-
-    # ========================================================
-    # LOG
-    # ========================================================
-
-    print(
-        "[GETUIDFB] "
-        f"Loaded {VERSION}"
-    )
-
-    print(
-        "[GETUIDFB] "
-        "Telethon adapter registered"
-    )
-
-    print(
-        "[GETUIDFB] "
-        "Task manager integration: ON"
     )

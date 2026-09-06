@@ -3,61 +3,63 @@
 
 """
 ======================================================================
- FACEBOOK IDENTITY + CONTENT RESOLVER V31
+ FACEBOOK RESOLVER V32 - PRECISION IDENTITY ENGINE
 ======================================================================
 
-PUBLIC FACEBOOK CONTENT ONLY
+PUBLIC FACEBOOK CONTENT
 HTTP ONLY
 
 NO:
-    Playwright
-    Selenium
-    Chromium
-    Cookie
-    Facebook Login
-    Facebook Access Token
-    Graph API Authentication
+    - Playwright
+    - Selenium
+    - Chromium
+    - Cookies
+    - Login
+    - Facebook Access Token
+    - Graph API Authentication
 
-GOAL
-----
-Resolve public Facebook URLs into:
+PRIMARY GOAL
+------------
+Resolve:
 
-    USER
-        name
+    Facebook Profile
         username
+        name
         UID
-        profile URL
         avatar
         bio
+        profile URL
 
-    PAGE
+    Facebook Page
         name
         page ID
         URL
 
-    GROUP
+    Facebook Group
         name
         group ID
         URL
 
-    CONTENT
+    Facebook Content
         post ID
-        video ID
         reel ID
+        video ID
         photo ID
         story ID
         title
-        canonical URL
+        publisher identity
 
-SECURITY / ACCURACY
--------------------
+IMPORTANT
+---------
 Never assume:
 
-    route entity ID == user UID
-    object ID == user UID
-    pfbid == user UID
+    route ID == UID
+    post ID == UID
+    video ID == UID
+    reel ID == UID
+    pfbid == UID
 
-UID is returned only after identity correlation.
+UID must be correlated with the actual publisher/profile.
 
 ======================================================================
 """
@@ -65,7 +67,7 @@ UID is returned only after identity correlation.
 from __future__ import annotations
 
 import asyncio
-import html as html_lib
+import html
 import json
 import logging
 import re
@@ -94,7 +96,7 @@ from telethon import events
 # ======================================================================
 
 log = logging.getLogger(
-    "facebook_identity_resolver"
+    "getuidfb"
 )
 
 
@@ -104,19 +106,19 @@ log = logging.getLogger(
 
 REQUEST_TIMEOUT = 12
 
-MAX_HTML_BYTES = 12 * 1024 * 1024
+MAX_HTML_BYTES = 14 * 1024 * 1024
 
 MAX_INPUT_URLS = 20
 
-MAX_DISCOVERED_URLS = 120
+MAX_DISCOVERED_URLS = 100
 
-MAX_PROFILE_CHECKS = 5
+MAX_PROFILE_CHECKS = 6
 
-MAX_EVIDENCE_DISPLAY = 10
+MAX_EVIDENCE = 8
 
-PROFILE_VERIFY_THRESHOLD = 70
+FETCH_WORKERS = 4
 
-FETCH_DELAY = 0.15
+CACHE_TTL = 300
 
 
 # ======================================================================
@@ -150,14 +152,14 @@ USER_AGENTS = [
         "Chrome/140.0.0.0 Safari/537.36"
     ),
     (
+        "Mozilla/5.0 (Linux; Android 14) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Mobile Safari/537.36"
+    ),
+    (
         "Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/139.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Linux; Android 14; Mobile) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/139.0.0.0 Mobile Safari/537.36"
     ),
 ]
 
@@ -168,15 +170,6 @@ USER_AGENTS = [
 
 NUMERIC_ID_RE = re.compile(
     r"^\d{5,21}$"
-)
-
-LONG_NUMERIC_RE = re.compile(
-    r"^\d{8,21}$"
-)
-
-PF_BID_RE = re.compile(
-    r"\bpfbid[A-Za-z0-9_-]+\b",
-    re.I,
 )
 
 FACEBOOK_URL_RE = re.compile(
@@ -204,83 +197,48 @@ FACEBOOK_URL_RE = re.compile(
     """
 )
 
-
-# ======================================================================
-# SEMANTIC WEIGHTS
-# ======================================================================
-
-USER_FIELD_WEIGHTS = {
-    "user_id": 125,
-    "userid": 125,
-
-    "profile_id": 125,
-    "profileid": 125,
-
-    "owner_id": 115,
-    "ownerid": 115,
-
-    "publisher_id": 112,
-    "publisherid": 112,
-
-    "author_id": 110,
-    "authorid": 110,
-
-    "creator_id": 112,
-    "creatorid": 112,
-
-    "from_id": 110,
-    "fromid": 110,
-
-    "actor_id": 100,
-    "actorid": 100,
-
-    "page_owner_id": 105,
-
-    "profile.uid": 125,
-    "profile.id": 125,
-
-    "owner.id": 115,
-    "publisher.id": 112,
-    "author.id": 110,
-    "creator.id": 112,
-
-    "from.id": 110,
-    "actor.id": 100,
-}
-
-
-OBJECT_FIELD_WEIGHTS = {
-    "post_id": 125,
-    "postid": 125,
-
-    "story_fbid": 125,
-    "storyfbid": 125,
-
-    "video_id": 125,
-    "videoid": 125,
-
-    "reel_id": 125,
-    "reelid": 125,
-
-    "photo_id": 122,
-    "photoid": 122,
-
-    "media_fbid": 115,
-    "mediafbid": 115,
-
-    "album_id": 108,
-    "albumid": 108,
-
-    "group_id": 130,
-    "groupid": 130,
-
-    "page_id": 130,
-    "pageid": 130,
-}
+SEMANTIC_ID_RE = re.compile(
+    r"""
+    (?P<key>
+        user[_\-]?id
+        |userid
+        |profile[_\-]?id
+        |profileid
+        |owner[_\-]?id
+        |ownerid
+        |publisher[_\-]?id
+        |publisherid
+        |author[_\-]?id
+        |authorid
+        |creator[_\-]?id
+        |creatorid
+        |from[_\-]?id
+        |fromid
+        |actor[_\-]?id
+        |actorid
+        |page[_\-]?owner[_\-]?id
+        |page[_\-]?id
+        |group[_\-]?id
+        |post[_\-]?id
+        |story[_\-]?fbid
+        |story[_\-]?id
+        |video[_\-]?id
+        |reel[_\-]?id
+        |photo[_\-]?id
+        |media[_\-]?fbid
+        |album[_\-]?id
+    )
+    \s*
+    ["':=]+
+    \s*
+    (?P<value>\d{5,21})
+    """,
+    re.I | re.X,
+)
 
 
 # ======================================================================
-# BASIC HELPERS
+# HELPERS
 # ======================================================================
 
 def clean_text(
@@ -290,7 +248,7 @@ def clean_text(
     if value is None:
         return ""
 
-    value = html_lib.unescape(
+    value = html.unescape(
         str(value)
     )
 
@@ -299,28 +257,28 @@ def clean_text(
         " ",
     )
 
-    return value.strip()
-
-
-def compact_text(
-    value: Any,
-    limit: int = 500,
-) -> str:
-
-    value = clean_text(
-        value
-    )
-
     value = re.sub(
         r"\s+",
         " ",
         value,
     )
 
-    if len(value) > limit:
-        return value[:limit - 3] + "..."
+    return value.strip()
 
-    return value
+
+def truncate(
+    value: Any,
+    limit: int,
+) -> str:
+
+    value = clean_text(
+        value
+    )
+
+    if len(value) <= limit:
+        return value
+
+    return value[:limit - 3] + "..."
 
 
 def is_numeric_id(
@@ -337,27 +295,12 @@ def is_numeric_id(
     )
 
 
-def is_long_numeric(
-    value: Any,
-) -> bool:
-
-    if value is None:
-        return False
-
-    return bool(
-        LONG_NUMERIC_RE.fullmatch(
-            str(value).strip()
-        )
-    )
-
-
 def normalize_host(
     host: str,
 ) -> str:
 
     return (
-        host
-        or ""
+        host or ""
     ).lower().strip().rstrip(".")
 
 
@@ -393,7 +336,7 @@ def normalize_url(
     url = url.strip(
         " \t\r\n"
         "\"'<>[]{}"
-        "，。！？；：、"
+        ".,!?;:，。！？；：、"
     )
 
     if not re.match(
@@ -421,6 +364,7 @@ def normalize_url(
                 "fb.watch/"
             )
         ):
+
             url = "https://" + url
 
         else:
@@ -451,11 +395,6 @@ def normalize_url(
             " \t\r\n"
         )
 
-        while path.endswith(
-            (".", ",", ";", ":", "!", "?", ")")
-        ):
-            path = path[:-1]
-
         if not path:
             path = "/"
 
@@ -464,27 +403,33 @@ def normalize_url(
             keep_blank_values=True,
         )
 
-        filtered = []
+        keep = []
+
+        remove = {
+            "fbclid",
+            "refsrc",
+            "utm_source",
+            "utm_medium",
+            "utm_campaign",
+            "utm_term",
+            "utm_content",
+            "rdid",
+            "share_url",
+            "__cft__",
+            "__tn__",
+        }
 
         for key, value in pairs:
 
-            if key.lower() in {
-                "utm_source",
-                "utm_medium",
-                "utm_campaign",
-                "utm_term",
-                "utm_content",
-                "fbclid",
-                "refsrc",
-            }:
+            if key.lower() in remove:
                 continue
 
-            filtered.append(
+            keep.append(
                 (key, value)
             )
 
         query = urlencode(
-            filtered,
+            keep,
             doseq=True,
         )
 
@@ -500,11 +445,12 @@ def normalize_url(
         )
 
     except Exception:
+
         return ""
 
 
 # ======================================================================
-# FACEBOOK URL SCANNER
+# URL SCANNER
 # ======================================================================
 
 def extract_facebook_urls(
@@ -514,7 +460,7 @@ def extract_facebook_urls(
     if not text:
         return []
 
-    text = html_lib.unescape(
+    text = html.unescape(
         text
     )
 
@@ -523,16 +469,16 @@ def extract_facebook_urls(
         "/",
     )
 
-    results = []
+    result = []
 
     seen = set()
 
     def add(
-        raw: str,
+        value: str,
     ):
 
         normalized = normalize_url(
-            raw
+            value
         )
 
         if not normalized:
@@ -545,7 +491,7 @@ def extract_facebook_urls(
             normalized
         )
 
-        results.append(
+        result.append(
             normalized
         )
 
@@ -565,68 +511,10 @@ def extract_facebook_urls(
             raw
         )
 
-        if len(results) >= MAX_INPUT_URLS:
+        if len(result) >= MAX_INPUT_URLS:
             break
 
-    # Secondary scan for concatenated URLs.
-    if len(results) < MAX_INPUT_URLS:
-
-        lower = text.lower()
-
-        markers = [
-            "https://facebook.com/",
-            "https://www.facebook.com/",
-            "https://m.facebook.com/",
-            "http://facebook.com/",
-            "http://www.facebook.com/",
-            "facebook.com/",
-            "www.facebook.com/",
-            "m.facebook.com/",
-            "mbasic.facebook.com/",
-            "https://fb.watch/",
-            "fb.watch/",
-        ]
-
-        for marker in markers:
-
-            start = 0
-
-            while True:
-
-                idx = lower.find(
-                    marker.lower(),
-                    start,
-                )
-
-                if idx < 0:
-                    break
-
-                candidate = re.split(
-                    r"""[\s<>"']""",
-                    text[idx:],
-                    maxsplit=1,
-                )[0]
-
-                candidate = candidate.rstrip(
-                    ".,;:!?)]}>'\""
-                )
-
-                add(
-                    candidate
-                )
-
-                start = (
-                    idx
-                    + len(marker)
-                )
-
-                if len(results) >= MAX_INPUT_URLS:
-                    break
-
-            if len(results) >= MAX_INPUT_URLS:
-                break
-
-    return results
+    return result
 
 
 # ======================================================================
@@ -668,11 +556,9 @@ class URLShape:
 
     album_id: str = ""
 
-    opaque_token: str = ""
-
 
 # ======================================================================
-# QUERY
+# QUERY VALUE
 # ======================================================================
 
 def query_value(
@@ -685,14 +571,14 @@ def query_value(
         keep_blank_values=True,
     )
 
-    mapping = {
+    lookup = {
         str(k).lower(): v
         for k, v in pairs
     }
 
     for name in names:
 
-        value = mapping.get(
+        value = lookup.get(
             name.lower()
         )
 
@@ -702,6 +588,42 @@ def query_value(
             )
 
     return ""
+
+
+# ======================================================================
+# RESERVED PROFILE ROUTES
+# ======================================================================
+
+RESERVED_ROUTES = {
+    "home",
+    "watch",
+    "reel",
+    "reels",
+    "videos",
+    "video",
+    "photos",
+    "photo",
+    "groups",
+    "pages",
+    "people",
+    "profile.php",
+    "photo.php",
+    "story.php",
+    "permalink.php",
+    "share",
+    "sharer",
+    "plugins",
+    "events",
+    "marketplace",
+    "gaming",
+    "messages",
+    "login",
+    "logout",
+    "settings",
+    "help",
+    "privacy",
+    "terms",
+}
 
 
 # ======================================================================
@@ -732,9 +654,7 @@ def classify_url(
     )
 
     segments = [
-        unquote(
-            x
-        ).strip()
+        unquote(x).strip()
         for x in parsed.path.split("/")
         if x.strip()
     ]
@@ -773,12 +693,12 @@ def classify_url(
         uid = query_value(
             parsed,
             "id",
+            "uid",
         )
 
+        shape.kind = "profile"
+
         if is_numeric_id(uid):
-
-            shape.kind = "profile"
-
             shape.route_entity_id = uid
 
         return shape
@@ -798,17 +718,8 @@ def classify_url(
             "id",
         )
 
-        album = query_value(
-            parsed,
-            "set",
-            "album_id",
-        )
-
         if is_numeric_id(photo):
             shape.photo_id = photo
-
-        if is_numeric_id(album):
-            shape.album_id = album
 
         shape.kind = "photo"
 
@@ -837,28 +748,6 @@ def classify_url(
         return shape
 
     # --------------------------------------------------------------
-    # permalink.php
-    # --------------------------------------------------------------
-
-    if lower[:1] == [
-        "permalink.php"
-    ]:
-
-        post = query_value(
-            parsed,
-            "story_fbid",
-            "fbid",
-            "id",
-        )
-
-        if is_numeric_id(post):
-            shape.post_id = post
-
-        shape.kind = "permalink"
-
-        return shape
-
-    # --------------------------------------------------------------
     # watch
     # --------------------------------------------------------------
 
@@ -883,28 +772,10 @@ def classify_url(
     # reel
     # --------------------------------------------------------------
 
-    if lower[:1] == [
-        "reel"
-    ]:
-
-        if len(segments) >= 2:
-
-            value = segments[1]
-
-            if is_numeric_id(value):
-                shape.reel_id = value
-
-        shape.kind = "reel"
-
-        return shape
-
-    # --------------------------------------------------------------
-    # reels
-    # --------------------------------------------------------------
-
-    if lower[:1] == [
-        "reels"
-    ]:
+    if lower[:1] in (
+        ["reel"],
+        ["reels"],
+    ):
 
         if len(segments) >= 2:
 
@@ -925,6 +796,8 @@ def classify_url(
         "groups"
     ]:
 
+        shape.kind = "group"
+
         if len(segments) >= 2:
 
             value = segments[1]
@@ -932,7 +805,6 @@ def classify_url(
             if is_numeric_id(value):
 
                 shape.group_id = value
-
                 shape.route_entity_id = value
 
             else:
@@ -945,6 +817,8 @@ def classify_url(
                 "posts"
             )
 
+            shape.kind = "group_post"
+
             if idx + 1 < len(segments):
 
                 value = segments[
@@ -953,12 +827,6 @@ def classify_url(
 
                 if is_numeric_id(value):
                     shape.post_id = value
-
-            shape.kind = "group_post"
-
-        else:
-
-            shape.kind = "group"
 
         return shape
 
@@ -979,7 +847,6 @@ def classify_url(
             if is_numeric_id(first):
 
                 shape.page_id = first
-
                 shape.route_entity_id = first
 
             else:
@@ -993,7 +860,6 @@ def classify_url(
             if is_numeric_id(second):
 
                 shape.page_id = second
-
                 shape.route_entity_id = second
 
         return shape
@@ -1021,52 +887,31 @@ def classify_url(
         return shape
 
     # --------------------------------------------------------------
-    # share
+    # generic numeric route
     # --------------------------------------------------------------
 
-    if lower[:1] == [
-        "share"
-    ]:
+    if segments:
 
-        shape.kind = "share"
+        first = segments[0]
 
-        return shape
+        if is_numeric_id(first):
 
-    # --------------------------------------------------------------
-    # /p/
-    # --------------------------------------------------------------
+            shape.route_entity_id = first
 
-    if lower[:1] == [
-        "p"
-    ]:
+        elif (
+            first.lower()
+            not in RESERVED_ROUTES
+        ):
 
-        shape.kind = "post"
-
-        if len(segments) >= 2:
-            shape.opaque_token = segments[1]
-
-        return shape
+            shape.username = first
 
     # --------------------------------------------------------------
-    # generic
+    # CONTENT UNDER USERNAME
+    #
+    # /username/videos/123
+    # /username/reels/123
+    # /username/posts/123
     # --------------------------------------------------------------
-
-    if not segments:
-
-        shape.kind = "home"
-
-        return shape
-
-    first = segments[0]
-
-    if is_numeric_id(first):
-
-        # NEVER promote directly to UID.
-        shape.route_entity_id = first
-
-    else:
-
-        shape.username = first
 
     for index, part in enumerate(
         lower
@@ -1076,9 +921,7 @@ def classify_url(
 
             shape.kind = "post"
 
-            if index + 1 < len(
-                segments
-            ):
+            if index + 1 < len(segments):
 
                 value = segments[
                     index + 1
@@ -1087,15 +930,13 @@ def classify_url(
                 if is_numeric_id(value):
                     shape.post_id = value
 
-            break
+            return shape
 
         if part == "videos":
 
             shape.kind = "video"
 
-            if index + 1 < len(
-                segments
-            ):
+            if index + 1 < len(segments):
 
                 value = segments[
                     index + 1
@@ -1104,15 +945,13 @@ def classify_url(
                 if is_numeric_id(value):
                     shape.video_id = value
 
-            break
+            return shape
 
         if part == "reels":
 
             shape.kind = "reel"
 
-            if index + 1 < len(
-                segments
-            ):
+            if index + 1 < len(segments):
 
                 value = segments[
                     index + 1
@@ -1121,15 +960,13 @@ def classify_url(
                 if is_numeric_id(value):
                     shape.reel_id = value
 
-            break
+            return shape
 
         if part == "photos":
 
             shape.kind = "photo"
 
-            if index + 1 < len(
-                segments
-            ):
+            if index + 1 < len(segments):
 
                 value = segments[
                     index + 1
@@ -1138,15 +975,13 @@ def classify_url(
                 if is_numeric_id(value):
                     shape.photo_id = value
 
-            break
+            return shape
 
         if part == "stories":
 
             shape.kind = "story"
 
-            if index + 1 < len(
-                segments
-            ):
+            if index + 1 < len(segments):
 
                 value = segments[
                     index + 1
@@ -1155,17 +990,70 @@ def classify_url(
                 if is_numeric_id(value):
                     shape.story_id = value
 
-            break
+            return shape
 
-    else:
+    # --------------------------------------------------------------
+    # PURE USERNAME PROFILE
+    #
+    # /nvlnopro/
+    #
+    # THIS IS THE IMPORTANT FIX.
+    # --------------------------------------------------------------
 
-        if shape.username:
-            shape.kind = "profile"
+    if (
+        len(segments) == 1
+        and shape.username
+    ):
 
-        elif shape.route_entity_id:
-            shape.kind = "entity"
+        shape.kind = "profile"
+
+        return shape
+
+    # --------------------------------------------------------------
+    # PURE NUMERIC ENTITY
+    # --------------------------------------------------------------
+
+    if (
+        len(segments) == 1
+        and shape.route_entity_id
+    ):
+
+        shape.kind = "entity"
+
+        return shape
+
+    shape.kind = "unknown"
 
     return shape
+
+
+# ======================================================================
+# PROFILE URL
+# ======================================================================
+
+def profile_url_from_shape(
+    shape: URLShape,
+) -> str:
+
+    if shape.username:
+
+        return (
+            "https://www.facebook.com/"
+            + quote(
+                shape.username,
+                safe="@._-",
+            )
+        )
+
+    if shape.route_entity_id:
+
+        return (
+            "https://www.facebook.com/"
+            "profile.php?id="
+            + shape.route_entity_id
+        )
+
+    return ""
 
 
 # ======================================================================
@@ -1236,13 +1124,13 @@ class FacebookHTMLParser(
 
         self.embedded_json = []
 
-        self._title = False
+        self.in_title = False
 
-        self._script = False
+        self.in_script = False
 
-        self._script_type = ""
+        self.script_type = ""
 
-        self._script_buffer = []
+        self.script_buffer = []
 
     def handle_starttag(
         self,
@@ -1252,7 +1140,7 @@ class FacebookHTMLParser(
 
         tag = tag.lower()
 
-        amap = {
+        data = {
             str(k).lower():
             (
                 ""
@@ -1264,20 +1152,19 @@ class FacebookHTMLParser(
 
         if tag == "title":
 
-            self._title = True
+            self.in_title = True
 
         elif tag == "meta":
 
             key = (
-                amap.get("property")
-                or amap.get("name")
-                or amap.get("itemprop")
-                or amap.get("data-name")
+                data.get("property")
+                or data.get("name")
+                or data.get("itemprop")
                 or ""
             ).strip().lower()
 
             value = (
-                amap.get("content")
+                data.get("content")
                 or ""
             ).strip()
 
@@ -1289,7 +1176,7 @@ class FacebookHTMLParser(
 
         elif tag == "link":
 
-            href = amap.get(
+            href = data.get(
                 "href"
             )
 
@@ -1300,18 +1187,17 @@ class FacebookHTMLParser(
 
         elif tag == "script":
 
-            self._script = True
+            self.in_script = True
 
-            self._script_type = (
-                amap.get(
+            self.script_type = (
+                data.get(
                     "type",
                     "",
                 )
                 .lower()
-                .strip()
             )
 
-            self._script_buffer = []
+            self.script_buffer = []
 
     def handle_endtag(
         self,
@@ -1322,12 +1208,12 @@ class FacebookHTMLParser(
 
         if tag == "title":
 
-            self._title = False
+            self.in_title = False
 
         elif tag == "script":
 
             content = "".join(
-                self._script_buffer
+                self.script_buffer
             ).strip()
 
             if content:
@@ -1336,42 +1222,43 @@ class FacebookHTMLParser(
                     content
                 )
 
-            self._script = False
+            self.in_script = False
 
-            self._script_type = ""
+            self.script_type = ""
 
-            self._script_buffer = []
+            self.script_buffer = []
 
     def handle_data(
         self,
         data,
     ):
 
-        if self._title:
+        if self.in_title:
 
             self.title_parts.append(
                 data
             )
 
-        if self._script:
+        if self.in_script:
 
-            if sum(
-                len(x)
-                for x in self._script_buffer
-            ) < 3 * 1024 * 1024:
+            if len(
+                "".join(
+                    self.script_buffer
+                )
+            ) < 4_000_000:
 
-                self._script_buffer.append(
+                self.script_buffer.append(
                     data
                 )
 
     def parse_script(
         self,
-        content,
+        content: str,
     ):
 
         if (
             "ld+json"
-            in self._script_type
+            in self.script_type
         ):
 
             try:
@@ -1389,7 +1276,7 @@ class FacebookHTMLParser(
 
         if (
             "application/json"
-            in self._script_type
+            in self.script_type
         ):
 
             try:
@@ -1405,23 +1292,19 @@ class FacebookHTMLParser(
 
             return
 
-        semantic_fields = (
-            '"user_id"',
-            '"profile_id"',
-            '"owner_id"',
-            '"publisher_id"',
-            '"author_id"',
-            '"creator_id"',
-            '"page_id"',
-            '"group_id"',
-            '"post_id"',
-            '"video_id"',
-            '"reel_id"',
-        )
-
         if any(
-            x in content
-            for x in semantic_fields
+            x in content.lower()
+            for x in (
+                "user_id",
+                "profile_id",
+                "owner_id",
+                "creator_id",
+                "publisher_id",
+                "page_id",
+                "group_id",
+                "video_id",
+                "reel_id",
+            )
         ):
 
             self.embedded_json.extend(
@@ -1430,25 +1313,24 @@ class FacebookHTMLParser(
                 )
             )
 
-    def title(
+    def get_title(
         self,
     ) -> str:
 
-        return compact_text(
+        return clean_text(
             "".join(
                 self.title_parts
-            ),
-            500,
+            )
         )
 
 
 # ======================================================================
-# JSON FRAGMENTS
+# JSON FRAGMENT EXTRACTION
 # ======================================================================
 
 def extract_json_fragments(
     text: str,
-    max_fragments: int = 50,
+    max_fragments: int = 80,
 ) -> List[Any]:
 
     if not text:
@@ -1460,11 +1342,11 @@ def extract_json_fragments(
         m.start()
         for m in re.finditer(
             r"\{",
-            text
+            text,
         )
     ]
 
-    for start in starts[:700]:
+    for start in starts[:1200]:
 
         depth = 0
 
@@ -1476,7 +1358,7 @@ def extract_json_fragments(
             start,
             min(
                 len(text),
-                start + 1_000_000,
+                start + 1_500_000,
             ),
         ):
 
@@ -1514,7 +1396,7 @@ def extract_json_fragments(
 
                 if depth == 0:
 
-                    candidate = text[
+                    fragment = text[
                         start:i + 1
                     ]
 
@@ -1522,7 +1404,7 @@ def extract_json_fragments(
 
                         results.append(
                             json.loads(
-                                candidate
+                                fragment
                             )
                         )
 
@@ -1560,12 +1442,12 @@ def parse_snapshot(
 
     except Exception as exc:
 
-        snapshot.error = (
-            f"HTML parser: {exc}"
+        snapshot.error = str(
+            exc
         )
 
     snapshot.title = (
-        parser.title()
+        parser.get_title()
     )
 
     snapshot.meta = (
@@ -1584,24 +1466,15 @@ def parse_snapshot(
         parser.embedded_json
     )
 
-    canonical_candidates = []
-
-    for key, value in (
-        snapshot.meta.items()
+    for key in (
+        "og:url",
+        "al:web:url",
+        "twitter:url",
     ):
 
-        if key in {
-            "og:url",
-            "al:web:url",
-            "twitter:url",
-            "canonical",
-        }:
-
-            canonical_candidates.append(
-                value
-            )
-
-    for value in canonical_candidates:
+        value = snapshot.meta.get(
+            key
+        )
 
         normalized = normalize_url(
             value
@@ -1617,73 +1490,153 @@ def parse_snapshot(
 
 
 # ======================================================================
-# JSON WALK
+# EVIDENCE
 # ======================================================================
 
-def walk_json(
-    value: Any,
-    path: str = "",
-    parent: Any = None,
-):
+@dataclass
+class Evidence:
 
-    if isinstance(
-        value,
-        dict,
+    value: str
+
+    role: str
+
+    source: str
+
+    weight: float
+
+    key: str = ""
+
+    path: str = ""
+
+    context: str = ""
+
+    url: str = ""
+
+    verified: bool = False
+
+    relation: str = ""
+
+
+class EvidenceGraph:
+
+    def __init__(
+        self,
     ):
 
-        for key, child in value.items():
+        self.items: List[
+            Evidence
+        ] = []
 
-            key = str(key)
+        self.seen = set()
 
-            child_path = (
-                f"{path}.{key}"
-                if path
-                else key
-            )
-
-            yield (
-                child_path,
-                child,
-                key,
-                value,
-            )
-
-            yield from walk_json(
-                child,
-                child_path,
-                value,
-            )
-
-    elif isinstance(
-        value,
-        list,
+    def add(
+        self,
+        evidence: Evidence,
     ):
 
-        for index, child in enumerate(
-            value
+        if not is_numeric_id(
+            evidence.value
         ):
+            return
 
-            child_path = (
-                f"{path}[{index}]"
-            )
+        fp = (
+            evidence.value,
+            evidence.role,
+            evidence.source,
+            evidence.key,
+            evidence.path,
+        )
 
-            yield (
-                child_path,
-                child,
-                str(index),
-                value,
-            )
+        if fp in self.seen:
+            return
 
-            yield from walk_json(
-                child,
-                child_path,
-                value,
-            )
+        self.seen.add(
+            fp
+        )
+
+        self.items.append(
+            evidence
+        )
+
+    def for_role(
+        self,
+        role: str,
+    ):
+
+        return [
+            x
+            for x in self.items
+            if x.role == role
+        ]
+
+    def for_value(
+        self,
+        value: str,
+    ):
+
+        return [
+            x
+            for x in self.items
+            if x.value == value
+        ]
+
+    def values(
+        self,
+        role: str,
+    ) -> Set[str]:
+
+        return {
+            x.value
+            for x in self.items
+            if x.role == role
+        }
 
 
 # ======================================================================
-# KEY WEIGHT
+# EVIDENCE WEIGHTS
 # ======================================================================
+
+USER_WEIGHTS = {
+    "user_id": 150,
+    "userid": 150,
+    "profile_id": 150,
+    "profileid": 150,
+    "owner_id": 138,
+    "ownerid": 138,
+    "publisher_id": 135,
+    "publisherid": 135,
+    "author_id": 132,
+    "authorid": 132,
+    "creator_id": 135,
+    "creatorid": 135,
+    "from_id": 132,
+    "fromid": 132,
+    "actor_id": 125,
+    "actorid": 125,
+    "page_owner_id": 140,
+}
+
+
+OBJECT_WEIGHTS = {
+    "post_id": 150,
+    "postid": 150,
+    "story_fbid": 150,
+    "story_id": 145,
+    "video_id": 150,
+    "videoid": 150,
+    "reel_id": 150,
+    "reelid": 150,
+    "photo_id": 150,
+    "photoid": 150,
+    "media_fbid": 145,
+    "album_id": 130,
+    "albumid": 130,
+    "page_id": 155,
+    "pageid": 155,
+    "group_id": 155,
+    "groupid": 155,
+}
+
 
 def normalize_key(
     key: str,
@@ -1704,158 +1657,75 @@ def normalize_key(
     )
 
 
-def field_weight(
+def classify_id_key(
     key: str,
-) -> Tuple[str, float]:
+) -> Tuple[
+    str,
+    float,
+]:
 
-    normalized = normalize_key(
+    key = normalize_key(
         key
     )
 
-    if normalized in USER_FIELD_WEIGHTS:
+    if key in USER_WEIGHTS:
 
         return (
             "USER_CANDIDATE",
-            USER_FIELD_WEIGHTS[
-                normalized
-            ],
+            USER_WEIGHTS[key],
         )
 
-    if normalized in OBJECT_FIELD_WEIGHTS:
+    if key in OBJECT_WEIGHTS:
+
+        role = "OBJECT"
+
+        if key in {
+            "post_id",
+            "postid",
+            "story_fbid",
+            "story_id",
+        }:
+            role = "POST"
+
+        elif key in {
+            "video_id",
+            "videoid",
+        }:
+            role = "VIDEO"
+
+        elif key in {
+            "reel_id",
+            "reelid",
+        }:
+            role = "REEL"
+
+        elif key in {
+            "photo_id",
+            "photoid",
+        }:
+            role = "PHOTO"
+
+        elif key in {
+            "page_id",
+            "pageid",
+        }:
+            role = "PAGE"
+
+        elif key in {
+            "group_id",
+            "groupid",
+        }:
+            role = "GROUP"
 
         return (
-            "OBJECT",
-            OBJECT_FIELD_WEIGHTS[
-                normalized
-            ],
-        )
-
-    compact = normalized.replace(
-        "_",
-        ".",
-    )
-
-    if compact in USER_FIELD_WEIGHTS:
-
-        return (
-            "USER_CANDIDATE",
-            USER_FIELD_WEIGHTS[
-                compact
-            ],
-        )
-
-    if compact in OBJECT_FIELD_WEIGHTS:
-
-        return (
-            "OBJECT",
-            OBJECT_FIELD_WEIGHTS[
-                compact
-            ],
+            role,
+            OBJECT_WEIGHTS[key],
         )
 
     return (
         "",
         0,
     )
-
-
-# ======================================================================
-# EVIDENCE
-# ======================================================================
-
-@dataclass
-class Evidence:
-
-    value: str
-
-    role: str
-
-    source: str
-
-    weight: float
-
-    context: str = ""
-
-    url: str = ""
-
-    path: str = ""
-
-    key: str = ""
-
-    neighbor: str = ""
-
-    independent: bool = True
-
-    verified: bool = False
-
-    def fingerprint(
-        self,
-    ):
-
-        return (
-            self.value,
-            self.role,
-            self.source,
-            self.path,
-            self.key,
-        )
-
-
-class EvidenceGraph:
-
-    def __init__(
-        self,
-    ):
-
-        self.items = []
-
-        self.seen = set()
-
-    def add(
-        self,
-        item: Evidence,
-    ):
-
-        if not is_numeric_id(
-            item.value
-        ):
-            return
-
-        fp = item.fingerprint()
-
-        if fp in self.seen:
-            return
-
-        self.seen.add(
-            fp
-        )
-
-        self.items.append(
-            item
-        )
-
-    def values(
-        self,
-        role=None,
-    ) -> Set[str]:
-
-        return {
-            x.value
-            for x in self.items
-            if role is None
-            or x.role == role
-        }
-
-    def for_value(
-        self,
-        value,
-    ):
-
-        return [
-            x
-            for x in self.items
-            if x.value == value
-        ]
 
 
 # ======================================================================
@@ -1868,13 +1738,13 @@ def add_evidence(
     role: str,
     source: str,
     weight: float,
+    *,
+    key: str = "",
+    path: str = "",
     context: str = "",
     url: str = "",
-    path: str = "",
-    key: str = "",
-    neighbor: str = "",
-    independent: bool = True,
     verified: bool = False,
+    relation: str = "",
 ):
 
     value = clean_text(
@@ -1892,16 +1762,15 @@ def add_evidence(
             role=role,
             source=source,
             weight=weight,
-            context=compact_text(
+            key=key,
+            path=path,
+            context=truncate(
                 context,
-                900,
+                700,
             ),
             url=url,
-            path=path,
-            key=key,
-            neighbor=neighbor,
-            independent=independent,
             verified=verified,
+            relation=relation,
         )
     )
 
@@ -1910,65 +1779,70 @@ def add_evidence(
 # STRUCTURAL EVIDENCE
 # ======================================================================
 
-def add_structural_evidence(
+def collect_url_evidence(
     graph: EvidenceGraph,
     shape: URLShape,
     url: str,
 ):
 
-    if (
-        shape.kind == "profile"
-        and shape.route_entity_id
-    ):
-
-        add_evidence(
-            graph,
-            shape.route_entity_id,
-            "USER_CANDIDATE",
-            "url_profile_id",
-            150,
-            "Explicit profile.php?id",
-            url,
-            path="query.id",
-            key="id",
-        )
-
-    if shape.group_id:
-
-        add_evidence(
-            graph,
-            shape.group_id,
-            "GROUP",
-            "url_group_id",
-            150,
-            "Explicit group ID",
-            url,
-        )
-
-    if shape.page_id:
-
-        add_evidence(
-            graph,
-            shape.page_id,
-            "PAGE",
-            "url_page_id",
-            150,
-            "Explicit page ID",
-            url,
-        )
-
     if shape.route_entity_id:
 
-        add_evidence(
-            graph,
-            shape.route_entity_id,
-            "ROUTE_ENTITY",
-            "url_route_entity",
-            15,
-            "Route entity only",
-            url,
-            independent=False,
-        )
+        role = "ROUTE_ENTITY"
+
+        if shape.kind == "profile":
+
+            role = "USER_CANDIDATE"
+
+            add_evidence(
+                graph,
+                shape.route_entity_id,
+                role,
+                "profile_url",
+                170,
+                key="profile_id",
+                url=url,
+                verified=True,
+            )
+
+        elif shape.kind == "page":
+
+            add_evidence(
+                graph,
+                shape.route_entity_id,
+                "PAGE",
+                "page_url",
+                170,
+                key="page_id",
+                url=url,
+                verified=True,
+            )
+
+        elif shape.kind in {
+            "group",
+            "group_post",
+        }:
+
+            add_evidence(
+                graph,
+                shape.route_entity_id,
+                "GROUP",
+                "group_url",
+                170,
+                key="group_id",
+                url=url,
+                verified=True,
+            )
+
+        else:
+
+            add_evidence(
+                graph,
+                shape.route_entity_id,
+                role,
+                "route_entity",
+                20,
+                url=url,
+            )
 
     if shape.post_id:
 
@@ -1976,10 +1850,10 @@ def add_structural_evidence(
             graph,
             shape.post_id,
             "POST",
-            "url_post_id",
-            140,
-            "Post object ID",
-            url,
+            "url",
+            155,
+            key="post_id",
+            url=url,
         )
 
     if shape.video_id:
@@ -1988,10 +1862,10 @@ def add_structural_evidence(
             graph,
             shape.video_id,
             "VIDEO",
-            "url_video_id",
-            140,
-            "Video object ID",
-            url,
+            "url",
+            155,
+            key="video_id",
+            url=url,
         )
 
     if shape.reel_id:
@@ -2000,10 +1874,10 @@ def add_structural_evidence(
             graph,
             shape.reel_id,
             "REEL",
-            "url_reel_id",
-            140,
-            "Reel object ID",
-            url,
+            "url",
+            155,
+            key="reel_id",
+            url=url,
         )
 
     if shape.photo_id:
@@ -2012,10 +1886,10 @@ def add_structural_evidence(
             graph,
             shape.photo_id,
             "PHOTO",
-            "url_photo_id",
-            140,
-            "Photo object ID",
-            url,
+            "url",
+            155,
+            key="photo_id",
+            url=url,
         )
 
     if shape.story_id:
@@ -2023,92 +1897,43 @@ def add_structural_evidence(
         add_evidence(
             graph,
             shape.story_id,
-            "STORY",
-            "url_story_id",
-            140,
-            "Story object ID",
-            url,
-        )
-
-    if shape.album_id:
-
-        add_evidence(
-            graph,
-            shape.album_id,
-            "ALBUM",
-            "url_album_id",
-            125,
-            "Album ID",
-            url,
+            "POST",
+            "url",
+            155,
+            key="story_id",
+            url=url,
         )
 
 
 # ======================================================================
-# HTML SEMANTIC
+# HTML SEMANTIC IDS
 # ======================================================================
 
-SEMANTIC_REGEX = re.compile(
-    r"""
-    (?P<key>
-        user[_\-]?id
-        |userid
-        |profile[_\-]?id
-        |profileid
-        |owner[_\-]?id
-        |ownerid
-        |publisher[_\-]?id
-        |publisherid
-        |author[_\-]?id
-        |authorid
-        |creator[_\-]?id
-        |creatorid
-        |from[_\-]?id
-        |fromid
-        |actor[_\-]?id
-        |actorid
-        |page[_\-]?owner[_\-]?id
-        |page[_\-]?id
-        |group[_\-]?id
-        |post[_\-]?id
-        |story[_\-]?fbid
-        |video[_\-]?id
-        |reel[_\-]?id
-        |photo[_\-]?id
-        |media[_\-]?fbid
-        |album[_\-]?id
-    )
-    \s*
-    ["':=]+
-    \s*
-    (?P<value>\d{5,21})
-    """,
-    re.I | re.X,
-)
-
-
-def collect_semantic_evidence(
+def collect_html_ids(
     graph: EvidenceGraph,
     text: str,
-    source: str,
     url: str,
+    source: str = "html",
 ):
 
     if not text:
         return
 
-    for match in SEMANTIC_REGEX.finditer(
-        text[:MAX_HTML_BYTES]
+    for match in SEMANTIC_ID_RE.finditer(
+        text
     ):
 
         key = normalize_key(
-            match.group("key")
+            match.group(
+                "key"
+            )
         )
 
         value = match.group(
             "value"
         )
 
-        role, weight = field_weight(
+        role, weight = classify_id_key(
             key
         )
 
@@ -2118,11 +1943,11 @@ def collect_semantic_evidence(
         context = text[
             max(
                 0,
-                match.start() - 180,
+                match.start() - 300,
             ):
             min(
                 len(text),
-                match.end() + 320,
+                match.end() + 600,
             )
         ]
 
@@ -2132,18 +1957,80 @@ def collect_semantic_evidence(
             role,
             source,
             weight,
+            key=key,
+            path=key,
             context=context,
             url=url,
-            path=key,
-            key=key,
         )
 
 
 # ======================================================================
-# JSON EVIDENCE
+# JSON WALK
 # ======================================================================
 
-def collect_json_semantic_evidence(
+def walk_json(
+    value: Any,
+    path: str = "",
+):
+
+    if isinstance(
+        value,
+        dict,
+    ):
+
+        for key, child in value.items():
+
+            key = str(key)
+
+            child_path = (
+                f"{path}.{key}"
+                if path
+                else key
+            )
+
+            yield (
+                child_path,
+                key,
+                child,
+                value,
+            )
+
+            yield from walk_json(
+                child,
+                child_path,
+            )
+
+    elif isinstance(
+        value,
+        list,
+    ):
+
+        for index, child in enumerate(
+            value
+        ):
+
+            child_path = (
+                f"{path}[{index}]"
+            )
+
+            yield (
+                child_path,
+                str(index),
+                child,
+                value,
+            )
+
+            yield from walk_json(
+                child,
+                child_path,
+            )
+
+
+# ======================================================================
+# JSON IDS
+# ======================================================================
+
+def collect_json_ids(
     graph: EvidenceGraph,
     objects: Iterable[Any],
     source: str,
@@ -2154,19 +2041,15 @@ def collect_json_semantic_evidence(
 
         for (
             path,
-            value,
             key,
+            value,
             parent,
         ) in walk_json(
             obj
         ):
 
-            normalized = normalize_key(
+            role, weight = classify_id_key(
                 key
-            )
-
-            role, weight = field_weight(
-                normalized
             )
 
             if (
@@ -2180,136 +2063,28 @@ def collect_json_semantic_evidence(
                     role,
                     source,
                     weight,
-                    context=compact_text(
-                        repr(parent),
-                        1000,
-                    ),
-                    url=url,
+                    key=normalize_key(key),
                     path=path,
-                    key=normalized,
-                )
-
-
-# ======================================================================
-# JSON-LD
-# ======================================================================
-
-def collect_jsonld_evidence(
-    graph: EvidenceGraph,
-    objects: Iterable[Any],
-    url: str,
-):
-
-    for obj in objects:
-
-        for (
-            path,
-            value,
-            key,
-            parent,
-        ) in walk_json(
-            obj
-        ):
-
-            key_lower = normalize_key(
-                key
-            )
-
-            # Direct identity IDs.
-            if (
-                key_lower in {
-                    "id",
-                    "identifier",
-                    "user_id",
-                    "profile_id",
-                    "owner_id",
-                    "creator_id",
-                    "author_id",
-                }
-                and is_numeric_id(value)
-            ):
-
-                role, weight = field_weight(
-                    key_lower
-                )
-
-                if not role:
-                    role = (
-                        "USER_CANDIDATE"
-                    )
-                    weight = 90
-
-                add_evidence(
-                    graph,
-                    value,
-                    role,
-                    "jsonld_identity",
-                    weight,
-                    context=compact_text(
-                        repr(parent),
-                        900,
-                    ),
+                    context=repr(parent),
                     url=url,
-                    path=path,
-                    key=key_lower,
                 )
-
-            if isinstance(
-                value,
-                str,
-            ):
-
-                normalized_url = (
-                    normalize_url(
-                        value
-                    )
-                )
-
-                if normalized_url:
-
-                    child = classify_url(
-                        normalized_url
-                    )
-
-                    if (
-                        child.kind
-                        == "profile"
-                        and child.route_entity_id
-                    ):
-
-                        add_evidence(
-                            graph,
-                            child.route_entity_id,
-                            "USER_CANDIDATE",
-                            "jsonld_profile_url",
-                            130,
-                            context=compact_text(
-                                repr(parent),
-                                900,
-                            ),
-                            url=url,
-                            path=path,
-                            key=key_lower,
-                        )
 
 
 # ======================================================================
-# META EVIDENCE
+# META IDS
 # ======================================================================
 
-def collect_meta_evidence(
+def collect_meta_ids(
     graph: EvidenceGraph,
     snapshot: Snapshot,
 ):
 
-    for key, value in snapshot.meta.items():
+    for key, value in (
+        snapshot.meta.items()
+    ):
 
-        key_lower = normalize_key(
+        role, weight = classify_id_key(
             key
-        )
-
-        role, weight = field_weight(
-            key_lower
         )
 
         if (
@@ -2323,67 +2098,46 @@ def collect_meta_evidence(
                 role,
                 "meta",
                 weight,
-                context=f"{key}: {value}",
+                key=normalize_key(key),
+                path=key,
+                context=f"{key}={value}",
                 url=snapshot.final_url,
-                key=key_lower,
-                path=key_lower,
             )
-
-        normalized = normalize_url(
-            value
-        )
-
-        if normalized:
-
-            child = classify_url(
-                normalized
-            )
-
-            if (
-                child.kind
-                == "profile"
-                and child.route_entity_id
-            ):
-
-                add_evidence(
-                    graph,
-                    child.route_entity_id,
-                    "USER_CANDIDATE",
-                    "meta_profile_url",
-                    140,
-                    context=f"{key}: {value}",
-                    url=snapshot.final_url,
-                    key=key_lower,
-                    path=key_lower,
-                )
 
 
 # ======================================================================
-# DISCOVER FACEBOOK URLS
+# PROFILE URL DISCOVERY
 # ======================================================================
 
-def discover_facebook_urls(
+def discover_profile_urls(
     snapshot: Snapshot,
+    original_shape: URLShape,
 ) -> List[str]:
 
-    results = []
+    result = []
 
     seen = set()
 
-    base = (
-        snapshot.final_url
-        or snapshot.requested_url
-    )
-
     def add(
-        value: str,
+        url: str,
     ):
 
         normalized = normalize_url(
-            value
+            url
         )
 
         if not normalized:
+            return
+
+        shape = classify_url(
+            normalized
+        )
+
+        # ----------------------------------------------------------
+        # A pure username URL is a profile.
+        # ----------------------------------------------------------
+
+        if shape.kind != "profile":
             return
 
         if normalized in seen:
@@ -2393,51 +2147,834 @@ def discover_facebook_urls(
             normalized
         )
 
-        results.append(
+        result.append(
             normalized
         )
 
+    # Original URL itself.
+    if original_shape.kind == "profile":
+
+        add(
+            original_shape.normalized
+        )
+
+    # Links.
     for link in snapshot.links:
 
         add(
             urljoin(
-                base,
+                snapshot.final_url,
                 link,
             )
         )
 
-        if len(results) >= MAX_DISCOVERED_URLS:
-            return results
+        if len(result) >= MAX_PROFILE_CHECKS:
+            return result
 
-    for value in snapshot.meta.values():
+    # Canonical.
+    if snapshot.canonical:
 
-        if (
-            "facebook.com"
-            in value.lower()
-            or "fb.watch"
-            in value.lower()
-        ):
-
-            add(value)
-
-    for match in FACEBOOK_URL_RE.finditer(
-        snapshot.html
-    ):
-
-        add(
-            match.group(
-                0
+        canonical_shape = (
+            classify_url(
+                snapshot.canonical
             )
         )
 
-        if len(results) >= MAX_DISCOVERED_URLS:
-            break
+        # Pure profile.
+        if canonical_shape.kind == "profile":
 
-    return results
+            add(
+                snapshot.canonical
+            )
+
+        # Content belonging to username.
+        elif canonical_shape.username:
+
+            add(
+                profile_url_from_shape(
+                    canonical_shape
+                )
+            )
+
+    # Metadata URLs.
+    for key in (
+        "og:url",
+        "al:web:url",
+        "twitter:url",
+    ):
+
+        value = snapshot.meta.get(
+            key
+        )
+
+        if value:
+            add(value)
+
+    return result[:MAX_PROFILE_CHECKS]
 
 
 # ======================================================================
-# HTTP ENGINE
+# PROFILE IDENTITY
+# ======================================================================
+
+@dataclass
+class ProfileInfo:
+
+    uid: str = ""
+
+    name: str = ""
+
+    username: str = ""
+
+    profile_url: str = ""
+
+    avatar: str = ""
+
+    bio: str = ""
+
+    entity_type: str = "USER"
+
+    verified: bool = False
+
+    score: float = 0
+
+
+# ======================================================================
+# NAME EXTRACTION
+# ======================================================================
+
+GENERIC_NAMES = {
+    "facebook",
+    "meta",
+    "home",
+    "login",
+    "log in",
+    "facebook watch",
+    "video",
+    "videos",
+    "reel",
+    "reels",
+}
+
+
+def clean_name(
+    value: Any,
+) -> str:
+
+    value = clean_text(
+        value
+    )
+
+    if not value:
+        return ""
+
+    value = re.sub(
+        r"\s*\|\s*Facebook.*$",
+        "",
+        value,
+        flags=re.I,
+    )
+
+    value = re.sub(
+        r"\s*-\s*Facebook.*$",
+        "",
+        value,
+        flags=re.I,
+    )
+
+    value = re.sub(
+        r"\s+on Facebook.*$",
+        "",
+        value,
+        flags=re.I,
+    )
+
+    value = re.sub(
+        r"'s\s+(reel|video|post|photo).*$",
+        "",
+        value,
+        flags=re.I,
+    )
+
+    value = value.strip()
+
+    if value.lower() in GENERIC_NAMES:
+        return ""
+
+    return truncate(
+        value,
+        250,
+    )
+
+
+def extract_names_from_json(
+    objects: Iterable[Any],
+) -> List[str]:
+
+    candidates = []
+
+    keys = {
+        "name",
+        "full_name",
+        "fullname",
+        "display_name",
+        "short_name",
+        "profile_name",
+        "user_name",
+    }
+
+    for obj in objects:
+
+        for (
+            path,
+            key,
+            value,
+            parent,
+        ) in walk_json(
+            obj
+        ):
+
+            if (
+                normalize_key(key)
+                not in keys
+            ):
+                continue
+
+            if not isinstance(
+                value,
+                str,
+            ):
+                continue
+
+            value = clean_name(
+                value
+            )
+
+            if not value:
+                continue
+
+            path_lower = (
+                path.lower()
+            )
+
+            score = 10
+
+            if any(
+                x in path_lower
+                for x in (
+                    "profile",
+                    "owner",
+                    "author",
+                    "creator",
+                    "publisher",
+                    "actor",
+                    "user",
+                )
+            ):
+
+                score += 30
+
+            if normalize_key(key) in {
+                "full_name",
+                "fullname",
+                "display_name",
+            }:
+
+                score += 20
+
+            candidates.append(
+                (
+                    score,
+                    value,
+                )
+            )
+
+    candidates.sort(
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    result = []
+
+    seen = set()
+
+    for _, value in candidates:
+
+        key = value.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(
+            key
+        )
+
+        result.append(
+            value
+        )
+
+        if len(result) >= 10:
+            break
+
+    return result
+
+
+# ======================================================================
+# USERNAME EXTRACTION
+# ======================================================================
+
+def extract_username_from_json(
+    objects: Iterable[Any],
+) -> str:
+
+    keys = {
+        "username",
+        "user_name",
+        "vanity",
+        "screen_name",
+        "handle",
+    }
+
+    candidates = []
+
+    for obj in objects:
+
+        for (
+            path,
+            key,
+            value,
+            parent,
+        ) in walk_json(
+            obj
+        ):
+
+            if (
+                normalize_key(key)
+                not in keys
+            ):
+                continue
+
+            if not isinstance(
+                value,
+                str,
+            ):
+                continue
+
+            value = clean_text(
+                value
+            )
+
+            if not value:
+                continue
+
+            path_lower = (
+                path.lower()
+            )
+
+            score = 10
+
+            if any(
+                x in path_lower
+                for x in (
+                    "profile",
+                    "user",
+                    "owner",
+                    "author",
+                    "creator",
+                )
+            ):
+
+                score += 30
+
+            candidates.append(
+                (
+                    score,
+                    value,
+                )
+            )
+
+    if not candidates:
+        return ""
+
+    candidates.sort(
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    return candidates[0][1].lstrip(
+        "@"
+    )
+
+
+# ======================================================================
+# PROFILE METADATA
+# ======================================================================
+
+def extract_profile_metadata(
+    snapshot: Snapshot,
+    shape: URLShape,
+) -> ProfileInfo:
+
+    info = ProfileInfo()
+
+    # --------------------------------------------------------------
+    # Username from URL.
+    # --------------------------------------------------------------
+
+    if shape.username:
+
+        info.username = (
+            shape.username
+        )
+
+    # --------------------------------------------------------------
+    # JSON username.
+    # --------------------------------------------------------------
+
+    if not info.username:
+
+        info.username = (
+            extract_username_from_json(
+                snapshot.embedded_json
+            )
+            or extract_username_from_json(
+                snapshot.jsonld
+            )
+        )
+
+    # --------------------------------------------------------------
+    # Name.
+    # --------------------------------------------------------------
+
+    name_candidates = []
+
+    for key in (
+        "og:title",
+        "twitter:title",
+        "title",
+    ):
+
+        value = snapshot.meta.get(
+            key
+        )
+
+        if value:
+
+            value = clean_name(
+                value
+            )
+
+            if value:
+
+                name_candidates.append(
+                    value
+                )
+
+    name_candidates.extend(
+        extract_names_from_json(
+            snapshot.embedded_json
+        )
+    )
+
+    name_candidates.extend(
+        extract_names_from_json(
+            snapshot.jsonld
+        )
+    )
+
+    if name_candidates:
+
+        info.name = name_candidates[0]
+
+    # --------------------------------------------------------------
+    # Bio.
+    # --------------------------------------------------------------
+
+    for key in (
+        "og:description",
+        "twitter:description",
+        "description",
+    ):
+
+        value = snapshot.meta.get(
+            key
+        )
+
+        if value:
+
+            info.bio = truncate(
+                value,
+                500,
+            )
+
+            break
+
+    # --------------------------------------------------------------
+    # Avatar.
+    # --------------------------------------------------------------
+
+    for key in (
+        "og:image",
+        "twitter:image",
+        "twitter:image:src",
+    ):
+
+        value = snapshot.meta.get(
+            key
+        )
+
+        if value:
+
+            info.avatar = value.strip()
+
+            break
+
+    # --------------------------------------------------------------
+    # Profile URL.
+    # --------------------------------------------------------------
+
+    if shape.kind == "profile":
+
+        info.profile_url = (
+            profile_url_from_shape(
+                shape
+            )
+        )
+
+    if not info.profile_url:
+
+        canonical_shape = classify_url(
+            snapshot.canonical
+        )
+
+        if canonical_shape.kind == "profile":
+
+            info.profile_url = (
+                profile_url_from_shape(
+                    canonical_shape
+                )
+            )
+
+        elif canonical_shape.username:
+
+            info.profile_url = (
+                profile_url_from_shape(
+                    canonical_shape
+                )
+            )
+
+    return info
+
+
+# ======================================================================
+# IDENTITY SCORE
+# ======================================================================
+
+def score_uid_candidates(
+    graph: EvidenceGraph,
+) -> Dict[str, float]:
+
+    scores = {}
+
+    for uid in graph.values(
+        "USER_CANDIDATE"
+    ):
+
+        items = graph.for_value(
+            uid
+        )
+
+        score = 0
+
+        sources = set()
+
+        strong_sources = set()
+
+        for item in items:
+
+            sources.add(
+                item.source
+            )
+
+            contribution = min(
+                170,
+                item.weight,
+            )
+
+            if item.verified:
+
+                contribution += 100
+
+            score += contribution
+
+            if item.weight >= 120:
+
+                strong_sources.add(
+                    item.source
+                )
+
+        # Independent-source bonus.
+        if len(sources) >= 2:
+            score += 50
+
+        if len(sources) >= 3:
+            score += 45
+
+        if len(strong_sources) >= 2:
+            score += 60
+
+        scores[uid] = score
+
+    return scores
+
+
+# ======================================================================
+# CONFLICT
+# ======================================================================
+
+def identity_conflict(
+    graph: EvidenceGraph,
+) -> bool:
+
+    scores = score_uid_candidates(
+        graph
+    )
+
+    ranked = sorted(
+        scores.items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    if len(ranked) < 2:
+        return False
+
+    top = ranked[0][1]
+
+    for _, score in ranked[1:]:
+
+        if (
+            score >= 250
+            and score >= top * 0.80
+        ):
+
+            return True
+
+    return False
+
+
+# ======================================================================
+# PROFILE VERIFICATION
+# ======================================================================
+
+@dataclass
+class Verification:
+
+    uid: str
+
+    verified: bool = False
+
+    score: float = 0
+
+    signals: List[str] = field(
+        default_factory=list
+    )
+
+    info: ProfileInfo = field(
+        default_factory=ProfileInfo
+    )
+
+
+async def verify_profile_identity(
+    fetcher,
+    profile_url: str,
+    expected_uid: str,
+) -> Verification:
+
+    result = Verification(
+        uid=expected_uid
+    )
+
+    snapshot = await fetcher.fetch(
+        profile_url
+    )
+
+    if not snapshot.html:
+        return result
+
+    shape = classify_url(
+        profile_url
+    )
+
+    graph = EvidenceGraph()
+
+    collect_url_evidence(
+        graph,
+        shape,
+        profile_url,
+    )
+
+    collect_html_ids(
+        graph,
+        snapshot.html,
+        snapshot.final_url,
+        "profile_html",
+    )
+
+    collect_meta_ids(
+        graph,
+        snapshot,
+    )
+
+    collect_json_ids(
+        graph,
+        snapshot.embedded_json,
+        "profile_json",
+        snapshot.final_url,
+    )
+
+    collect_json_ids(
+        graph,
+        snapshot.jsonld,
+        "profile_jsonld",
+        snapshot.final_url,
+    )
+
+    info = extract_profile_metadata(
+        snapshot,
+        shape,
+    )
+
+    info.profile_url = (
+        profile_url_from_shape(
+            shape
+        )
+        or profile_url
+    )
+
+    # --------------------------------------------------------------
+    # Exact UID evidence.
+    # --------------------------------------------------------------
+
+    exact = [
+        x
+        for x in graph.for_value(
+            expected_uid
+        )
+        if x.role == "USER_CANDIDATE"
+    ]
+
+    sources = {
+        x.source
+        for x in exact
+    }
+
+    strong = [
+        x
+        for x in exact
+        if x.weight >= 120
+    ]
+
+    if exact:
+
+        result.score += 70
+
+        result.signals.append(
+            "uid_found_in_profile"
+        )
+
+    if len(sources) >= 2:
+
+        result.score += 80
+
+        result.signals.append(
+            "uid_multiple_sources"
+        )
+
+    if len(strong) >= 2:
+
+        result.score += 70
+
+        result.signals.append(
+            "uid_multiple_strong_sources"
+        )
+
+    # --------------------------------------------------------------
+    # Explicit profile.php?id.
+    # --------------------------------------------------------------
+
+    if (
+        shape.kind == "profile"
+        and shape.route_entity_id
+        == expected_uid
+    ):
+
+        result.score += 90
+
+        result.signals.append(
+            "profile_url_exact_uid"
+        )
+
+    # --------------------------------------------------------------
+    # Canonical exact numeric profile.
+    # --------------------------------------------------------------
+
+    canonical_shape = classify_url(
+        snapshot.canonical
+    )
+
+    if (
+        canonical_shape.kind == "profile"
+        and canonical_shape.route_entity_id
+        == expected_uid
+    ):
+
+        result.score += 100
+
+        result.signals.append(
+            "canonical_exact_uid"
+        )
+
+    # --------------------------------------------------------------
+    # Identity decision.
+    # --------------------------------------------------------------
+
+    if (
+        len(sources) >= 2
+        and len(strong) >= 1
+    ):
+
+        result.verified = True
+
+    elif (
+        "profile_url_exact_uid"
+        in result.signals
+        and len(strong) >= 1
+    ):
+
+        result.verified = True
+
+    elif (
+        "canonical_exact_uid"
+        in result.signals
+        and len(strong) >= 1
+    ):
+
+        result.verified = True
+
+    if result.verified:
+
+        info.uid = expected_uid
+        info.verified = True
+        info.score = result.score
+
+        result.info = info
+
+    return result
+
+
+# ======================================================================
+# FETCH ENGINE
 # ======================================================================
 
 class FetchEngine:
@@ -2489,7 +3026,7 @@ class FetchEngine:
         user_agent: str,
     ) -> Snapshot:
 
-        snapshot = Snapshot(
+        result = Snapshot(
             requested_url=url
         )
 
@@ -2498,31 +3035,57 @@ class FetchEngine:
             response = self.session.get(
                 url,
                 headers={
-                    "User-Agent":
-                    user_agent,
+                    "authority": "www.facebook.com",
+		            "accept": (
+		                "text/html,"
+		                "application/xhtml+xml,"
+		                "application/xml;q=0.9,"
+		                "image/avif,"
+		                "image/webp,"
+		                "image/apng,"
+		                "*/*;q=0.8"
+		            ),
+		            "accept-language": (
+		                "vi-VN,vi;q=0.9,"
+		                "en-US;q=0.8,en;q=0.7"
+		            ),
+		            "cache-control": "no-cache",
+		            "pragma": "no-cache",
+		            "sec-fetch-dest": "document",
+		            "sec-fetch-mode": "navigate",
+		            "sec-fetch-site": "none",
+		            "upgrade-insecure-requests": "1",
+		            "user-agent": (
+		                "Mozilla/5.0 "
+		                "(Windows NT 10.0; Win64; x64) "
+		                "AppleWebKit/537.36 "
+		                "(KHTML, like Gecko) "
+		                "Chrome/139.0.0.0 "
+		                "Safari/537.36"
+		            ),
                 },
                 timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
                 stream=True,
             )
 
-            snapshot.status_code = (
+            result.status_code = (
                 response.status_code
             )
 
-            snapshot.final_url = (
+            result.final_url = (
                 normalize_url(
                     response.url
                 )
                 or response.url
             )
 
-            snapshot.redirects = [
+            result.redirects = [
                 normalize_url(
-                    x.url
+                    item.url
                 )
-                or x.url
-                for x in response.history
+                or item.url
+                for item in response.history
             ]
 
             chunks = []
@@ -2530,8 +3093,7 @@ class FetchEngine:
             total = 0
 
             for chunk in response.iter_content(
-                chunk_size=65536,
-                decode_unicode=False,
+                chunk_size=65536
             ):
 
                 if not chunk:
@@ -2573,36 +3135,31 @@ class FetchEngine:
 
             try:
 
-                snapshot.html = (
-                    raw.decode(
-                        encoding,
-                        errors="replace",
-                    )
+                result.html = raw.decode(
+                    encoding,
+                    errors="replace",
                 )
 
             except Exception:
 
-                snapshot.html = (
-                    raw.decode(
-                        "utf-8",
-                        errors="replace",
-                    )
+                result.html = raw.decode(
+                    "utf-8",
+                    errors="replace",
                 )
 
             parse_snapshot(
-                snapshot
+                result
             )
 
-            return snapshot
+            return result
 
         except Exception as exc:
 
-            snapshot.error = (
-                f"{type(exc).__name__}: "
-                f"{exc}"
+            result.error = (
+                f"{type(exc).__name__}: {exc}"
             )
 
-            return snapshot
+            return result
 
     async def fetch(
         self,
@@ -2623,56 +3180,23 @@ class FetchEngine:
 
             last = result
 
-            if (
-                result.html
-                and result.status_code
-            ):
+            if result.html:
 
                 return result
-
-            await asyncio.sleep(
-                FETCH_DELAY
-            )
 
         return last
 
 
 # ======================================================================
-# PROFILE INFORMATION
-# ======================================================================
-
-@dataclass
-class ProfileInfo:
-
-    uid: str = ""
-
-    name: str = ""
-
-    username: str = ""
-
-    profile_url: str = ""
-
-    avatar: str = ""
-
-    bio: str = ""
-
-    entity_type: str = "USER"
-
-    verified: bool = False
-
-    sources: Set[str] = field(
-        default_factory=set
-    )
-
-
-# ======================================================================
-# CONTENT INFORMATION
+# CONTENT
 # ======================================================================
 
 @dataclass
 class ContentInfo:
 
-    content_type: str = ""
+    kind: str = ""
+
+    title: str = ""
 
     post_id: str = ""
 
@@ -2684,13 +3208,7 @@ class ContentInfo:
 
     story_id: str = ""
 
-    album_id: str = ""
-
-    title: str = ""
-
-    canonical_url: str = ""
-
-    publisher_uid: str = ""
+    url: str = ""
 
 
 # ======================================================================
@@ -2702,15 +3220,11 @@ class ResolveResult:
 
     input_url: str
 
-    shape: URLShape
+    kind: str = "UNKNOWN"
 
     status: str = "NOT_VERIFIED"
 
-    confidence: float = 0.0
-
-    entity_type: str = "UNKNOWN"
-
-    publisher_type: str = "UNKNOWN"
+    confidence: float = 0
 
     profile: ProfileInfo = field(
         default_factory=ProfileInfo
@@ -2720,362 +3234,17 @@ class ResolveResult:
         default_factory=ContentInfo
     )
 
-    resolved_url: str = ""
-
-    canonical_url: str = ""
-
     evidence: List[Evidence] = field(
         default_factory=list
     )
 
-    notes: List[str] = field(
-        default_factory=list
-    )
+    elapsed: float = 0
 
-    elapsed: float = 0.0
+    error: str = ""
 
 
 # ======================================================================
-# PROFILE URL EXTRACTION
-# ======================================================================
-
-def extract_profile_urls(
-    snapshot: Snapshot,
-) -> List[str]:
-
-    results = []
-
-    seen = set()
-
-    def add(
-        value: str,
-    ):
-
-        normalized = normalize_url(
-            value
-        )
-
-        if not normalized:
-            return
-
-        child = classify_url(
-            normalized
-        )
-
-        if child.kind != "profile":
-            return
-
-        if normalized in seen:
-            return
-
-        seen.add(
-            normalized
-        )
-
-        results.append(
-            normalized
-        )
-
-    for link in snapshot.links:
-
-        add(
-            urljoin(
-                snapshot.final_url,
-                link,
-            )
-        )
-
-        if len(results) >= MAX_PROFILE_CHECKS:
-            break
-
-    for key in (
-        "og:url",
-        "al:web:url",
-        "twitter:url",
-        "canonical",
-    ):
-
-        value = snapshot.meta.get(
-            key
-        )
-
-        if value:
-            add(value)
-
-    for obj in snapshot.jsonld:
-
-        for (
-            _,
-            value,
-            _key,
-            _parent,
-        ) in walk_json(
-            obj
-        ):
-
-            if isinstance(
-                value,
-                str,
-            ):
-
-                add(value)
-
-                if (
-                    len(results)
-                    >= MAX_PROFILE_CHECKS
-                ):
-                    return results
-
-    return results
-
-
-# ======================================================================
-# PROFILE NAME / USERNAME EXTRACTION
-# ======================================================================
-
-def extract_profile_identity(
-    snapshot: Snapshot,
-    expected_uid: str = "",
-) -> ProfileInfo:
-
-    info = ProfileInfo()
-
-    graph = EvidenceGraph()
-
-    collect_semantic_evidence(
-        graph,
-        snapshot.html,
-        "profile_html",
-        snapshot.final_url,
-    )
-
-    collect_meta_evidence(
-        graph,
-        snapshot,
-    )
-
-    collect_json_semantic_evidence(
-        graph,
-        snapshot.embedded_json,
-        "profile_json",
-        snapshot.final_url,
-    )
-
-    collect_jsonld_evidence(
-        graph,
-        snapshot.jsonld,
-        snapshot.final_url,
-    )
-
-    # --------------------------------------------------------------
-    # UID
-    # --------------------------------------------------------------
-
-    if expected_uid:
-
-        if any(
-            x.value == expected_uid
-            and x.role
-            == "USER_CANDIDATE"
-            for x in graph.items
-        ):
-
-            info.uid = expected_uid
-
-    # --------------------------------------------------------------
-    # Name candidates
-    # --------------------------------------------------------------
-
-    name_keys = [
-        "og:title",
-        "twitter:title",
-        "title",
-        "profile:name",
-        "author",
-        "og:site_name",
-    ]
-
-    for key in name_keys:
-
-        value = snapshot.meta.get(
-            key
-        )
-
-        if value:
-
-            value = compact_text(
-                value,
-                250,
-            )
-
-            if (
-                value
-                and value.lower()
-                not in {
-                    "facebook",
-                    "meta",
-                }
-            ):
-
-                info.name = value
-
-                break
-
-    # --------------------------------------------------------------
-    # Description / bio
-    # --------------------------------------------------------------
-
-    for key in (
-        "og:description",
-        "description",
-        "twitter:description",
-    ):
-
-        value = snapshot.meta.get(
-            key
-        )
-
-        if value:
-
-            info.bio = compact_text(
-                value,
-                500,
-            )
-
-            break
-
-    # --------------------------------------------------------------
-    # Profile URL
-    # --------------------------------------------------------------
-
-    profile_urls = (
-        extract_profile_urls(
-            snapshot
-        )
-    )
-
-    if profile_urls:
-
-        info.profile_url = (
-            clean_profile_url(
-                profile_urls[0]
-            )
-        )
-
-        shape = classify_url(
-            profile_urls[0]
-        )
-
-        if shape.username:
-
-            info.username = (
-                shape.username
-            )
-
-        if (
-            not info.uid
-            and shape.route_entity_id
-        ):
-
-            info.uid = (
-                shape.route_entity_id
-            )
-
-    # --------------------------------------------------------------
-    # Canonical username
-    # --------------------------------------------------------------
-
-    if not info.username:
-
-        candidate = (
-            clean_profile_url(
-                snapshot.canonical
-            )
-        )
-
-        child = classify_url(
-            candidate
-        )
-
-        if child.username:
-
-            info.username = (
-                child.username
-            )
-
-    # --------------------------------------------------------------
-    # Avatar
-    # --------------------------------------------------------------
-
-    for key in (
-        "og:image",
-        "twitter:image",
-        "twitter:image:src",
-    ):
-
-        value = snapshot.meta.get(
-            key
-        )
-
-        if value:
-
-            info.avatar = value.strip()
-
-            break
-
-    return info
-
-
-# ======================================================================
-# CLEAN PROFILE URL
-# ======================================================================
-
-def clean_profile_url(
-    url: str,
-) -> str:
-
-    normalized = normalize_url(
-        url
-    )
-
-    if not normalized:
-        return ""
-
-    shape = classify_url(
-        normalized
-    )
-
-    if (
-        shape.kind == "profile"
-        and shape.username
-    ):
-
-        return (
-            "https://www.facebook.com/"
-            + quote(
-                shape.username,
-                safe="@._-",
-            )
-        )
-
-    if (
-        shape.kind == "profile"
-        and shape.route_entity_id
-    ):
-
-        return (
-            "https://www.facebook.com/"
-            "profile.php?id="
-            + quote(
-                shape.route_entity_id
-            )
-        )
-
-    return normalized
-
-
-# ======================================================================
-# CLEAN CONTENT URL
+# CONTENT EXTRACTION
 # ======================================================================
 
 def clean_content_url(
@@ -3089,10 +3258,6 @@ def clean_content_url(
     if not normalized:
         return ""
 
-    parsed = urlparse(
-        normalized
-    )
-
     shape = classify_url(
         normalized
     )
@@ -3100,39 +3265,51 @@ def clean_content_url(
     if shape.kind == "reel" and shape.reel_id:
 
         return (
-            "https://www.facebook.com/"
-            "reel/"
-            f"{shape.reel_id}"
+            "https://www.facebook.com/reel/"
+            + shape.reel_id
         )
 
     if shape.kind == "video" and shape.video_id:
 
         return (
-            "https://www.facebook.com/"
-            "watch/?v="
-            f"{shape.video_id}"
+            "https://www.facebook.com/watch/?v="
+            + shape.video_id
         )
 
     if shape.kind == "photo" and shape.photo_id:
 
         return (
-            "https://www.facebook.com/"
-            "photo.php?fbid="
-            f"{shape.photo_id}"
+            "https://www.facebook.com/photo.php?fbid="
+            + shape.photo_id
         )
 
     if shape.kind == "post" and shape.post_id:
 
         return (
-            "https://www.facebook.com/"
-            "posts/"
-            f"{shape.post_id}"
+            "https://www.facebook.com/posts/"
+            + shape.post_id
         )
 
-    # Fallback: remove query parameters.
+    # --------------------------------------------------------------
+    # IMPORTANT:
+    # Profile URL must remain profile URL.
+    # --------------------------------------------------------------
+
+    if shape.kind == "profile":
+
+        return (
+            profile_url_from_shape(
+                shape
+            )
+        )
+
+    parsed = urlparse(
+        normalized
+    )
+
     return urlunparse(
         (
-            parsed.scheme,
+            "https",
             parsed.netloc,
             parsed.path,
             "",
@@ -3142,821 +3319,148 @@ def clean_content_url(
     )
 
 
-# ======================================================================
-# PROFILE VERIFIER
-# ======================================================================
-
-@dataclass
-class ProfileVerification:
-
-    uid: str
-
-    profile_url: str
-
-    score: float = 0
-
-    verified: bool = False
-
-    signals: List[str] = field(
-        default_factory=list
-    )
-
-    snapshot: Optional[
-        Snapshot
-    ] = None
-
-    info: ProfileInfo = field(
-        default_factory=ProfileInfo
-    )
-
-
-async def verify_profile(
-    fetcher: FetchEngine,
-    profile_url: str,
-    uid: str,
-) -> ProfileVerification:
-
-    result = ProfileVerification(
-        uid=uid,
-        profile_url=profile_url,
-    )
-
-    snapshot = await fetcher.fetch(
-        profile_url
-    )
-
-    result.snapshot = snapshot
-
-    if not snapshot.html:
-
-        return result
-
-    info = extract_profile_identity(
-        snapshot,
-        uid,
-    )
-
-    result.info = info
-
-    shape = classify_url(
-        profile_url
-    )
-
-    # --------------------------------------------------------------
-    # Explicit profile URL.
-    # --------------------------------------------------------------
-
-    if (
-        shape.kind == "profile"
-        and shape.route_entity_id == uid
-    ):
-
-        result.score += 55
-
-        result.signals.append(
-            "profile_url_exact_uid"
-        )
-
-    # --------------------------------------------------------------
-    # Final URL.
-    # --------------------------------------------------------------
-
-    final_shape = classify_url(
-        snapshot.final_url
-    )
-
-    if (
-        final_shape.kind == "profile"
-        and final_shape.route_entity_id == uid
-    ):
-
-        result.score += 65
-
-        result.signals.append(
-            "final_url_exact_uid"
-        )
-
-    # --------------------------------------------------------------
-    # Canonical.
-    # --------------------------------------------------------------
-
-    canonical = (
-        clean_profile_url(
-            snapshot.canonical
-        )
-    )
-
-    canonical_shape = classify_url(
-        canonical
-    )
-
-    if (
-        canonical_shape.kind == "profile"
-        and canonical_shape.route_entity_id == uid
-    ):
-
-        result.score += 80
-
-        result.signals.append(
-            "canonical_exact_uid"
-        )
-
-    # --------------------------------------------------------------
-    # Explicit semantic identity.
-    # --------------------------------------------------------------
-
-    graph = EvidenceGraph()
-
-    collect_semantic_evidence(
-        graph,
-        snapshot.html,
-        "profile_semantic",
-        snapshot.final_url,
-    )
-
-    collect_json_semantic_evidence(
-        graph,
-        snapshot.embedded_json,
-        "profile_json",
-        snapshot.final_url,
-    )
-
-    collect_jsonld_evidence(
-        graph,
-        snapshot.jsonld,
-        snapshot.final_url,
-    )
-
-    identity_items = [
-        x
-        for x in graph.for_value(
-            uid
-        )
-        if x.role
-        == "USER_CANDIDATE"
-    ]
-
-    identity_sources = {
-        x.source
-        for x in identity_items
-    }
-
-    if identity_items:
-
-        result.score += 40
-
-        result.signals.append(
-            "explicit_identity_field"
-        )
-
-    if len(identity_sources) >= 2:
-
-        result.score += 30
-
-        result.signals.append(
-            "multiple_identity_sources"
-        )
-
-    # --------------------------------------------------------------
-    # Final verification.
-    # --------------------------------------------------------------
-
-    strong_url = any(
-        x in result.signals
-        for x in (
-            "canonical_exact_uid",
-            "final_url_exact_uid",
-        )
-    )
-
-    semantic = (
-        "explicit_identity_field"
-        in result.signals
-    )
-
-    multi = (
-        "multiple_identity_sources"
-        in result.signals
-    )
-
-    if (
-        strong_url
-        and semantic
-    ):
-
-        result.verified = True
-
-    elif (
-        strong_url
-        and multi
-    ):
-
-        result.verified = True
-
-    elif (
-        result.score >= 150
-        and semantic
-        and multi
-    ):
-
-        result.verified = True
-
-    if result.verified:
-
-        result.info.verified = True
-
-    return result
-
-
-# ======================================================================
-# USER SCORING
-# ======================================================================
-
-def candidate_user_scores(
+def best_object(
     graph: EvidenceGraph,
-) -> Dict[str, float]:
+    role: str,
+) -> str:
 
-    scores = {}
+    candidates = {}
 
-    for uid in graph.values(
-        "USER_CANDIDATE"
+    for item in graph.for_role(
+        role
     ):
 
-        items = graph.for_value(
-            uid
+        candidates.setdefault(
+            item.value,
+            0,
         )
 
-        by_source = {}
+        candidates[
+            item.value
+        ] += item.weight
 
-        for item in items:
+    if not candidates:
+        return ""
 
-            if item.role != "USER_CANDIDATE":
-                continue
-
-            by_source.setdefault(
-                item.source,
-                [],
-            ).append(
-                item
-            )
-
-        score = 0
-
-        for source, source_items in (
-            by_source.items()
-        ):
-
-            strongest = max(
-                source_items,
-                key=lambda x: x.weight,
-            )
-
-            contribution = min(
-                150,
-                strongest.weight,
-            )
-
-            # Same source gets only tiny bonus.
-            if len(source_items) > 1:
-
-                contribution += min(
-                    12,
-                    (len(source_items) - 1)
-                    * 3,
-                )
-
-            score += contribution
-
-        source_count = len(
-            by_source
-        )
-
-        if source_count >= 2:
-            score += 30
-
-        if source_count >= 3:
-            score += 30
-
-        if source_count >= 4:
-            score += 20
-
-        if any(
-            x.verified
-            for x in items
-        ):
-
-            score += 150
-
-        scores[uid] = score
-
-    return scores
-
-
-# ======================================================================
-# CONFLICT DETECTION
-# ======================================================================
-
-def detect_user_conflict(
-    graph: EvidenceGraph,
-) -> Tuple[
-    bool,
-    List[str],
-]:
-
-    scores = candidate_user_scores(
-        graph
-    )
-
-    ranked = sorted(
-        scores.items(),
+    return max(
+        candidates.items(),
         key=lambda x: x[1],
-        reverse=True,
-    )
-
-    if len(ranked) < 2:
-
-        return (
-            False,
-            [],
-        )
-
-    top_uid, top_score = ranked[0]
-
-    conflicts = []
-
-    for uid, score in ranked[1:]:
-
-        if (
-            score >= 180
-            and score >= top_score * 0.72
-        ):
-
-            conflicts.append(
-                uid
-            )
-
-    if conflicts:
-
-        return (
-            True,
-            [top_uid] + conflicts,
-        )
-
-    return (
-        False,
-        [],
-    )
+    )[0]
 
 
-# ======================================================================
-# ENTITY TYPE
-# ======================================================================
-
-def infer_entity_type(
-    shape: URLShape,
-) -> str:
-
-    mapping = {
-        "profile": "USER",
-        "group": "GROUP",
-        "group_post": "GROUP_POST",
-        "page": "PAGE",
-        "post": "POST",
-        "video": "VIDEO",
-        "reel": "REEL",
-        "photo": "PHOTO",
-        "story": "STORY",
-        "permalink": "POST",
-        "share": "SHARE",
-    }
-
-    return mapping.get(
-        shape.kind,
-        "UNKNOWN",
-    )
-
-
-def infer_publisher_type(
-    shape: URLShape,
-    graph: EvidenceGraph,
-) -> str:
-
-    if shape.group_id:
-        return "GROUP"
-
-    if shape.page_id:
-        return "PAGE"
-
-    if graph.values(
-        "GROUP"
-    ):
-        return "GROUP"
-
-    if graph.values(
-        "PAGE"
-    ):
-        return "PAGE"
-
-    if graph.values(
-        "USER_CANDIDATE"
-    ):
-        return "USER"
-
-    return "UNKNOWN"
-
-
-# ======================================================================
-# CONTENT EXTRACTION
-# ======================================================================
-
-def extract_content_info(
+def extract_content(
     shape: URLShape,
     snapshot: Snapshot,
     graph: EvidenceGraph,
 ) -> ContentInfo:
 
-    content = ContentInfo()
+    info = ContentInfo()
 
     final_shape = classify_url(
         snapshot.final_url
     )
 
-    # Prefer final route.
-    chosen = final_shape
+    # --------------------------------------------------------------
+    # For pure profile, there is NO content.
+    # --------------------------------------------------------------
 
-    if chosen.kind == "unknown":
+    if (
+        shape.kind == "profile"
+        and not shape.post_id
+        and not shape.video_id
+        and not shape.reel_id
+        and not shape.photo_id
+        and not shape.story_id
+    ):
 
-        chosen = shape
+        return info
 
-    content.content_type = (
-        infer_entity_type(
-            chosen
-        )
+    selected = final_shape
+
+    if selected.kind in {
+        "profile",
+        "unknown",
+    }:
+
+        selected = shape
+
+    mapping = {
+        "post": "POST",
+        "video": "VIDEO",
+        "reel": "REEL",
+        "photo": "PHOTO",
+        "story": "STORY",
+        "group_post": "GROUP_POST",
+    }
+
+    info.kind = mapping.get(
+        selected.kind,
+        "",
     )
 
-    content.post_id = (
-        best_value(
+    info.post_id = (
+        selected.post_id
+        or best_object(
             graph,
             "POST",
         )
     )
 
-    content.video_id = (
-        best_value(
+    info.video_id = (
+        selected.video_id
+        or best_object(
             graph,
             "VIDEO",
         )
     )
 
-    content.reel_id = (
-        best_value(
+    info.reel_id = (
+        selected.reel_id
+        or best_object(
             graph,
             "REEL",
         )
     )
 
-    content.photo_id = (
-        best_value(
+    info.photo_id = (
+        selected.photo_id
+        or best_object(
             graph,
             "PHOTO",
         )
     )
 
-    content.story_id = (
-        best_value(
-            graph,
-            "STORY",
-        )
-    )
-
-    content.album_id = (
-        best_value(
-            graph,
-            "ALBUM",
-        )
-    )
-
-    # Route IDs should win if available.
-    if chosen.post_id:
-        content.post_id = chosen.post_id
-
-    if chosen.video_id:
-        content.video_id = chosen.video_id
-
-    if chosen.reel_id:
-        content.reel_id = chosen.reel_id
-
-    if chosen.photo_id:
-        content.photo_id = chosen.photo_id
-
-    if chosen.story_id:
-        content.story_id = chosen.story_id
-
-    if chosen.album_id:
-        content.album_id = chosen.album_id
-
-    content.title = (
-        extract_clean_title(
-            snapshot
-        )
-    )
-
-    content.canonical_url = (
-        clean_content_url(
-            snapshot.canonical
-        )
-        if snapshot.canonical
-        else clean_content_url(
-            snapshot.final_url
-        )
-    )
-
-    return content
-
-
-# ======================================================================
-# TITLE
-# ======================================================================
-
-def extract_clean_title(
-    snapshot: Snapshot,
-) -> str:
-
-    candidates = [
+    info.title = clean_name(
         snapshot.meta.get(
             "og:title",
             "",
-        ),
-        snapshot.meta.get(
-            "twitter:title",
-            "",
-        ),
-        snapshot.title,
-    ]
-
-    for value in candidates:
-
-        value = compact_text(
-            value,
-            350,
-        )
-
-        if not value:
-            continue
-
-        if value.lower() in {
-            "facebook",
-            "meta",
-        }:
-            continue
-
-        return value
-
-    return ""
-
-
-# ======================================================================
-# BEST OBJECT VALUE
-# ======================================================================
-
-def best_value(
-    graph: EvidenceGraph,
-    role: str,
-) -> str:
-
-    values = graph.values(
-        role
-    )
-
-    if not values:
-        return ""
-
-    best = ""
-
-    best_score = -1
-
-    for value in values:
-
-        items = [
-            x
-            for x in graph.for_value(
-                value
-            )
-            if x.role == role
-        ]
-
-        sources = {
-            x.source
-            for x in items
-        }
-
-        score = sum(
-            min(
-                150,
-                x.weight,
-            )
-            for x in items
-        )
-
-        score += len(
-            sources
-        ) * 20
-
-        if score > best_score:
-
-            best_score = score
-
-            best = value
-
-    return best
-
-
-# ======================================================================
-# IDENTITY VERIFICATION
-# ======================================================================
-
-async def resolve_identity(
-    fetcher: FetchEngine,
-    graph: EvidenceGraph,
-    snapshot: Snapshot,
-    shape: URLShape,
-) -> Tuple[
-    ProfileInfo,
-    float,
-    str,
-    List[str],
-]:
-
-    notes = []
-
-    profile_urls = (
-        extract_profile_urls(
-            snapshot
         )
     )
 
-    scores = candidate_user_scores(
-        graph
-    )
+    if not info.title:
 
-    ranked = sorted(
-        scores.items(),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-
-    if not ranked:
-
-        return (
-            ProfileInfo(),
-            0,
-            "NOT_VERIFIED",
-            [
-                "No user identity candidate"
-            ],
+        info.title = clean_name(
+            snapshot.title
         )
 
-    conflict, conflict_uids = (
-        detect_user_conflict(
-            graph
-        )
-    )
-
-    if conflict:
-
-        notes.append(
-            "Multiple strong user identities conflict"
+    if selected.kind == "reel":
+        info.url = clean_content_url(
+            snapshot.final_url
         )
 
-        return (
-            ProfileInfo(),
-            0,
-            "NOT_VERIFIED",
-            notes,
+    elif snapshot.canonical:
+
+        info.url = clean_content_url(
+            snapshot.canonical
         )
 
-    best_uid = ranked[0][0]
+    else:
 
-    # --------------------------------------------------------------
-    # Verify discovered profile URLs.
-    # --------------------------------------------------------------
-
-    verifications = []
-
-    for profile_url in profile_urls:
-
-        child = classify_url(
-            profile_url
+        info.url = clean_content_url(
+            snapshot.final_url
         )
 
-        uid = child.route_entity_id
-
-        if not uid:
-            continue
-
-        verification = (
-            await verify_profile(
-                fetcher,
-                profile_url,
-                uid,
-            )
-        )
-
-        verifications.append(
-            verification
-        )
-
-        if verification.verified:
-
-            if uid == best_uid:
-
-                info = (
-                    verification.info
-                )
-
-                if not info.uid:
-                    info.uid = uid
-
-                return (
-                    info,
-                    min(
-                        99.9,
-                        94
-                        + min(
-                            5,
-                            len(
-                                verification.signals
-                            ),
-                        ),
-                    ),
-                    "VERIFIED",
-                    [
-                        "Profile identity independently verified",
-                        *verification.signals,
-                    ],
-                )
-
-    # --------------------------------------------------------------
-    # Explicit profile candidate.
-    # --------------------------------------------------------------
-
-    if (
-        shape.kind == "profile"
-        and shape.route_entity_id
-    ):
-
-        uid = shape.route_entity_id
-
-        profile_url = (
-            "https://www.facebook.com/"
-            "profile.php?id="
-            f"{uid}"
-        )
-
-        verification = (
-            await verify_profile(
-                fetcher,
-                profile_url,
-                uid,
-            )
-        )
-
-        if verification.verified:
-
-            return (
-                verification.info,
-                min(
-                    99.0,
-                    92
-                    + min(
-                        7,
-                        len(
-                            verification.signals
-                        ),
-                    ),
-                ),
-                "VERIFIED",
-                [
-                    "Explicit profile ID verified",
-                    *verification.signals,
-                ],
-            )
-
-    # --------------------------------------------------------------
-    # No profile verification.
-    # --------------------------------------------------------------
-
-    notes.append(
-        "User candidate found but profile correlation "
-        "is insufficient"
-    )
-
-    return (
-        ProfileInfo(),
-        0,
-        "NOT_VERIFIED",
-        notes,
-    )
+    return info
 
 
 # ======================================================================
@@ -3989,14 +3493,18 @@ class FacebookResolver:
         )
 
         result = ResolveResult(
-            input_url=input_url,
-            shape=shape,
+            input_url=input_url
         )
 
         if not normalized:
 
-            result.notes.append(
+            result.error = (
                 "Invalid Facebook URL"
+            )
+
+            result.elapsed = (
+                time.monotonic()
+                - started
             )
 
             return result
@@ -4004,40 +3512,32 @@ class FacebookResolver:
         graph = EvidenceGraph()
 
         # ----------------------------------------------------------
-        # URL evidence
+        # URL
         # ----------------------------------------------------------
 
-        add_structural_evidence(
+        collect_url_evidence(
             graph,
             shape,
             normalized,
         )
 
         # ----------------------------------------------------------
-        # Fetch
+        # FETCH
         # ----------------------------------------------------------
 
         snapshot = await self.fetcher.fetch(
             normalized
         )
 
-        result.resolved_url = (
-            snapshot.final_url
-            or normalized
-        )
-
-        result.canonical_url = (
-            clean_content_url(
-                snapshot.canonical
-            )
-            if snapshot.canonical
-            else ""
-        )
-
         if not snapshot.html:
 
-            result.notes.append(
-                "Facebook did not return usable public HTML"
+            result.kind = (
+                shape.kind.upper()
+            )
+
+            result.error = (
+                snapshot.error
+                or "No public HTML"
             )
 
             result.evidence = (
@@ -4052,21 +3552,21 @@ class FacebookResolver:
             return result
 
         # ----------------------------------------------------------
-        # Final URL
+        # FINAL URL
         # ----------------------------------------------------------
 
         final_shape = classify_url(
             snapshot.final_url
         )
 
-        add_structural_evidence(
+        collect_url_evidence(
             graph,
             final_shape,
             snapshot.final_url,
         )
 
         # ----------------------------------------------------------
-        # Canonical
+        # CANONICAL
         # ----------------------------------------------------------
 
         if snapshot.canonical:
@@ -4077,215 +3577,450 @@ class FacebookResolver:
                 )
             )
 
-            add_structural_evidence(
+            collect_url_evidence(
                 graph,
                 canonical_shape,
                 snapshot.canonical,
             )
 
         # ----------------------------------------------------------
-        # Redirects
+        # HTML
         # ----------------------------------------------------------
 
-        for redirect in snapshot.redirects:
-
-            redirect_shape = (
-                classify_url(
-                    redirect
-                )
-            )
-
-            add_structural_evidence(
-                graph,
-                redirect_shape,
-                redirect,
-            )
+        collect_html_ids(
+            graph,
+            snapshot.html,
+            snapshot.final_url,
+            "html_semantic",
+        )
 
         # ----------------------------------------------------------
-        # Metadata
+        # META
         # ----------------------------------------------------------
 
-        collect_meta_evidence(
+        collect_meta_ids(
             graph,
             snapshot,
         )
 
         # ----------------------------------------------------------
-        # HTML
+        # JSON
         # ----------------------------------------------------------
 
-        collect_semantic_evidence(
-            graph,
-            snapshot.html,
-            "html_semantic",
-            snapshot.final_url,
-        )
-
-        # ----------------------------------------------------------
-        # Embedded JSON
-        # ----------------------------------------------------------
-
-        collect_json_semantic_evidence(
+        collect_json_ids(
             graph,
             snapshot.embedded_json,
             "embedded_json",
             snapshot.final_url,
         )
 
-        # ----------------------------------------------------------
-        # JSON-LD
-        # ----------------------------------------------------------
-
-        collect_json_semantic_evidence(
+        collect_json_ids(
             graph,
             snapshot.jsonld,
             "jsonld",
             snapshot.final_url,
         )
 
-        collect_jsonld_evidence(
-            graph,
-            snapshot.jsonld,
-            snapshot.final_url,
+        # ----------------------------------------------------------
+        # Effective shape
+        # ----------------------------------------------------------
+
+        effective_shape = final_shape
+
+        if effective_shape.kind == "unknown":
+
+            effective_shape = shape
+
+        # ----------------------------------------------------------
+        # PROFILE FLOW
+        # ----------------------------------------------------------
+
+        is_profile = (
+            shape.kind == "profile"
+            or final_shape.kind == "profile"
         )
 
-        # ----------------------------------------------------------
-        # Discover all Facebook URLs.
-        # ----------------------------------------------------------
-
-        discovered = (
-            discover_facebook_urls(
-                snapshot
+        profile_urls = (
+            discover_profile_urls(
+                snapshot,
+                shape,
             )
         )
 
-        for discovered_url in discovered:
-
-            child = classify_url(
-                discovered_url
-            )
-
-            add_structural_evidence(
-                graph,
-                child,
-                discovered_url,
-            )
-
         # ----------------------------------------------------------
-        # Identity
+        # For username content URL:
+        #
+        # /nvlnopro/videos/123
+        #
+        # derive /nvlnopro
         # ----------------------------------------------------------
 
-        (
-            profile,
-            confidence,
-            status,
-            identity_notes,
-        ) = await resolve_identity(
-            self.fetcher,
-            graph,
-            snapshot,
-            shape,
+        if (
+            shape.username
+            and not profile_urls
+        ):
+
+            derived = (
+                profile_url_from_shape(
+                    shape
+                )
+            )
+
+            if derived:
+
+                profile_urls.append(
+                    derived
+                )
+
+        # ----------------------------------------------------------
+        # Identity candidates.
+        # ----------------------------------------------------------
+
+        scores = score_uid_candidates(
+            graph
         )
 
-        result.profile = profile
+        profile = ProfileInfo()
 
-        result.confidence = confidence
+        verified_uid = ""
 
-        result.status = status
+        confidence = 0
 
-        result.notes.extend(
-            identity_notes
-        )
+        status = "NOT_VERIFIED"
+
+        # ----------------------------------------------------------
+        # If URL explicitly has profile numeric ID,
+        # verify that exact ID.
+        # ----------------------------------------------------------
+
+        if (
+            is_profile
+            and shape.route_entity_id
+        ):
+
+            exact_profile_url = (
+                profile_url_from_shape(
+                    shape
+                )
+            )
+
+            verification = (
+                await verify_profile_identity(
+                    self.fetcher,
+                    exact_profile_url,
+                    shape.route_entity_id,
+                )
+            )
+
+            if verification.verified:
+
+                profile = (
+                    verification.info
+                )
+
+                verified_uid = (
+                    shape.route_entity_id
+                )
+
+                confidence = min(
+                    99.9,
+                    94
+                    + (
+                        len(
+                            verification.signals
+                        ) * 0.8
+                    ),
+                )
+
+                status = "VERIFIED"
+
+        # ----------------------------------------------------------
+        # Username profile.
+        # ----------------------------------------------------------
+
+        if (
+            not verified_uid
+            and is_profile
+            and profile_urls
+        ):
+
+            # Fetch candidate profiles.
+            for profile_url in profile_urls[
+                :MAX_PROFILE_CHECKS
+            ]:
+
+                # Candidate IDs must come from the
+                # profile page itself.
+                profile_snapshot = (
+                    await self.fetcher.fetch(
+                        profile_url
+                    )
+                )
+
+                if not profile_snapshot.html:
+                    continue
+
+                profile_graph = (
+                    EvidenceGraph()
+                )
+
+                collect_html_ids(
+                    profile_graph,
+                    profile_snapshot.html,
+                    profile_snapshot.final_url,
+                    "profile_html",
+                )
+
+                collect_meta_ids(
+                    profile_graph,
+                    profile_snapshot,
+                )
+
+                collect_json_ids(
+                    profile_graph,
+                    profile_snapshot.embedded_json,
+                    "profile_json",
+                    profile_snapshot.final_url,
+                )
+
+                collect_json_ids(
+                    profile_graph,
+                    profile_snapshot.jsonld,
+                    "profile_jsonld",
+                    profile_snapshot.final_url,
+                )
+
+                profile_scores = (
+                    score_uid_candidates(
+                        profile_graph
+                    )
+                )
+
+                if not profile_scores:
+                    continue
+
+                ranked = sorted(
+                    profile_scores.items(),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+
+                # --------------------------------------------------
+                # Do not accept weak candidate.
+                # --------------------------------------------------
+
+                candidate_uid = ranked[0][0]
+
+                candidate_items = (
+                    profile_graph.for_value(
+                        candidate_uid
+                    )
+                )
+
+                candidate_sources = {
+                    x.source
+                    for x in candidate_items
+                    if x.role
+                    == "USER_CANDIDATE"
+                }
+
+                strong_count = sum(
+                    1
+                    for x in candidate_items
+                    if (
+                        x.role
+                        == "USER_CANDIDATE"
+                        and x.weight >= 120
+                    )
+                )
+
+                # High precision rule.
+                if not (
+                    len(candidate_sources) >= 2
+                    and strong_count >= 1
+                ):
+
+                    continue
+
+                profile_shape = (
+                    classify_url(
+                        profile_url
+                    )
+                )
+
+                info = extract_profile_metadata(
+                    profile_snapshot,
+                    profile_shape,
+                )
+
+                info.uid = candidate_uid
+
+                info.profile_url = (
+                    profile_url_from_shape(
+                        profile_shape
+                    )
+                    or profile_url
+                )
+
+                info.verified = True
+
+                info.score = (
+                    profile_scores[
+                        candidate_uid
+                    ]
+                )
+
+                profile = info
+
+                verified_uid = candidate_uid
+
+                confidence = min(
+                    99.5,
+                    91
+                    + min(
+                        8,
+                        len(
+                            candidate_sources
+                        ) * 2.2,
+                    ),
+                )
+
+                status = "VERIFIED"
+
+                break
+
+        # ----------------------------------------------------------
+        # Content publisher.
+        # ----------------------------------------------------------
+
+        if (
+            not verified_uid
+            and not is_profile
+            and scores
+        ):
+
+            ranked = sorted(
+                scores.items(),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+
+            candidate_uid = ranked[0][0]
+
+            candidate_items = (
+                graph.for_value(
+                    candidate_uid
+                )
+            )
+
+            sources = {
+                x.source
+                for x in candidate_items
+                if x.role
+                == "USER_CANDIDATE"
+            }
+
+            strong = [
+                x
+                for x in candidate_items
+                if (
+                    x.role
+                    == "USER_CANDIDATE"
+                    and x.weight >= 120
+                )
+            ]
+
+            # Need multiple independent signals.
+            if (
+                len(sources) >= 2
+                and strong
+                and not identity_conflict(
+                    graph
+                )
+            ):
+
+                for profile_url in profile_urls:
+
+                    verification = (
+                        await verify_profile_identity(
+                            self.fetcher,
+                            profile_url,
+                            candidate_uid,
+                        )
+                    )
+
+                    if verification.verified:
+
+                        profile = (
+                            verification.info
+                        )
+
+                        verified_uid = (
+                            candidate_uid
+                        )
+
+                        confidence = min(
+                            99.5,
+                            93
+                            + min(
+                                6,
+                                len(
+                                    verification.signals
+                                ),
+                            ),
+                        )
+
+                        status = "VERIFIED"
+
+                        break
+
+        # ----------------------------------------------------------
+        # If identity not verified:
+        # DO NOT expose a guessed UID.
+        # ----------------------------------------------------------
+
+        if not verified_uid:
+
+            profile = ProfileInfo()
+
+            confidence = 0
+
+            status = "NOT_VERIFIED"
 
         # ----------------------------------------------------------
         # Content
         # ----------------------------------------------------------
 
-        result.content = (
-            extract_content_info(
-                shape,
-                snapshot,
-                graph,
-            )
+        content = extract_content(
+            shape,
+            snapshot,
+            graph,
         )
 
         # ----------------------------------------------------------
-        # Entity
+        # Result
         # ----------------------------------------------------------
 
-        result.entity_type = (
-            infer_entity_type(
-                final_shape
-                if final_shape.kind
-                != "unknown"
-                else shape
-            )
+        result.kind = (
+            effective_shape.kind.upper()
         )
 
-        result.publisher_type = (
-            infer_publisher_type(
-                final_shape,
-                graph,
-            )
-        )
+        result.status = status
 
-        # If profile is verified,
-        # publisher is USER unless content says PAGE/GROUP.
-        if (
-            result.status
-            == "VERIFIED"
-            and result.publisher_type
-            == "UNKNOWN"
-        ):
+        result.confidence = confidence
 
-            result.publisher_type = "USER"
+        result.profile = profile
 
-        # ----------------------------------------------------------
-        # Clean URLs
-        # ----------------------------------------------------------
-
-        result.resolved_url = (
-            clean_content_url(
-                snapshot.final_url
-            )
-        )
-
-        if snapshot.canonical:
-
-            result.canonical_url = (
-                clean_content_url(
-                    snapshot.canonical
-                )
-            )
-
-        # ----------------------------------------------------------
-        # Evidence
-        # ----------------------------------------------------------
+        result.content = content
 
         result.evidence = sorted(
             graph.items,
-            key=lambda x: x.weight,
+            key=lambda x: (
+                x.weight,
+                x.verified,
+            ),
             reverse=True,
         )
-
-        # ----------------------------------------------------------
-        # Final
-        # ----------------------------------------------------------
-
-        if (
-            result.status
-            != "VERIFIED"
-        ):
-
-            result.profile = (
-                ProfileInfo()
-            )
-
-            result.confidence = 0
-
-            result.notes.append(
-                "UID withheld: insufficient identity correlation"
-            )
 
         result.elapsed = (
             time.monotonic()
@@ -4296,21 +4031,15 @@ class FacebookResolver:
 
 
 # ======================================================================
-# TELEGRAM ESCAPE
+# TELEGRAM HTML ESCAPE
 # ======================================================================
 
 def tg_escape(
     value: Any,
 ) -> str:
 
-    value = (
-        ""
-        if value is None
-        else str(value)
-    )
-
     return (
-        value
+        str(value or "")
         .replace(
             "&",
             "&amp;",
@@ -4330,425 +4059,57 @@ def tg_escape(
     )
 
 
-def truncate(
-    value: Any,
-    limit: int,
+# ======================================================================
+# DISPLAY
+# ======================================================================
+
+def entity_label(
+    result: ResolveResult,
 ) -> str:
 
-    value = str(
-        value or ""
-    )
+    if result.kind in {
+        "PROFILE",
+    }:
 
-    if len(value) <= limit:
-        return value
+        return "👤 Cá nhân"
 
-    return value[
-        :limit - 3
-    ] + "..."
+    if result.kind in {
+        "PAGE",
+    }:
 
+        return "📄 Trang"
 
-# ======================================================================
-# UI HELPERS
-# ======================================================================
+    if result.kind in {
+        "GROUP",
+        "GROUP_POST",
+    }:
+
+        return "👥 Nhóm"
+
+    if result.profile.uid:
+
+        return "👤 Cá nhân"
+
+    return ""
+
 
 def content_icon(
-    content_type: str,
+    kind: str,
 ) -> str:
 
-    mapping = {
+    return {
         "REEL": "🎬",
         "VIDEO": "🎥",
         "POST": "📝",
         "PHOTO": "📷",
         "STORY": "⭕",
-        "GROUP": "👥",
-        "GROUP_POST": "👥",
-        "PAGE": "📄",
-        "USER": "👤",
-    }
-
-    return mapping.get(
-        content_type,
-        "📌",
-    )
-
-
-def entity_icon(
-    entity_type: str,
-) -> str:
-
-    return {
-        "USER": "👤",
-        "PAGE": "📄",
-        "GROUP": "👥",
     }.get(
-        entity_type,
+        kind,
         "📌",
     )
 
 
-def format_profile_block(
-    result: ResolveResult,
-) -> List[str]:
-
-    profile = result.profile
-
-    lines = []
-
-    if not profile.uid:
-        return lines
-
-    lines.append(
-        "👤 <b>NGƯỜI ĐĂNG</b>"
-    )
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    if profile.name:
-
-        lines.append(
-            "Tên: "
-            f"<b>{tg_escape(profile.name)}</b>"
-        )
-
-    if profile.username:
-
-        lines.append(
-            "Username: "
-            f"<code>@{tg_escape(profile.username)}</code>"
-        )
-
-    lines.append(
-        "UID: "
-        f"<code>{tg_escape(profile.uid)}</code>"
-    )
-
-    lines.append(
-        "Loại: "
-        f"{entity_icon(profile.entity_type)} "
-        f"{tg_escape(profile.entity_type)}"
-    )
-
-    if profile.profile_url:
-
-        lines.append(
-            "Profile: "
-            f"<a href=\"{tg_escape(profile.profile_url)}\">"
-            "Mở profile"
-            "</a>"
-        )
-
-    if profile.bio:
-
-        lines.append("")
-
-        lines.append(
-            "📝 "
-            f"{tg_escape(truncate(profile.bio, 350))}"
-        )
-
-    return lines
-
-
-def format_content_block(
-    result: ResolveResult,
-) -> List[str]:
-
-    content = result.content
-
-    lines = []
-
-    has_content = any(
-        [
-            content.post_id,
-            content.video_id,
-            content.reel_id,
-            content.photo_id,
-            content.story_id,
-        ]
-    )
-
-    if not has_content:
-        return lines
-
-    icon = content_icon(
-        content.content_type
-    )
-
-    lines.append(
-        f"{icon} <b>NỘI DUNG</b>"
-    )
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    if content.content_type:
-
-        lines.append(
-            "Loại: "
-            f"<b>{tg_escape(content.content_type)}</b>"
-        )
-
-    if content.title:
-
-        lines.append(
-            "Tiêu đề: "
-            f"{tg_escape(truncate(content.title, 300))}"
-        )
-
-    if content.post_id:
-
-        lines.append(
-            "Post ID: "
-            f"<code>{tg_escape(content.post_id)}</code>"
-        )
-
-    if content.video_id:
-
-        lines.append(
-            "Video ID: "
-            f"<code>{tg_escape(content.video_id)}</code>"
-        )
-
-    if content.reel_id:
-
-        lines.append(
-            "Reel ID: "
-            f"<code>{tg_escape(content.reel_id)}</code>"
-        )
-
-    if content.photo_id:
-
-        lines.append(
-            "Photo ID: "
-            f"<code>{tg_escape(content.photo_id)}</code>"
-        )
-
-    if content.story_id:
-
-        lines.append(
-            "Story ID: "
-            f"<code>{tg_escape(content.story_id)}</code>"
-        )
-
-    return lines
-
-
-def format_links_block(
-    result: ResolveResult,
-) -> List[str]:
-
-    lines = []
-
-    if not (
-        result.profile.profile_url
-        or result.canonical_url
-    ):
-        return lines
-
-    lines.append(
-        "🔗 <b>LIÊN KẾT</b>"
-    )
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    if result.profile.profile_url:
-
-        lines.append(
-            "Profile: "
-            f"<a href=\""
-            f"{tg_escape(result.profile.profile_url)}"
-            f"\">Facebook Profile</a>"
-        )
-
-    if result.canonical_url:
-
-        lines.append(
-            "Content: "
-            f"<a href=\""
-            f"{tg_escape(result.canonical_url)}"
-            f"\">Facebook Content</a>"
-        )
-
-    return lines
-
-
-def format_verification_block(
-    result: ResolveResult,
-) -> List[str]:
-
-    lines = []
-
-    if result.status == "VERIFIED":
-
-        lines.append(
-            "🛡 <b>XÁC MINH</b>"
-        )
-
-        lines.append(
-            "━━━━━━━━━━━━━━━━━━━━"
-        )
-
-        lines.append(
-            "Trạng thái: "
-            "<b>✅ VERIFIED</b>"
-        )
-
-        lines.append(
-            "Độ tin cậy: "
-            f"<b>{result.confidence:.1f}%</b>"
-        )
-
-        sources = set()
-
-        for item in result.evidence:
-
-            if (
-                item.role
-                == "USER_CANDIDATE"
-            ):
-
-                sources.add(
-                    item.source
-                )
-
-        if sources:
-
-            lines.append(
-                "Nguồn: "
-                f"<b>{len(sources)} nguồn</b>"
-            )
-
-        lines.append(
-            "✓ Identity correlation"
-        )
-
-        lines.append(
-            "✓ Profile verification"
-        )
-
-    else:
-
-        lines.append(
-            "🛡 <b>XÁC MINH</b>"
-        )
-
-        lines.append(
-            "━━━━━━━━━━━━━━━━━━━━"
-        )
-
-        lines.append(
-            "Trạng thái: "
-            "<b>⚠️ NOT VERIFIED</b>"
-        )
-
-        lines.append(
-            "UID chưa được hiển thị vì "
-            "chưa đủ bằng chứng độc lập."
-        )
-
-    return lines
-
-
-def format_forensic_block(
-    result: ResolveResult,
-) -> List[str]:
-
-    lines = []
-
-    useful = []
-
-    seen = set()
-
-    for item in result.evidence:
-
-        if item.role in {
-            "ROUTE_ENTITY",
-            "OBJECT",
-        }:
-            continue
-
-        key = (
-            item.value,
-            item.role,
-            item.source,
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(
-            key
-        )
-
-        useful.append(
-            item
-        )
-
-        if len(useful) >= MAX_EVIDENCE_DISPLAY:
-            break
-
-    if not useful:
-        return lines
-
-    lines.append(
-        "🔬 <b>FORENSIC</b>"
-    )
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
-
-    for item in useful:
-
-        label = {
-            "USER_CANDIDATE":
-                "🆔 Identity",
-            "POST":
-                "📝 Post",
-            "VIDEO":
-                "🎥 Video",
-            "REEL":
-                "🎬 Reel",
-            "PHOTO":
-                "📷 Photo",
-            "STORY":
-                "⭕ Story",
-            "PAGE":
-                "📄 Page",
-            "GROUP":
-                "👥 Group",
-        }.get(
-            item.role,
-            item.role,
-        )
-
-        lines.append(
-            f"{label}: "
-            f"<code>{tg_escape(item.value)}</code>"
-        )
-
-        if item.key:
-
-            lines.append(
-                "  "
-                f"<i>{tg_escape(item.key)}</i>"
-                f" · {tg_escape(item.source)}"
-            )
-
-    return lines
-
-
-# ======================================================================
-# MAIN UI
-# ======================================================================
-
-def format_result(
+def format_single_result(
     result: ResolveResult,
     index: Optional[int] = None,
 ) -> str:
@@ -4764,95 +4125,321 @@ def format_result(
     if result.status == "VERIFIED":
 
         lines.append(
-            "🔎 <b>FACEBOOK IDENTITY RESOLVER</b>"
-        )
-
-    else:
-
-        lines.append(
             "🔎 <b>FACEBOOK RESOLVER</b>"
         )
+
+        lines.append(
+            "━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        # ----------------------------------------------------------
+        # Profile
+        # ----------------------------------------------------------
+
+        if result.profile.uid:
+
+            lines.append(
+                "👤 <b>TÀI KHOẢN</b>"
+            )
+
+            if result.profile.name:
+
+                lines.append(
+                    "Tên: "
+                    f"<b>"
+                    f"{tg_escape(result.profile.name)}"
+                    f"</b>"
+                )
+
+            if result.profile.username:
+
+                lines.append(
+                    "Username: "
+                    f"<code>@"
+                    f"{tg_escape(result.profile.username)}"
+                    f"</code>"
+                )
+
+            lines.append(
+                "UID: "
+                f"<code>"
+                f"{tg_escape(result.profile.uid)}"
+                f"</code>"
+            )
+
+            label = entity_label(
+                result
+            )
+
+            if label:
+
+                lines.append(
+                    "Loại: "
+                    f"{label}"
+                )
+
+            if result.profile.profile_url:
+
+                lines.append(
+                    "Profile: "
+                    f"<a href=\""
+                    f"{tg_escape(result.profile.profile_url)}"
+                    f"\">Mở profile</a>"
+                )
+
+            # Avatar only when actually available.
+            if result.profile.avatar:
+
+                lines.append(
+                    "Avatar: "
+                    f"<a href=\""
+                    f"{tg_escape(result.profile.avatar)}"
+                    f"\">Xem ảnh</a>"
+                )
+
+        # ----------------------------------------------------------
+        # Content
+        # ----------------------------------------------------------
+
+        if result.content.kind:
+
+            lines.append("")
+
+            lines.append(
+                f"{content_icon(result.content.kind)} "
+                f"<b>NỘI DUNG</b>"
+            )
+
+            if result.content.title:
+
+                lines.append(
+                    "Tiêu đề: "
+                    f"{tg_escape(result.content.title)}"
+                )
+
+            if result.content.reel_id:
+
+                lines.append(
+                    "Reel ID: "
+                    f"<code>"
+                    f"{result.content.reel_id}"
+                    f"</code>"
+                )
+
+            if result.content.post_id:
+
+                lines.append(
+                    "Post ID: "
+                    f"<code>"
+                    f"{result.content.post_id}"
+                    f"</code>"
+                )
+
+            if result.content.video_id:
+
+                lines.append(
+                    "Video ID: "
+                    f"<code>"
+                    f"{result.content.video_id}"
+                    f"</code>"
+                )
+
+            if result.content.photo_id:
+
+                lines.append(
+                    "Photo ID: "
+                    f"<code>"
+                    f"{result.content.photo_id}"
+                    f"</code>"
+                )
+
+            if result.content.url:
+
+                lines.append(
+                    "Content: "
+                    f"<a href=\""
+                    f"{tg_escape(result.content.url)}"
+                    f"\">Mở nội dung</a>"
+                )
+
+        # ----------------------------------------------------------
+        # Verification
+        # ----------------------------------------------------------
+
+        lines.append("")
+
+        lines.append(
+            "🛡 <b>XÁC MINH</b>"
+        )
+
+        lines.append(
+            "Trạng thái: "
+            "<b>✅ VERIFIED</b>"
+        )
+
+        lines.append(
+            "Độ tin cậy: "
+            f"<b>{result.confidence:.1f}%</b>"
+        )
+
+        # ----------------------------------------------------------
+        # Compact forensic.
+        # ----------------------------------------------------------
+
+        identity_evidence = [
+            x
+            for x in result.evidence
+            if (
+                x.role
+                == "USER_CANDIDATE"
+            )
+        ]
+
+        if identity_evidence:
+
+            lines.append("")
+
+            lines.append(
+                "🔬 <b>XÁC NHẬN</b>"
+            )
+
+            seen = set()
+
+            shown = 0
+
+            for item in identity_evidence:
+
+                key = (
+                    item.value,
+                    item.source,
+                )
+
+                if key in seen:
+                    continue
+
+                seen.add(
+                    key
+                )
+
+                lines.append(
+                    "• "
+                    f"{item.key or item.role}"
+                    " → "
+                    f"<code>"
+                    f"{item.value}"
+                    f"</code>"
+                )
+
+                shown += 1
+
+                if shown >= 3:
+                    break
+
+        lines.append(
+            f"⏱ {result.elapsed:.2f}s"
+        )
+
+        return "\n".join(
+            lines
+        )
+
+    # --------------------------------------------------------------
+    # NOT VERIFIED
+    # --------------------------------------------------------------
+
+    lines.append(
+        "🔎 <b>FACEBOOK RESOLVER</b>"
+    )
 
     lines.append(
         "━━━━━━━━━━━━━━━━━━━━"
     )
 
-    lines.extend(
-        format_profile_block(
-            result
-        )
-    )
+    # Show useful object information even
+    # when UID cannot be verified.
 
-    if result.profile.uid:
-
-        lines.append("")
-
-    lines.extend(
-        format_content_block(
-            result
-        )
-    )
-
-    if result.content.post_id or (
-        result.content.reel_id
-    ):
-
-        lines.append("")
-
-    lines.extend(
-        format_links_block(
-            result
-        )
-    )
-
-    if (
-        result.profile.profile_url
-        or result.canonical_url
-    ):
-
-        lines.append("")
-
-    lines.extend(
-        format_verification_block(
-            result
-        )
-    )
-
-    # --------------------------------------------------------------
-    # Notes
-    # --------------------------------------------------------------
-
-    if (
-        result.status != "VERIFIED"
-        and result.notes
-    ):
-
-        lines.append("")
+    if result.content.kind:
 
         lines.append(
-            "ℹ️ "
-            f"{tg_escape(truncate(result.notes[-1], 350))}"
+            f"{content_icon(result.content.kind)} "
+            f"<b>{result.content.kind}</b>"
         )
 
-    # --------------------------------------------------------------
-    # Forensic
-    # --------------------------------------------------------------
+        if result.content.reel_id:
 
-    if result.status == "VERIFIED":
-
-        lines.append("")
-
-        lines.extend(
-            format_forensic_block(
-                result
+            lines.append(
+                "Reel ID: "
+                f"<code>"
+                f"{result.content.reel_id}"
+                f"</code>"
             )
+
+        if result.content.post_id:
+
+            lines.append(
+                "Post ID: "
+                f"<code>"
+                f"{result.content.post_id}"
+                f"</code>"
+            )
+
+        if result.content.video_id:
+
+            lines.append(
+                "Video ID: "
+                f"<code>"
+                f"{result.content.video_id}"
+                f"</code>"
+            )
+
+        if result.content.url:
+
+            lines.append(
+                "Content: "
+                f"<a href=\""
+                f"{tg_escape(result.content.url)}"
+                f"\">Mở nội dung</a>"
+            )
+
+    elif (
+        result.kind == "PROFILE"
+    ):
+
+        shape = classify_url(
+            result.input_url
         )
+
+        username = shape.username
+
+        if username:
+
+            lines.append(
+                "👤 Username: "
+                f"<code>@"
+                f"{tg_escape(username)}"
+                f"</code>"
+            )
+
+            lines.append(
+                "Profile: "
+                f"<a href=\""
+                f"{tg_escape(profile_url_from_shape(shape))}"
+                f"\">Mở profile</a>"
+            )
 
     lines.append("")
 
     lines.append(
-        "⏱ "
-        f"{result.elapsed:.2f}s"
+        "🛡 <b>UID: CHƯA XÁC MINH</b>"
+    )
+
+    lines.append(
+        "Không hiển thị UID khi "
+        "chưa đủ bằng chứng."
+    )
+
+    lines.append(
+        f"⏱ {result.elapsed:.2f}s"
     )
 
     return "\n".join(
@@ -4861,11 +4448,100 @@ def format_result(
 
 
 # ======================================================================
-# WAIT FOR URL
+# MULTI RESULT FORMAT
 # ======================================================================
 
-_ACTIVE_SESSIONS = {}
+def format_results(
+    results: List[ResolveResult],
+) -> str:
 
+    if not results:
+        return "❌ Không có kết quả."
+
+    # One compact message.
+    blocks = []
+
+    for index, result in enumerate(
+        results,
+        start=1,
+    ):
+
+        blocks.append(
+            format_single_result(
+                result,
+                index
+                if len(results) > 1
+                else None,
+            )
+        )
+
+    output = "\n\n".join(
+        blocks
+    )
+
+    # Telegram message limit.
+    # Prefer one message.
+    if len(output) <= 3900:
+
+        return output
+
+    # If too long, compact harder.
+    compact_blocks = []
+
+    for index, result in enumerate(
+        results,
+        start=1,
+    ):
+
+        if result.status == "VERIFIED":
+
+            name = (
+                tg_escape(
+                    result.profile.name
+                )
+                if result.profile.name
+                else "Không rõ"
+            )
+
+            username = (
+                "@"
+                + tg_escape(
+                    result.profile.username
+                )
+                if result.profile.username
+                else ""
+            )
+
+            compact_blocks.append(
+                (
+                    f"<b>#{index}</b> "
+                    f"👤 <b>{name}</b>\n"
+                    f"{username}\n"
+                    f"UID: <code>"
+                    f"{result.profile.uid}"
+                    f"</code>\n"
+                    f"✅ VERIFIED "
+                    f"{result.confidence:.1f}%"
+                )
+            )
+
+        else:
+
+            compact_blocks.append(
+                (
+                    f"<b>#{index}</b> "
+                    "⚠️ NOT VERIFIED"
+                )
+            )
+
+    return "\n\n".join(
+        compact_blocks
+    )
+
+
+# ======================================================================
+# TELEGRAM WAIT
+# ======================================================================
 
 async def wait_for_next_message(
     client,
@@ -4927,10 +4603,10 @@ async def wait_for_next_message(
 
 
 # ======================================================================
-# RESOLVE TELEGRAM TEXT
+# TELEGRAM RESOLVE
 # ======================================================================
 
-async def resolve_text(
+async def resolve_message(
     event,
     text: str,
 ):
@@ -4942,60 +4618,63 @@ async def resolve_text(
     if not urls:
 
         await event.reply(
-            "❌ <b>Không tìm thấy URL Facebook hợp lệ.</b>\n\n"
-            "Hãy gửi link Facebook công khai.",
+            "❌ <b>Không tìm thấy link Facebook.</b>",
             parse_mode="html",
+            link_preview=False,
         )
 
         return
 
-    urls = urls[
-        :MAX_INPUT_URLS
-    ]
-
     resolver = FacebookResolver()
 
-    results = []
+    # --------------------------------------------------------------
+    # Resolve concurrently.
+    # --------------------------------------------------------------
 
-    for index, url in enumerate(
-        urls,
-        start=1,
+    semaphore = asyncio.Semaphore(
+        FETCH_WORKERS
+    )
+
+    async def worker(
+        url: str,
     ):
 
-        try:
+        async with semaphore:
 
-            result = await resolver.resolve(
-                url
-            )
+            try:
 
-            results.append(
-                format_result(
-                    result,
-                    index
-                    if len(urls) > 1
-                    else None,
+                return await resolver.resolve(
+                    url
                 )
-            )
 
-        except Exception as exc:
+            except Exception as exc:
 
-            log.exception(
-                "Facebook resolver error"
-            )
-
-            results.append(
-                (
-                    f"❌ <b>#{index}</b>\n"
-                    "Resolver error: "
-                    f"<code>{tg_escape(exc)}</code>"
+                log.exception(
+                    "getuidfb resolve error"
                 )
-            )
 
-    output = "\n\n".join(
+                return ResolveResult(
+                    input_url=url,
+                    error=str(
+                        exc
+                    ),
+                )
+
+    results = await asyncio.gather(
+        *[
+            worker(url)
+            for url in urls
+        ]
+    )
+
+    output = format_results(
         results
     )
 
-    # Telegram safe limit.
+    # --------------------------------------------------------------
+    # ONE MESSAGE whenever possible.
+    # --------------------------------------------------------------
+
     if len(output) <= 3900:
 
         await event.reply(
@@ -5006,46 +4685,12 @@ async def resolve_text(
 
         return
 
-    # Split without destroying HTML blocks.
-    chunks = []
-
-    current = ""
-
-    for block in results:
-
-        if (
-            len(current)
-            + len(block)
-            + 2
-            <= 3900
-        ):
-
-            if current:
-                current += "\n\n"
-
-            current += block
-
-        else:
-
-            if current:
-                chunks.append(
-                    current
-                )
-
-            current = block
-
-    if current:
-        chunks.append(
-            current
-        )
-
-    for chunk in chunks:
-
-        await event.reply(
-            chunk[:3900],
-            parse_mode="html",
-            link_preview=False,
-        )
+    # Only split when absolutely necessary.
+    await event.reply(
+        output[:3900],
+        parse_mode="html",
+        link_preview=False,
+    )
 
 
 # ======================================================================
@@ -5056,74 +4701,54 @@ async def _handle_getuidfb(
     event,
 ):
 
-    sender_id = (
-        event.sender_id
+    raw = (
+        event.raw_text
+        or ""
     )
 
-    _ACTIVE_SESSIONS[
-        sender_id
-    ] = time.time()
+    parts = raw.split(
+        maxsplit=1
+    )
 
-    try:
+    if len(parts) > 1:
 
-        raw = (
-            event.raw_text
-            or ""
-        )
+        text = parts[1].strip()
 
-        parts = raw.split(
-            maxsplit=1
-        )
+        if text:
 
-        if len(parts) > 1:
-
-            text = parts[1].strip()
-
-            if text:
-
-                await resolve_text(
-                    event,
-                    text,
-                )
-
-                return
-
-        await event.reply(
-            "🔎 <b>FACEBOOK IDENTITY RESOLVER</b>\n\n"
-            "Gửi link Facebook công khai.\n"
-            "Có thể gửi nhiều link cùng lúc.\n\n"
-            "Ví dụ:\n"
-            "<code>/getuidfb https://facebook.com/...</code>\n\n"
-            "Hoặc gửi link ở tin nhắn tiếp theo.",
-            parse_mode="html",
-        )
-
-        text = await wait_for_next_message(
-            event.client,
-            event.chat_id,
-            120,
-        )
-
-        if not text:
-
-            await event.reply(
-                "⌛ Hết thời gian chờ.",
-                parse_mode="html",
+            await resolve_message(
+                event,
+                text,
             )
 
             return
 
-        await resolve_text(
-            event,
-            text,
+    await event.reply(
+        "🔎 <b>FACEBOOK RESOLVER</b>\n\n"
+        "Gửi link Facebook công khai.",
+        parse_mode="html",
+        link_preview=False,
+    )
+
+    text = await wait_for_next_message(
+        event.client,
+        event.chat_id,
+        120,
+    )
+
+    if not text:
+
+        await event.reply(
+            "⌛ Hết thời gian chờ.",
+            parse_mode="html",
         )
 
-    finally:
+        return
 
-        _ACTIVE_SESSIONS.pop(
-            sender_id,
-            None,
-        )
+    await resolve_message(
+        event,
+        text,
+    )
 
 
 # ======================================================================
@@ -5143,7 +4768,7 @@ def register(
     )
 
     log.info(
-        "Registered /getuidfb V31"
+        "Registered commands.getuidfb V32"
     )
 
 
@@ -5154,7 +4779,7 @@ def register(
 COMMAND_INFO = {
     "command": "getuidfb",
     "description": (
-        "Facebook Identity + Content Resolver"
+        "Facebook Precision Identity Resolver"
     ),
     "usage": (
         "/getuidfb [Facebook URL]"
@@ -5174,139 +4799,75 @@ COMMAND_INFO = {
 
 def self_test():
 
-    cases = [
+    tests = [
+        (
+            "https://www.facebook.com/nvlnopro/",
+            "profile",
+            "nvlnopro",
+        ),
         (
             "https://www.facebook.com/profile.php?id=61553239356646",
             "profile",
             "",
-            "61553239356646",
         ),
         (
             "https://www.facebook.com/reel/4697823150500072/",
             "reel",
-            "4697823150500072",
             "",
         ),
         (
             "https://www.facebook.com/61592487939720/videos/1671583863938536/",
             "video",
-            "1671583863938536",
-            "61592487939720",
-        ),
-        (
-            "https://www.facebook.com/groups/123456789012345/posts/987654321012345/",
-            "group_post",
-            "987654321012345",
-            "123456789012345",
-        ),
-        (
-            "https://www.facebook.com/photo.php?fbid=1234567890123456",
-            "photo",
-            "1234567890123456",
             "",
         ),
     ]
 
     print(
-        "=" * 75
+        "=" * 70
     )
 
     print(
-        "FACEBOOK IDENTITY RESOLVER V31"
+        "FACEBOOK RESOLVER V32 SELF TEST"
     )
 
     print(
-        "=" * 75
+        "=" * 70
     )
 
-    for (
-        url,
-        expected_kind,
-        expected_object,
-        expected_route,
-    ) in cases:
+    for url, expected, username in tests:
 
         shape = classify_url(
             url
         )
 
-        objects = [
-            shape.post_id,
-            shape.video_id,
-            shape.reel_id,
-            shape.photo_id,
-            shape.story_id,
-        ]
-
-        found = next(
-            (
-                x
-                for x in objects
-                if x
-            ),
-            "",
-        )
-
         ok = (
-            shape.kind
-            == expected_kind
-            and found
-            == expected_object
-            and shape.route_entity_id
-            == expected_route
+            shape.kind == expected
+            and (
+                not username
+                or shape.username
+                == username
+            )
         )
 
         print(
-            "PASS"
-            if ok
-            else "FAIL",
+            "PASS" if ok else "FAIL",
             "|",
             shape.kind,
             "|",
-            url,
-        )
-
-        print(
-            "  route_entity_id =",
+            shape.username,
+            "|",
             shape.route_entity_id,
-        )
-
-        print(
-            "  object_id        =",
-            found,
-        )
-
-    print()
-
-    concatenated = (
-        "https://www.facebook.com/reel/4697823150500072/"
-        "https://www.facebook.com/profile.php?id=61553239356646"
-    )
-
-    urls = extract_facebook_urls(
-        concatenated
-    )
-
-    print(
-        "SCANNER:",
-        len(urls),
-        "URLs"
-    )
-
-    for url in urls:
-
-        print(
-            " ",
+            "|",
             url,
         )
 
     print(
-        "=" * 75
+        "=" * 70
     )
 
 
 # ======================================================================
-# CLI
+# MAIN
 # ======================================================================
 
 if __name__ == "__main__":
@@ -5320,11 +4881,7 @@ if __name__ == "__main__":
     else:
 
         print(
-            "Facebook Identity + Content Resolver V31"
-        )
-
-        print(
-            "Run:"
+            "Facebook Resolver V32"
         )
 
         print(

@@ -2713,6 +2713,10 @@ def format_result(
 # TELETHON BOT ADAPTER
 # ============================================================
 
+# ============================================================
+# TELETHON / DRAGON BOT ADAPTER
+# ============================================================
+
 START_TEXT = """
 <b>🔎 FB UID / ENTITY RESOLVER V15 ULTRA</b>
 
@@ -2726,12 +2730,10 @@ Bot phân tích URL Facebook bằng HTTP public.
 • Facebook Login
 
 <b>Lệnh:</b>
-<code>/getuidfb URL</code>
+<code>/getuidfb</code>
 
-<b>Ví dụ:</b>
-<code>/getuidfb https://www.facebook.com/username</code>
-
-Bạn cũng có thể gửi trực tiếp một URL Facebook cho bot.
+Sau khi gửi lệnh, bot sẽ chuyển sang chế độ
+chờ link Facebook.
 
 <b>Hỗ trợ:</b>
 • Profile / User
@@ -2751,8 +2753,14 @@ Bạn cũng có thể gửi trực tiếp một URL Facebook cho bot.
 • profile_id
 • entity_id
 • UID verification
-"""
 
+<b>Quản lý:</b>
+• Gửi 1 hoặc nhiều link cùng lúc
+• Không cần xuống dòng
+• Bot xử lý lần lượt
+• Sau khi xong tiếp tục chờ link
+• /stop để dừng
+"""
 
 # ============================================================
 # COMMAND INFO
@@ -2760,25 +2768,33 @@ Bạn cũng có thể gửi trực tiếp một URL Facebook cho bot.
 
 COMMAND_INFO = {
     "command": "getuidfb",
+    "category": "🔎 FACEBOOK",
     "title": "Facebook UID / Entity Resolver",
+
     "description": (
         "Phân tích URL Facebook bằng HTTP public "
         "và tìm UID / Entity ID."
     ),
-    "category": "🔎 FACEBOOK",
-    "usage": "/getuidfb <facebook_url>",
+
+    "usage": "/getuidfb",
+
     "examples": [
-        "/getuidfb https://facebook.com/username",
-        "/getuidfb https://facebook.com/username/posts/123456789",
-        "/getuidfb https://facebook.com/reel/123456789",
+        "/getuidfb",
     ],
-    "details": (
-        "HTTP-only Facebook public resolver. "
-        "Hỗ trợ phân tích profile, page, group, "
-        "post, reel, video, photo, story, share URL, "
-        "pfbid, media_fbid, actor_id, profile_id "
-        "và xác minh UID bằng nhiều nguồn bằng chứng."
-    ),
+
+    "details": [
+        "Gửi /getuidfb.",
+        "Sau đó gửi một hoặc nhiều link Facebook.",
+        "Không cần xuống dòng giữa các link.",
+        "Bot tự động nhận diện tất cả URL.",
+        "Hỗ trợ profile, page, group, post, reel, video, photo, story.",
+        "Hỗ trợ share/p, share/v, share/r và pfbid.",
+        "Hỗ trợ media_fbid, actor_id, profile_id, entity_id.",
+        "Có hệ thống evidence và UID verification.",
+        "Sau khi xử lý xong bot tiếp tục chờ link.",
+        "Dùng /stop để dừng.",
+    ],
+
     "supported": [
         "Profile / User",
         "Page",
@@ -2798,332 +2814,219 @@ COMMAND_INFO = {
         "entity_id",
         "UID verification",
     ],
+
     "permission": "PUBLIC",
 }
 
 
 # ============================================================
-# /start
+# SESSION
 # ============================================================
 
-async def start_command(event):
-    await event.reply(
-        START_TEXT,
-        parse_mode="html",
-        link_preview=False,
+SESSION_KEY = "_dragon_sessions"
+
+
+def get_sessions(bot):
+
+    if not hasattr(bot, SESSION_KEY):
+        setattr(
+            bot,
+            SESSION_KEY,
+            {},
+        )
+
+    return getattr(
+        bot,
+        SESSION_KEY,
     )
 
 
 # ============================================================
-# /help
-# ============================================================
-
-async def help_command(event):
-    await event.reply(
-        START_TEXT,
-        parse_mode="html",
-        link_preview=False,
-    )
-
-
-# ============================================================
-# PROCESS FACEBOOK URL
+# PROCESS ONE FACEBOOK URL
+#
+# Giữ nguyên V15 FacebookResolver.
+# Chỉ thay lớp Telegram.
 # ============================================================
 
 async def process_facebook_url(
     event,
     url: str,
+    notify_bot=None,
 ):
-    """
-    Telethon adapter.
-
-    KHÔNG thay đổi FacebookResolver.
-    KHÔNG thay đổi V15 engine.
-    Chỉ thay Telegram framework.
-    """
-
     url = strip_url_punctuation(
         clean_text(url)
     )
 
     if not url:
-        return
+        return None
 
-    normalized = normalize_url(url)
-
-    if not is_http_url(normalized):
-        await event.reply(
-            "❌ URL không hợp lệ."
-        )
-        return
-
-    if not is_fb_host_or_redirect(normalized):
-        await event.reply(
-            "❌ Đây không phải URL Facebook."
-        )
-        return
-
-    # --------------------------------------------------------
-    # PROCESSING MESSAGE
-    # --------------------------------------------------------
-
-    processing_message = await event.reply(
-        "⏳ <b>Đang phân tích Facebook...</b>\n"
-        "HTTP public resolver đang thu thập "
-        "các bằng chứng UID/entity.",
-        parse_mode="html",
-        link_preview=False,
+    normalized = normalize_url(
+        url
     )
 
-    started = time.perf_counter()
+    if not is_http_url(
+        normalized
+    ):
+        return {
+            "url": url,
+            "uid": None,
+            "success": False,
+            "error": "URL không hợp lệ.",
+        }
 
-    # --------------------------------------------------------
-    # WORKER
-    # --------------------------------------------------------
+    if not is_fb_host_or_redirect(
+        normalized
+    ):
+        return {
+            "url": url,
+            "uid": None,
+            "success": False,
+            "error": "Đây không phải URL Facebook.",
+        }
 
-    async def worker():
-        resolver = None
+    try:
 
-        try:
-            # ------------------------------------------------
-            # NEW RESOLVER PER REQUEST
-            #
-            # Giữ nguyên thiết kế V15:
-            # mỗi request có resolver riêng,
-            # tránh state dùng chung giữa users.
-            # ------------------------------------------------
+        # ----------------------------------------------------
+        # MỖI REQUEST MỘT RESOLVER
+        # ----------------------------------------------------
 
-            resolver = FacebookResolver(
-                timeout=DEFAULT_TIMEOUT,
-                max_pages=DEFAULT_MAX_PAGES,
-                concurrency=DEFAULT_CONCURRENCY,
-            )
+        resolver = FacebookResolver(
+            timeout=DEFAULT_TIMEOUT,
+            max_pages=DEFAULT_MAX_PAGES,
+            concurrency=DEFAULT_CONCURRENCY,
+        )
 
-            result = await resolver.resolve(
-                normalized
-            )
+        result = await resolver.resolve(
+            normalized
+        )
 
-            elapsed = (
-                time.perf_counter()
-                - started
-            )
+        return result
 
-            output = format_result(
-                result,
-                elapsed,
-            )
+    except asyncio.CancelledError:
 
-            # ------------------------------------------------
-            # TELEGRAM INLINE BUTTONS
-            # ------------------------------------------------
+        raise
 
-            buttons = []
+    except Exception as exc:
 
-            # USER UID
-            if (
-                result.user_uid
-                and is_numeric_id(
-                    result.user_uid
-                )
-            ):
-                profile_url = (
-                    "https://www.facebook.com/"
-                    + result.user_uid
-                )
+        print(
+            f"[GETUIDFB ERROR] {exc}"
+        )
 
-                buttons.append([
-                    Button.url(
-                        "👤 Mở Profile",
-                        profile_url,
-                    )
-                ])
-
-            # USERNAME
-            if result.publisher_username:
-                username_url = (
-                    "https://www.facebook.com/"
-                    + quote(
-                        result.publisher_username,
-                        safe="._-",
-                    )
-                )
-
-                buttons.append([
-                    Button.url(
-                        "📛 Mở Username",
-                        username_url,
-                    )
-                ])
-
-            # RESOLVED URL
-            if (
-                result.resolved_url
-                and is_http_url(
-                    result.resolved_url
-                )
-            ):
-                buttons.append([
-                    Button.url(
-                        "🔗 Mở URL",
-                        result.resolved_url,
-                    )
-                ])
-
-            # ------------------------------------------------
-            # EDIT PROCESSING MESSAGE
-            # ------------------------------------------------
-
-            await processing_message.edit(
-                output,
-                parse_mode="html",
-                link_preview=False,
-                buttons=buttons or None,
-            )
-
-        except asyncio.CancelledError:
-            # ------------------------------------------------
-            # User gửi URL mới.
-            # task_manager sẽ cancel task cũ.
-            #
-            # Không gửi lỗi "Resolver Error" khi bị cancel.
-            # ------------------------------------------------
-
-            raise
-
-        except Exception as exc:
-            elapsed = (
-                time.perf_counter()
-                - started
-            )
-
-            error_text = (
-                "❌ <b>Resolver Error</b>\n\n"
-                "<b>Error:</b> "
-                f"<code>"
-                f"{tg_escape(str(exc)[:1000])}"
-                f"</code>\n"
-                "<b>Time:</b> "
-                f"<code>{elapsed:.2f}s</code>"
-            )
-
-            try:
-                await processing_message.edit(
-                    error_text,
-                    parse_mode="html",
-                )
-            except Exception:
-                try:
-                    await event.reply(
-                        error_text,
-                        parse_mode="html",
-                    )
-                except Exception:
-                    pass
-
-        finally:
-            # ------------------------------------------------
-            # CLOSE HTTP CLIENT / RESOLVER RESOURCES
-            # ------------------------------------------------
-            #
-            # FacebookResolver V15 hiện tại có thể tự quản lý
-            # HTTPClient trong resolve().
-            #
-            # Không tự gọi close ở đây nếu class hiện tại
-            # không expose close().
-            # ------------------------------------------------
-
-            resolver = None
-
-    # --------------------------------------------------------
-    # TASK MANAGER
-    # --------------------------------------------------------
-    #
-    # QUAN TRỌNG:
-    # Không gọi track_current_task() bên trong worker.
-    #
-    # replace_user_tasks() đã tạo + đăng ký task.
-    #
-    # User mới:
-    #   URL A -> task A
-    #   URL B -> cancel task A + chạy task B
-    #
-    # User khác:
-    #   task riêng, không ảnh hưởng nhau.
-    # --------------------------------------------------------
-
-    await replace_user_tasks(
-        event.sender_id,
-        worker(),
-    )
+        return {
+            "url": normalized,
+            "uid": None,
+            "success": False,
+            "error": str(exc),
+        }
 
 
 # ============================================================
 # /getuidfb
 # ============================================================
 
-@bot.on(
-    events.NewMessage(
-        pattern=r"^/getuidfb(?:\s+.+)?$"
-    )
-)
-async def getuidfb_command(event):
+async def getuidfb_start(
+    event,
+    sessions,
+    notify_bot=None,
+):
 
-    text = (
-        event.raw_text
-        or ""
-    ).strip()
-
-    if not text:
-        return
+    user_id = event.sender_id
 
     # --------------------------------------------------------
-    # /getuidfb
+    # Command mới thay thế task nền cũ
     # --------------------------------------------------------
 
-    parts = text.split(
-        maxsplit=1
+    await replace_user_tasks(
+        user_id
     )
 
-    if len(parts) < 2:
-        await event.reply(
-            "❗ <b>Cú pháp:</b>\n\n"
-            "<code>"
-            "/getuidfb "
-            "https://www.facebook.com/username"
-            "</code>",
-            parse_mode="html",
+    # --------------------------------------------------------
+    # Xóa session command cũ
+    # --------------------------------------------------------
+
+    for _attr in (
+        "_dragon_sessions",
+        "_dragon_download_sessions",
+    ):
+
+        _sessions = getattr(
+            event.client,
+            _attr,
+            None,
         )
-        return
 
-    argument = parts[1].strip()
+        if isinstance(
+            _sessions,
+            dict,
+        ):
+            _sessions.pop(
+                user_id,
+                None,
+            )
 
     # --------------------------------------------------------
-    # Extract URL
+    # Clear power session nếu tồn tại
     # --------------------------------------------------------
 
-    url = extract_url(
-        argument
-    )
+    try:
 
-    # Nếu extract_url() không bắt được,
-    # thử nguyên argument.
-    if not url:
-        url = argument
+        from core.power.session import clear_session
 
-    await process_facebook_url(
-        event,
-        url,
+        clear_session(
+            event.client,
+            user_id,
+        )
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # Session riêng user
+    # --------------------------------------------------------
+
+    sessions[user_id] = {
+        "command": "getuidfb",
+        "running": True,
+        "processing": False,
+    }
+
+    await event.reply(
+        "╭─────────────────────╮\n"
+        "│  🔎 <b>FACEBOOK UID</b>  │\n"
+        "╰─────────────────────╯\n\n"
+
+        "📥 <b>Vui lòng gửi link Facebook.</b>\n\n"
+
+        "🔹 1 link → Get 1\n"
+        "🔹 2 link → Get 2\n"
+        "🔹 Nhiều link → Get lần lượt\n"
+        "🔹 Không cần xuống dòng\n\n"
+
+        "💡 Ví dụ:\n"
+        "<code>"
+        "https://facebook.com/a"
+        "https://facebook.com/b"
+        "https://facebook.com/c"
+        "</code>\n\n"
+
+        "🔄 Sau khi xong bot tiếp tục chờ link.\n"
+        "🛑 <b>/stop</b> → Dừng",
+
+        parse_mode="html",
     )
 
 
 # ============================================================
-# DIRECT FACEBOOK URL
+# NHẬN LINK
 # ============================================================
 
-@bot.on(
-    events.NewMessage()
-)
-async def direct_url_handler(event):
+async def getuid_receive(
+    event,
+    sessions,
+    notify_bot=None,
+):
+
+    user_id = event.sender_id
 
     text = (
         event.raw_text
@@ -3134,35 +3037,478 @@ async def direct_url_handler(event):
         return
 
     # --------------------------------------------------------
-    # Không xử lý command.
-    #
-    # /start
-    # /help
-    # /getuidfb
-    # ...
+    # Không bắt command
     # --------------------------------------------------------
 
     if text.startswith("/"):
         return
 
     # --------------------------------------------------------
-    # Extract Facebook URL
+    # Session user
     # --------------------------------------------------------
 
-    url = extract_url(
-        text
+    session = sessions.get(
+        user_id
     )
 
-    if not url:
+    if not session:
+        return
+
+    if session.get(
+        "command"
+    ) != "getuidfb":
+        return
+
+    if not session.get(
+        "running",
+        False,
+    ):
         return
 
     # --------------------------------------------------------
-    # Chỉ gửi Facebook URL mới chạy resolver.
-    #
-    # process_facebook_url() tiếp tục validate host.
+    # Không xử lý song song cùng user
     # --------------------------------------------------------
 
-    await process_facebook_url(
-        event,
-        url,
+    if session.get(
+        "processing",
+        False,
+    ):
+        return
+
+    # --------------------------------------------------------
+    # Tách tất cả URL
+    # --------------------------------------------------------
+
+    urls = extract_urls(
+        text
     )
+
+    if not urls:
+
+        await event.reply(
+            "❌ <b>Không tìm thấy link Facebook.</b>\n\n"
+            "📥 Gửi một hoặc nhiều link.\n"
+            "💡 Không cần xuống dòng.\n\n"
+            "🔄 Bot vẫn đang chờ link.",
+
+            parse_mode="html",
+        )
+
+        return
+
+    session["processing"] = True
+
+    total = len(urls)
+
+    progress = await event.reply(
+        "╭─────────────────────╮\n"
+        "│  🔎 <b>GET FACEBOOK UID</b>  │\n"
+        "╰─────────────────────╯\n\n"
+
+        f"📊 <b>Đã nhận:</b> {total} link\n"
+        "⚙️ <b>Đang xử lý...</b>",
+
+        parse_mode="html",
+    )
+
+    results = []
+
+    try:
+
+        # ====================================================
+        # XỬ LÝ TỪNG URL
+        # ====================================================
+
+        for index, url in enumerate(
+            urls,
+            start=1,
+        ):
+
+            session = sessions.get(
+                user_id
+            )
+
+            if not session:
+                return
+
+            # ------------------------------------------------
+            # Kiểm tra /stop
+            # ------------------------------------------------
+
+            if not session.get(
+                "running",
+                False,
+            ):
+
+                try:
+
+                    await progress.edit(
+                        "🛑 <b>Đã dừng Get UID.</b>\n\n"
+                        "Dùng <code>/getuidfb</code> "
+                        "để bắt đầu lại.",
+
+                        parse_mode="html",
+                    )
+
+                except Exception:
+                    pass
+
+                return
+
+            # ------------------------------------------------
+            # Command khác đã thay thế
+            # ------------------------------------------------
+
+            if session.get(
+                "command"
+            ) != "getuidfb":
+
+                return
+
+            # ------------------------------------------------
+            # Progress
+            # ------------------------------------------------
+
+            try:
+
+                await progress.edit(
+                    "╭─────────────────────╮\n"
+                    "│  🔎 <b>GET FACEBOOK UID</b>  │\n"
+                    "╰─────────────────────╯\n\n"
+
+                    f"📊 <b>Tiến trình:</b> "
+                    f"{index}/{total}\n\n"
+
+                    f"🔗 <code>{esc(url)}</code>\n\n"
+
+                    "⏳ Đang phân tích V15...",
+
+                    parse_mode="html",
+                )
+
+            except Exception:
+                pass
+
+            # ------------------------------------------------
+            # V15 RESOLVER
+            # ------------------------------------------------
+
+            try:
+
+                v15_result = await process_facebook_url(
+                    event,
+                    url,
+                    notify_bot,
+                )
+
+                # ------------------------------------------------
+                # V15 Result -> legacy result format
+                #
+                # Nếu V15 Result object có user_uid:
+                # giữ lại UID chuẩn.
+                # ------------------------------------------------
+
+                if isinstance(
+                    v15_result,
+                    Result,
+                ):
+
+                    uid = (
+                        v15_result.user_uid
+                    )
+
+                    clean_uid = (
+                        clean_facebook_uid(uid)
+                        if uid
+                        else None
+                    )
+
+                    result = {
+                        "url": url,
+                        "uid": clean_uid,
+                        "success": bool(
+                            clean_uid
+                        ),
+                        "v15": v15_result,
+                    }
+
+                    if not clean_uid:
+
+                        result["error"] = (
+                            "V15 không tìm thấy "
+                            "UID user đã xác minh."
+                        )
+
+                elif isinstance(
+                    v15_result,
+                    dict,
+                ):
+
+                    result = v15_result
+
+                    if result.get("uid"):
+
+                        clean_uid = (
+                            clean_facebook_uid(
+                                result.get("uid")
+                            )
+                        )
+
+                        result["uid"] = clean_uid
+                        result["success"] = bool(
+                            clean_uid
+                        )
+
+                else:
+
+                    result = {
+                        "url": url,
+                        "uid": None,
+                        "success": False,
+                        "error": (
+                            "Resolver trả về "
+                            "kết quả không hợp lệ."
+                        ),
+                    }
+
+                # ------------------------------------------------
+                # Admin notification
+                # ------------------------------------------------
+
+                if notify_bot:
+
+                    try:
+
+                        sender = (
+                            await event.get_sender()
+                        )
+
+                        admin_result = (
+                            f"UID: "
+                            f"{result.get('uid') or 'Không tìm thấy'}\n"
+                            f"Link: {url}"
+                        )
+
+                        await notify_bot(
+                            sender,
+                            "/getuidfb",
+                            result=admin_result,
+                        )
+
+                    except Exception as exc:
+
+                        print(
+                            f"[UID ADMIN] {exc}"
+                        )
+
+                results.append(
+                    result
+                )
+
+            except asyncio.CancelledError:
+
+                raise
+
+            except Exception as exc:
+
+                print(
+                    f"[GETUID LOOP] {exc}"
+                )
+
+                results.append(
+                    {
+                        "url": url,
+                        "uid": None,
+                        "success": False,
+                        "error": str(exc),
+                    }
+                )
+
+        # ====================================================
+        # SESSION CHECK
+        # ====================================================
+
+        session = sessions.get(
+            user_id
+        )
+
+        if not session:
+            return
+
+        if not session.get(
+            "running",
+            False,
+        ):
+            return
+
+        # ====================================================
+        # FORMAT V15 RESULT
+        # ====================================================
+
+        # Nếu muốn hiển thị đầy đủ V15,
+        # không dùng format_results() cũ.
+        #
+        # Mỗi Result được format bằng format_result().
+        # ====================================================
+
+        blocks = []
+
+        for index, item in enumerate(
+            results,
+            start=1,
+        ):
+
+            v15_result = item.get(
+                "v15"
+            )
+
+            if isinstance(
+                v15_result,
+                Result,
+            ):
+
+                started = time.perf_counter()
+
+                # elapsed đã không còn chính xác ở đây,
+                # nên chỉ dùng giá trị tối thiểu.
+                #
+                # Kết quả V15 vẫn giữ nguyên.
+                blocks.append(
+                    f"<b>━━ RESULT {index}/{total} ━━</b>\n"
+                    + format_result(
+                        v15_result,
+                        0.0,
+                    )
+                )
+
+            else:
+
+                uid = item.get(
+                    "uid"
+                )
+
+                if uid:
+
+                    blocks.append(
+                        f"<b>{index}.</b> "
+                        f"🆔 <code>{esc(uid)}</code>\n"
+                        f"🔗 <a href=\"{esc(item.get('url', ''))}\">"
+                        f"Mở Facebook</a>\n"
+                        "✅ <i>Thành công</i>"
+                    )
+
+                else:
+
+                    blocks.append(
+                        f"<b>{index}.</b> "
+                        "❌ <b>Không tìm thấy UID</b>\n"
+                        f"🔗 <a href=\"{esc(item.get('url', ''))}\">"
+                        f"Mở Facebook</a>"
+                    )
+
+        result_message = "\n\n".join(
+            blocks
+        )
+
+        # Telegram giới hạn khoảng 4096 ký tự.
+        if len(result_message) > MAX_TELEGRAM_MESSAGE:
+
+            result_message = (
+                result_message[
+                    :MAX_TELEGRAM_MESSAGE - 50
+                ]
+                + "\n\n<i>... kết quả quá dài</i>"
+            )
+
+        try:
+
+            await progress.edit(
+                result_message,
+                parse_mode="html",
+                link_preview=False,
+            )
+
+        except Exception as exc:
+
+            print(
+                f"[RESULT EDIT] {exc}"
+            )
+
+        # ----------------------------------------------------
+        # Tiếp tục chờ link
+        # ----------------------------------------------------
+
+        session = sessions.get(
+            user_id
+        )
+
+        if session:
+
+            session["processing"] = False
+            session["running"] = True
+            session["command"] = "getuidfb"
+
+    except asyncio.CancelledError:
+
+        # ----------------------------------------------------
+        # Nếu task bị command khác thay thế
+        # không báo lỗi giả.
+        # ----------------------------------------------------
+
+        raise
+
+    finally:
+
+        session = sessions.get(
+            user_id
+        )
+
+        if session:
+
+            session["processing"] = False
+
+
+# ============================================================
+# REGISTER
+# ============================================================
+
+def register(
+    bot,
+    notify_bot,
+):
+
+    sessions = get_sessions(
+        bot
+    )
+
+    # ========================================================
+    # /getuidfb
+    # ========================================================
+
+    @bot.on(
+        events.NewMessage(
+            pattern=r"^/getuidfb(?:@\w+)?$"
+        )
+    )
+    async def getuid_start_handler(event):
+
+        await getuidfb_start(
+            event,
+            sessions,
+            notify_bot,
+        )
+
+    # ========================================================
+    # NHẬN LINK FACEBOOK
+    # ========================================================
+
+    @bot.on(
+        events.NewMessage()
+    )
+    async def getuid_receive_handler(event):
+
+        await getuid_receive(
+            event,
+            sessions,
+            notify_bot,
+        )

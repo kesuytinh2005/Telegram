@@ -388,50 +388,36 @@ USER_AGENTS = [
 
 
 def browser_headers() -> Dict[str, str]:
-    ua = USER_AGENTS[
-        int(time.time() * 1000) % len(USER_AGENTS)
-    ]
-
-    mobile = "Android" in ua
+    
 
     return {
-        "User-Agent": ua,
-
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,image/avif,"
-            "image/webp,image/apng,*/*;q=0.8"
+        "authority": "www.facebook.com",
+        "accept": (
+            "text/html,"
+            "application/xhtml+xml,"
+            "application/xml;q=0.9,"
+            "image/avif,"
+            "image/webp,"
+            "image/apng,"
+            "*/*;q=0.8"
         ),
-
-        "Accept-Language": (
-            "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
+        "accept-language": (
+            "vi-VN,vi;q=0.9,"
+            "en-US;q=0.8,en;q=0.7"
         ),
-
-        "Accept-Encoding": (
-            "gzip, deflate, br"
-        ),
-
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "DNT": "1",
-
-        "Upgrade-Insecure-Requests": "1",
-
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-
-        "Sec-CH-UA": (
-            '"Chromium";v="140", '
-            '"Google Chrome";v="140", '
-            '"Not=A?Brand";v="24"'
-        ),
-
-        "Sec-CH-UA-Mobile": "?1" if mobile else "?0",
-
-        "Sec-CH-UA-Platform": (
-            '"Android"' if mobile else '"Windows"'
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "upgrade-insecure-requests": "1",
+        "user-agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/139.0.0.0 "
+            "Safari/537.36"
         ),
     }
 

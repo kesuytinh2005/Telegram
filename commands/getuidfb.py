@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-============================================================
- FACEBOOK UID / ENTITY RESOLVER V17 PRECISION
-============================================================
+================================================================
+ FACEBOOK UID / ENTITY RESOLVER V17.5 UID-FIRST
+================================================================
 
 HTTP ONLY
 PUBLIC CONTENT ONLY
@@ -19,39 +19,32 @@ NO:
 TELEGRAM:
 - Telethon
 - Async
-- Concurrent requests
+- Concurrent HTTP
+- Direct Facebook URL
 - /getuidfb <facebook_url>
 
-CORE:
-- USER / PAGE / GROUP separation
-- USER_POST / PAGE_POST / GROUP_POST
-- POST / REEL / VIDEO / PHOTO / STORY
-- share/p, share/v, share/r
-- pfbid
-- media_fbid
-- actor_id
-- profile_id
-- entity_id
-- owner_id
-- publisher_id
-- canonical URL
-- OG metadata
-- JSON-LD
-- HTML / JS correlation
-- Base64 / URL-safe Base64 inspection
-- Facebook redirect unwrap
-- Public URL crawl
-- Identity locking
-- Evidence correlation
-- Conflict detection
-- Precision-first scoring
+GOAL:
+- Tối đa khả năng tìm NUMERIC UID chính của chủ thể URL.
+- Giữ nguyên kiểu tích hợp command.register(...)
+- Không biến Group ID thành User UID.
+- Không bỏ qua pfbid / media_fbid.
+- Không phụ thuộc task_manager / database.
 
-IMPORTANT:
-This resolver NEVER guarantees a numeric UID merely because a
-number was found in HTML. A numeric value must be correlated with
-the correct entity/context before it becomes USER_UID / PAGE_ID /
-GROUP_ID.
-============================================================
+ENGINE:
+1. URL structural analysis
+2. Redirect unwrap
+3. Canonical discovery
+4. OG metadata
+5. JSON-LD
+6. Embedded JSON
+7. HTML / JS identity extraction
+8. Publisher extraction
+9. Publisher profile crawling
+10. ID correlation
+11. Entity separation
+12. UID verification
+13. Minimal Telegram output
+================================================================
 """
 
 from __future__ import annotations
@@ -66,10 +59,9 @@ import re
 import time
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional
+from typing import Any, Optional, Iterable
 from urllib.parse import (
     parse_qs,
-    quote,
     unquote,
     urlencode,
     urljoin,
@@ -79,28 +71,28 @@ from urllib.parse import (
 
 try:
     import httpx
-except ImportError:  # pragma: no cover
+except ImportError:
     httpx = None
 
 from telethon import events
 
 
-# ============================================================
+# ==============================================================
 # COMMAND INFO
-# ============================================================
+# ==============================================================
 
 COMMAND_INFO = {
     "command": "getuidfb",
-    "description": "Facebook public UID / entity resolver",
+    "description": "Facebook UID / Entity Resolver",
     "usage": "/getuidfb <facebook_url>",
-    "aliases": ["fbuid", "uidfb"],
+    "aliases": ["uidfb", "fbuid"],
 }
 
 
-GETUIDFB_HELP = """
-<b>🔎 FACEBOOK UID RESOLVER V17</b>
+HELP_TEXT = """
+<b>🔎 FACEBOOK UID RESOLVER V17.5</b>
 
-<b>Cú pháp:</b>
+<b>Sử dụng:</b>
 <code>/getuidfb &lt;facebook_url&gt;</code>
 
 Hỗ trợ:
@@ -110,30 +102,23 @@ Hỗ trợ:
 • POST / REEL / VIDEO / PHOTO / STORY
 • pfbid
 • media_fbid
-• share/p
-• share/v
-• share/r
+• actor_id / profile_id / owner_id
 • canonical / OG / JSON-LD
-• HTML / JS correlation
+• HTML / JS
 • Facebook redirect
 
-<b>Precision-first:</b>
-chỉ trả ID khi có bằng chứng đủ mạnh.
+<b>UID được ưu tiên tìm từ publisher/chủ thể chính.</b>
 """
 
 
-# ============================================================
-# LOGGING
-# ============================================================
-
-LOGGER = logging.getLogger("facebook_uid_v17")
+LOGGER = logging.getLogger("getuidfb.v17")
 
 
-# ============================================================
+# ==============================================================
 # CONSTANTS
-# ============================================================
+# ==============================================================
 
-FB_HOSTS = {
+FACEBOOK_HOSTS = {
     "facebook.com",
     "www.facebook.com",
     "m.facebook.com",
@@ -146,123 +131,42 @@ FB_HOSTS = {
     "l.facebook.com",
 }
 
-MAX_BODY = 5_500_000
-MAX_CRAWL = 4
-MAX_DISCOVERED_LINKS = 3
+MAX_HTML = 7_000_000
+MAX_CRAWL = 5
+MAX_PROFILE_CRAWL = 2
 MAX_CONCURRENT = 6
 
-MIN_NUMERIC_ID_LEN = 5
-MAX_NUMERIC_ID_LEN = 30
+NUMERIC_ID_RE = re.compile(
+    r"(?<!\d)(\d{5,30})(?!\d)"
+)
 
-PF_TOKEN_RE = re.compile(
+PFID_RE = re.compile(
     r"\bpfbid[A-Za-z0-9_-]+\b",
     re.I,
 )
 
-NUMERIC_RE = re.compile(
-    rf"(?<!\d)(\d{{{MIN_NUMERIC_ID_LEN},{MAX_NUMERIC_ID_LEN}}})(?!\d)"
+FB_URL_RE = re.compile(
+    r"""(?ix)
+    https?://
+    (?:
+        (?:[a-z0-9-]+\.)?facebook\.com
+        |
+        (?:www\.)?fb\.com
+        |
+        fb\.watch
+    )
+    [^\s<>"']*
+    """
 )
 
 USERNAME_RE = re.compile(
     r"^[A-Za-z0-9._-]{2,100}$"
 )
 
-FACEBOOK_URL_RE = re.compile(
-    r"""(?ix)
-    https?://
-    (?:
-        [a-z0-9.-]+\.)?
-        facebook\.com
-        [^\s<>"']*
-    |
-        https?://(?:www\.)?fb\.com[^\s<>"']*
-    |
-        https?://fb\.watch/[^\s<>"']*
-    """
-)
 
-META_RE = re.compile(
-    r"""(?is)
-    <meta
-        [^>]+
-        (?:property|name)\s*=\s*["']([^"']+)["']
-        [^>]+
-        content\s*=\s*["'](.*?)["']
-        [^>]*>
-    |
-    <meta
-        [^>]+
-        content\s*=\s*["'](.*?)["']
-        [^>]+
-        (?:property|name)\s*=\s*["']([^"']+)["']
-        [^>]*>
-    """
-)
-
-LINK_RE = re.compile(
-    r"""(?is)
-    <link
-        [^>]*rel\s*=\s*["']([^"']+)["']
-        [^>]*href\s*=\s*["'](.*?)["']
-        [^>]*>
-    |
-    <link
-        [^>]*href\s*=\s*["'](.*?)["']
-        [^>]*rel\s*=\s*["']([^"']+)["']
-        [^>]*>
-    """
-)
-
-SCRIPT_RE = re.compile(
-    r"(?is)<script\b[^>]*>(.*?)</script>"
-)
-
-TITLE_RE = re.compile(
-    r"(?is)<title[^>]*>(.*?)</title>"
-)
-
-# Common Facebook identity keys.
-IDENTITY_KEYS = (
-    "user_id",
-    "profile_id",
-    "actor_id",
-    "page_id",
-    "group_id",
-    "owner_id",
-    "publisher_id",
-    "entity_id",
-    "story_fbid",
-    "post_id",
-    "media_fbid",
-    "video_id",
-    "photo_id",
-    "reel_id",
-    "id",
-)
-
-# Values which frequently contain non-identity numbers.
-BAD_NUMERIC_CONTEXT = (
-    "timestamp",
-    "created_time",
-    "updated_time",
-    "width",
-    "height",
-    "duration",
-    "offset",
-    "count",
-    "limit",
-    "size",
-    "version",
-    "revision",
-    "tracking",
-    "cache",
-    "expires",
-)
-
-
-# ============================================================
-# ENTITY TYPES
-# ============================================================
+# ==============================================================
+# ENTITY
+# ==============================================================
 
 GROUP_TYPES = {
     "GROUP",
@@ -285,20 +189,12 @@ USER_TYPES = {
     "USER_REEL",
 }
 
-CONTENT_TYPES = {
-    "POST",
-    "REEL",
-    "VIDEO",
-    "PHOTO",
-    "STORY",
-}
 
+# ==============================================================
+# DATA
+# ==============================================================
 
-# ============================================================
-# DATA STRUCTURES
-# ============================================================
-
-@dataclass(slots=True)
+@dataclass
 class Evidence:
     field: str
     value: str
@@ -306,51 +202,63 @@ class Evidence:
     score: float
     context: str = ""
     direct: bool = False
-    kind: str = "generic"
     role: str = ""
-    independent_key: str = ""
-
-    def key(self) -> tuple:
-        return (
-            self.field,
-            self.value,
-            self.source,
-            self.role,
-        )
+    independent: str = ""
 
 
-@dataclass(slots=True)
-class PageSnapshot:
-    url: str
-    final_url: str
-    status_code: int
-    content_type: str
-    text: str
-    headers: dict[str, str] = field(default_factory=dict)
-    elapsed_ms: int = 0
-
-
-@dataclass(slots=True)
+@dataclass
 class Candidate:
     field: str
     value: str
-    score: float = 0.0
-    evidence: list[Evidence] = field(default_factory=list)
+    evidence: list[Evidence] = field(
+        default_factory=list
+    )
 
     @property
-    def evidence_count(self) -> int:
-        return len(self.evidence)
+    def score(self) -> float:
+        total = 0.0
 
-    @property
-    def independent_sources(self) -> int:
-        return len({
-            e.independent_key or e.source
+        total += sum(
+            min(35.0, e.score)
+            for e in self.evidence
+        )
+
+        independent = len({
+            e.independent or e.source
             for e in self.evidence
         })
 
+        if independent >= 2:
+            total += 15
 
-@dataclass(slots=True)
-class ResolveResult:
+        if independent >= 3:
+            total += 15
+
+        if independent >= 4:
+            total += 10
+
+        if any(e.direct for e in self.evidence):
+            total += 10
+
+        if len(self.evidence) >= 2:
+            total += 7
+
+        return min(100.0, total)
+
+
+@dataclass
+class Snapshot:
+    requested_url: str
+    final_url: str
+    status: int
+    text: str
+    headers: dict[str, str] = field(
+        default_factory=dict
+    )
+
+
+@dataclass
+class Result:
     input_url: str
 
     status: str = "FAILED"
@@ -358,10 +266,7 @@ class ResolveResult:
     entity_type: str = "UNKNOWN"
 
     confidence: int = 0
-    confidence_label: str = "LOW"
-
-    canonical_url: Optional[str] = None
-    resolved_url: Optional[str] = None
+    verification: str = "UNVERIFIED"
 
     user_uid: Optional[str] = None
     page_id: Optional[str] = None
@@ -372,29 +277,32 @@ class ResolveResult:
     video_id: Optional[str] = None
     photo_id: Optional[str] = None
     story_id: Optional[str] = None
-
     media_fbid: Optional[str] = None
-    actor_id: Optional[str] = None
-    profile_id: Optional[str] = None
-    entity_id: Optional[str] = None
+
+    publisher: Optional[str] = None
     publisher_id: Optional[str] = None
 
-    publisher_username: Optional[str] = None
+    canonical_url: Optional[str] = None
+    resolved_url: Optional[str] = None
+
     share_token: Optional[str] = None
 
-    verification: str = "UNVERIFIED"
-
-    warnings: list[str] = field(default_factory=list)
-    evidence: list[Evidence] = field(default_factory=list)
+    warnings: list[str] = field(
+        default_factory=list
+    )
 
     error: Optional[str] = None
 
+    evidence: list[Evidence] = field(
+        default_factory=list
+    )
 
-# ============================================================
-# HELPERS
-# ============================================================
 
-def clean_text(value: Any) -> str:
+# ==============================================================
+# UTIL
+# ==============================================================
+
+def clean(value: Any) -> str:
     if value is None:
         return ""
 
@@ -404,10 +312,14 @@ def clean_text(value: Any) -> str:
     value = value.replace("\\u003A", ":")
     value = value.replace("\\u0026", "&")
 
-    return re.sub(r"\s+", " ", value).strip()
+    return re.sub(
+        r"\s+",
+        " ",
+        value,
+    ).strip()
 
 
-def valid_numeric_id(value: Any) -> bool:
+def numeric(value: Any) -> bool:
     if value is None:
         return False
 
@@ -416,21 +328,17 @@ def valid_numeric_id(value: Any) -> bool:
     if not value.isdigit():
         return False
 
-    if not (
-        MIN_NUMERIC_ID_LEN
-        <= len(value)
-        <= MAX_NUMERIC_ID_LEN
-    ):
+    if not 5 <= len(value) <= 30:
         return False
 
-    # Reject obvious tiny test values.
+    # Avoid obvious dummy values.
     if len(set(value)) == 1:
         return False
 
     return True
 
 
-def valid_opaque_id(value: Any) -> bool:
+def opaque(value: Any) -> bool:
     if value is None:
         return False
 
@@ -438,41 +346,46 @@ def valid_opaque_id(value: Any) -> bool:
 
     return bool(
         3 <= len(value) <= 300
-        and re.fullmatch(r"[A-Za-z0-9_.:-]+", value)
-    )
-
-
-def normalize_host(host: str) -> str:
-    return (host or "").lower().split(":")[0]
-
-
-def is_facebook_host(host: str) -> bool:
-    host = normalize_host(host)
-
-    if host in FB_HOSTS:
-        return True
-
-    return any(
-        host.endswith("." + base)
-        for base in (
-            "facebook.com",
-            "fb.com",
+        and re.fullmatch(
+            r"[A-Za-z0-9_.:-]+",
+            value,
         )
     )
 
 
-def normalize_url(url: str) -> str:
-    url = clean_text(url)
+def host(url: str) -> str:
+    return (
+        urlparse(url)
+        .netloc
+        .lower()
+        .split(":")[0]
+    )
+
+
+def is_fb(url: str) -> bool:
+    h = host(url)
+
+    return (
+        h in FACEBOOK_HOSTS
+        or h.endswith(".facebook.com")
+        or h.endswith(".fb.com")
+    )
+
+
+def normalize(url: str) -> str:
+    url = clean(url)
 
     if not url:
         return ""
 
+    if not url.startswith(
+        ("http://", "https://")
+    ):
+        url = "https://" + url
+
     parsed = urlparse(url)
 
-    if not parsed.scheme:
-        parsed = urlparse("https://" + url)
-
-    if not is_facebook_host(parsed.netloc):
+    if not is_fb(url):
         return ""
 
     query = parse_qs(
@@ -480,13 +393,11 @@ def normalize_url(url: str) -> str:
         keep_blank_values=False,
     )
 
-    # Keep only semantically useful Facebook parameters.
-    keep = {}
+    useful = {}
 
     for key, values in query.items():
-        key_l = key.lower()
 
-        if key_l in {
+        if key.lower() in {
             "id",
             "fbid",
             "story_fbid",
@@ -494,397 +405,83 @@ def normalize_url(url: str) -> str:
             "u",
             "set",
             "substory_index",
-        }:
-            if values:
-                keep[key] = values[-1]
-
-    clean_query = urlencode(keep)
-
-    path = re.sub(
-        r"/{2,}",
-        "/",
-        parsed.path or "/",
-    )
+        } and values:
+            useful[key] = values[-1]
 
     return urlunparse(
         (
             "https",
-            normalize_host(parsed.netloc),
-            path.rstrip("/") or "/",
+            host(url),
+            re.sub(
+                r"/{2,}",
+                "/",
+                parsed.path or "/",
+            ).rstrip("/") or "/",
             "",
-            clean_query,
+            urlencode(useful),
             "",
         )
     )
 
 
-def unwrap_redirect(url: str) -> str:
-    """
-    Unwrap l.facebook.com/l.php?u=...
-    and common Facebook redirect wrappers.
-    """
+def unwrap(url: str) -> str:
     try:
         parsed = urlparse(url)
-        query = parse_qs(parsed.query)
+        qs = parse_qs(parsed.query)
 
-        for key in ("u", "url", "target", "redirect_uri"):
-            values = query.get(key)
+        for key in (
+            "u",
+            "url",
+            "target",
+            "redirect_uri",
+        ):
+            values = qs.get(key)
 
             if not values:
                 continue
 
-            candidate = unquote(values[-1])
+            candidate = unquote(
+                values[-1]
+            )
 
-            if candidate.startswith(("http://", "https://")):
-                if is_facebook_host(urlparse(candidate).netloc):
-                    return normalize_url(candidate)
-
-        return normalize_url(url)
+            if candidate.startswith(
+                ("http://", "https://")
+            ) and is_fb(candidate):
+                return normalize(candidate)
 
     except Exception:
-        return normalize_url(url)
+        pass
+
+    return normalize(url)
 
 
-def extract_facebook_urls(text: str) -> list[str]:
-    if not text:
-        return []
+def extract_urls(text: str) -> list[str]:
+    result = []
 
-    found = []
-
-    for match in FACEBOOK_URL_RE.finditer(text):
+    for match in FB_URL_RE.finditer(
+        text or ""
+    ):
         url = match.group(0).rstrip(
             ".,!?;:)]}>\"'"
         )
 
-        url = unwrap_redirect(url)
+        url = unwrap(url)
 
-        if url and url not in found:
-            found.append(url)
+        if url and url not in result:
+            result.append(url)
 
-    return found
+    return result
 
 
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def confidence_label(score: int) -> str:
-    if score >= 95:
-        return "VERY HIGH"
-
-    if score >= 85:
-        return "HIGH"
-
-    if score >= 70:
-        return "GOOD"
-
-    if score >= 50:
-        return "MEDIUM"
-
-    return "LOW"
-
-
-# ============================================================
-# URL CLASSIFIER
-# ============================================================
-
-class FacebookURLClassifier:
-    """
-    Structural URL classification.
-
-    IMPORTANT:
-    Group context has absolute precedence.
-    """
-
-    @staticmethod
-    def classify(url: str) -> tuple[str, dict[str, str]]:
-        parsed = urlparse(url)
-        path = unquote(parsed.path or "")
-        lower = path.lower()
-
-        query = parse_qs(parsed.query)
-
-        info: dict[str, str] = {}
-
-        # ----------------------------------------------------
-        # GROUP
-        # ----------------------------------------------------
-
-        m = re.search(
-            r"/groups/([^/]+)/(?:posts|permalink|user_posts)/([^/?#]+)",
-            lower,
-            re.I,
-        )
-
-        if m:
-            group_token = unquote(m.group(1))
-            post_token = unquote(m.group(2))
-
-            if valid_numeric_id(group_token):
-                info["group_id"] = group_token
-
-            info["post_id"] = post_token
-
-            return "GROUP_POST", info
-
-        m = re.search(
-            r"/groups/([^/?#]+)",
-            lower,
-            re.I,
-        )
-
-        if m:
-            group_token = unquote(m.group(1))
-
-            if valid_numeric_id(group_token):
-                info["group_id"] = group_token
-
-            return "GROUP", info
-
-        # ----------------------------------------------------
-        # STORIES
-        # ----------------------------------------------------
-
-        if "/story.php" in lower:
-            story_fbid = (
-                query.get("story_fbid", [None])[-1]
-            )
-
-            owner_id = (
-                query.get("id", [None])[-1]
-            )
-
-            if story_fbid:
-                info["story_id"] = story_fbid
-
-            if valid_numeric_id(owner_id):
-                info["owner_id"] = owner_id
-
-            return "STORY", info
-
-        # ----------------------------------------------------
-        # SHARE
-        # ----------------------------------------------------
-
-        m = re.search(
-            r"/share/(p|v|r)/([^/?#]+)",
-            lower,
-            re.I,
-        )
-
-        if m:
-            kind = m.group(1).lower()
-            token = unquote(m.group(2))
-
-            info["share_token"] = token
-
-            if kind == "p":
-                if token.lower().startswith("pfbid"):
-                    info["post_id"] = token
-
-                return "SHARE_POST", info
-
-            if kind == "v":
-                return "SHARE_VIDEO", info
-
-            if kind == "r":
-                return "SHARE_REEL", info
-
-        # ----------------------------------------------------
-        # PROFILE.PHP
-        # ----------------------------------------------------
-
-        if lower.startswith("/profile.php"):
-            profile_id = query.get("id", [None])[-1]
-
-            if valid_numeric_id(profile_id):
-                info["profile_id"] = profile_id
-
-            return "PROFILE", info
-
-        # ----------------------------------------------------
-        # PAGES
-        # ----------------------------------------------------
-
-        if lower.startswith("/pages/"):
-            parts = [
-                unquote(x)
-                for x in path.split("/")
-                if x
-            ]
-
-            if len(parts) >= 2:
-                page_name = parts[1]
-
-                info["publisher_username"] = page_name
-
-            if "/posts/" in lower:
-                post = path.split("/posts/", 1)[1]
-                post = post.split("/", 1)[0]
-
-                if post:
-                    info["post_id"] = unquote(post)
-
-                return "PAGE_POST", info
-
-            if "/videos/" in lower:
-                video = path.split("/videos/", 1)[1]
-                video = video.split("/", 1)[0]
-
-                if video:
-                    info["video_id"] = unquote(video)
-
-                return "PAGE_VIDEO", info
-
-            if "/reels/" in lower:
-                reel = path.split("/reels/", 1)[1]
-                reel = reel.split("/", 1)[0]
-
-                if reel:
-                    info["reel_id"] = unquote(reel)
-
-                return "PAGE_REEL", info
-
-            return "PAGE", info
-
-        # ----------------------------------------------------
-        # REELS
-        # ----------------------------------------------------
-
-        m = re.search(
-            r"/(?:reel|reels)/([^/?#]+)",
-            lower,
-            re.I,
-        )
-
-        if m:
-            info["reel_id"] = unquote(m.group(1))
-            return "REEL", info
-
-        # ----------------------------------------------------
-        # VIDEOS
-        # ----------------------------------------------------
-
-        m = re.search(
-            r"/videos/(?:[^/]+/)?([^/?#]+)",
-            lower,
-            re.I,
-        )
-
-        if m:
-            info["video_id"] = unquote(m.group(1))
-            return "VIDEO", info
-
-        if lower.startswith("/watch"):
-            video_id = query.get("v", [None])[-1]
-
-            if video_id:
-                info["video_id"] = video_id
-
-            return "VIDEO", info
-
-        # ----------------------------------------------------
-        # PHOTO
-        # ----------------------------------------------------
-
-        if lower.startswith("/photo.php"):
-            photo_id = query.get("fbid", [None])[-1]
-
-            if photo_id:
-                info["photo_id"] = photo_id
-
-            return "PHOTO", info
-
-        # ----------------------------------------------------
-        # /p/
-        # ----------------------------------------------------
-
-        m = re.search(
-            r"/p/([^/?#]+)",
-            lower,
-            re.I,
-        )
-
-        if m:
-            token = unquote(m.group(1))
-
-            info["post_id"] = token
-
-            return "POST", info
-
-        # ----------------------------------------------------
-        # USER / PAGE STYLE POST
-        # ----------------------------------------------------
-
-        parts = [
-            unquote(x)
-            for x in path.split("/")
-            if x
-        ]
-
-        if parts:
-            first = parts[0]
-
-            if (
-                first.lower()
-                not in {
-                    "home",
-                    "watch",
-                    "marketplace",
-                    "gaming",
-                    "events",
-                    "groups",
-                    "pages",
-                    "reels",
-                    "videos",
-                    "photo.php",
-                    "story.php",
-                    "profile.php",
-                    "share",
-                }
-            ):
-                if len(parts) >= 3:
-                    action = parts[1].lower()
-                    token = parts[2]
-
-                    if action == "posts":
-                        info["publisher_username"] = first
-                        info["post_id"] = token
-                        return "AMBIGUOUS_POST", info
-
-                    if action == "videos":
-                        info["publisher_username"] = first
-                        info["video_id"] = token
-                        return "AMBIGUOUS_VIDEO", info
-
-                    if action == "photos":
-                        info["publisher_username"] = first
-                        info["photo_id"] = token
-                        return "AMBIGUOUS_PHOTO", info
-
-                    if action in {"reels", "reel"}:
-                        info["publisher_username"] = first
-                        info["reel_id"] = token
-                        return "AMBIGUOUS_REEL", info
-
-                if len(parts) == 1:
-                    info["publisher_username"] = first
-                    return "PROFILE_CANDIDATE", info
-
-        return "UNKNOWN", info
-
-
-# ============================================================
+# ==============================================================
 # EVIDENCE STORE
-# ============================================================
+# ==============================================================
 
 class EvidenceStore:
-    def __init__(self) -> None:
+
+    def __init__(self):
         self.items: list[Evidence] = []
-        self._keys: set[tuple] = set()
+        self._keys = set()
 
     def add(
         self,
@@ -895,14 +492,10 @@ class EvidenceStore:
         *,
         context: str = "",
         direct: bool = False,
-        kind: str = "generic",
         role: str = "",
-        independent_key: str = "",
-    ) -> None:
-        if value is None:
-            return
-
-        value = clean_text(value)
+        independent: str = "",
+    ):
+        value = clean(value)
 
         if not value:
             return
@@ -914,15 +507,19 @@ class EvidenceStore:
             score=score,
             context=context,
             direct=direct,
-            kind=kind,
             role=role,
-            independent_key=(
-                independent_key
+            independent=(
+                independent
                 or source
             ),
         )
 
-        key = item.key()
+        key = (
+            item.field,
+            item.value,
+            item.source,
+            item.role,
+        )
 
         if key in self._keys:
             return
@@ -930,443 +527,756 @@ class EvidenceStore:
         self._keys.add(key)
         self.items.append(item)
 
-    def for_field(self, field: str) -> list[Evidence]:
-        return [
-            x for x in self.items
-            if x.field == field
-        ]
+    def candidates(
+        self,
+        field: str,
+    ) -> list[Candidate]:
 
-    def for_value(self, field: str, value: str) -> list[Evidence]:
-        return [
-            x
-            for x in self.items
-            if x.field == field
-            and x.value == value
-        ]
+        grouped: dict[str, Candidate] = {}
 
-    def candidates(self, field: str) -> list[Candidate]:
-        values: dict[str, Candidate] = {}
+        for item in self.items:
 
-        for evidence in self.for_field(field):
-            candidate = values.setdefault(
-                evidence.value,
+            if item.field != field:
+                continue
+
+            grouped.setdefault(
+                item.value,
                 Candidate(
                     field=field,
-                    value=evidence.value,
+                    value=item.value,
                 ),
-            )
-
-            candidate.evidence.append(evidence)
-
-        for candidate in values.values():
-            candidate.score = self._score(candidate)
+            ).evidence.append(item)
 
         return sorted(
-            values.values(),
+            grouped.values(),
             key=lambda x: x.score,
             reverse=True,
         )
 
-    @staticmethod
-    def _score(candidate: Candidate) -> float:
-        if not candidate.evidence:
-            return 0.0
+    def has(
+        self,
+        field: str,
+        value: str,
+    ) -> bool:
 
-        score = 0.0
-
-        # Base evidence scores.
-        score += sum(
-            min(35.0, e.score)
-            for e in candidate.evidence
+        return any(
+            e.field == field
+            and e.value == value
+            for e in self.items
         )
 
-        # Independent-source bonus.
-        independent = candidate.independent_sources
 
-        if independent >= 2:
-            score += 18
+# ==============================================================
+# URL ANALYSIS
+# ==============================================================
 
-        if independent >= 3:
-            score += 15
+class URLParser:
 
-        if independent >= 4:
-            score += 10
+    @staticmethod
+    def parse(
+        url: str,
+    ) -> tuple[str, dict[str, str]]:
 
-        # Direct evidence bonus.
-        if any(e.direct for e in candidate.evidence):
-            score += 12
+        p = urlparse(url)
+        path = unquote(p.path or "")
+        low = path.lower()
 
-        # Multiple evidence of same value.
-        if len(candidate.evidence) >= 2:
-            score += 8
+        query = parse_qs(p.query)
+        info = {}
 
-        return min(100.0, score)
+        # ------------------------------------------------------
+        # GROUP POST — absolute priority
+        # ------------------------------------------------------
+
+        m = re.search(
+            r"/groups/([^/]+)"
+            r"/(?:posts|permalink|user_posts)"
+            r"/([^/?#]+)",
+            low,
+            re.I,
+        )
+
+        if m:
+
+            group = unquote(m.group(1))
+            post = unquote(m.group(2))
+
+            if numeric(group):
+                info["group_id"] = group
+
+            if opaque(post):
+                info["post_id"] = post
+
+            return "GROUP_POST", info
+
+        # ------------------------------------------------------
+        # GROUP
+        # ------------------------------------------------------
+
+        m = re.search(
+            r"/groups/([^/?#]+)",
+            low,
+            re.I,
+        )
+
+        if m:
+
+            group = unquote(m.group(1))
+
+            if numeric(group):
+                info["group_id"] = group
+
+            return "GROUP", info
+
+        # ------------------------------------------------------
+        # STORY
+        # ------------------------------------------------------
+
+        if low.startswith("/story.php"):
+
+            story = query.get(
+                "story_fbid",
+                [None],
+            )[-1]
+
+            owner = query.get(
+                "id",
+                [None],
+            )[-1]
+
+            if story:
+                info["story_id"] = story
+
+            if numeric(owner):
+                info["owner_id"] = owner
+
+            return "STORY", info
+
+        # ------------------------------------------------------
+        # SHARE
+        # ------------------------------------------------------
+
+        m = re.search(
+            r"/share/(p|v|r)/([^/?#]+)",
+            low,
+            re.I,
+        )
+
+        if m:
+
+            mode = m.group(1).lower()
+            token = unquote(m.group(2))
+
+            info["share_token"] = token
+
+            if mode == "p":
+                if token.lower().startswith("pfbid"):
+                    info["post_id"] = token
+
+                return "SHARE_POST", info
+
+            if mode == "v":
+                return "SHARE_VIDEO", info
+
+            return "SHARE_REEL", info
+
+        # ------------------------------------------------------
+        # PROFILE.PHP
+        # ------------------------------------------------------
+
+        if low.startswith("/profile.php"):
+
+            profile = query.get(
+                "id",
+                [None],
+            )[-1]
+
+            if numeric(profile):
+                info["profile_id"] = profile
+
+            return "USER", info
+
+        # ------------------------------------------------------
+        # PAGES
+        # ------------------------------------------------------
+
+        if low.startswith("/pages/"):
+
+            parts = [
+                unquote(x)
+                for x in path.split("/")
+                if x
+            ]
+
+            if len(parts) >= 2:
+                info["publisher"] = parts[1]
+
+            if "/posts/" in low:
+
+                post = path.split(
+                    "/posts/",
+                    1,
+                )[1].split("/", 1)[0]
+
+                if post:
+                    info["post_id"] = post
+
+                return "PAGE_POST", info
+
+            if "/videos/" in low:
+
+                video = path.split(
+                    "/videos/",
+                    1,
+                )[1].split("/", 1)[0]
+
+                if video:
+                    info["video_id"] = video
+
+                return "PAGE_VIDEO", info
+
+            if "/reels/" in low:
+
+                reel = path.split(
+                    "/reels/",
+                    1,
+                )[1].split("/", 1)[0]
+
+                if reel:
+                    info["reel_id"] = reel
+
+                return "PAGE_REEL", info
+
+            return "PAGE", info
+
+        # ------------------------------------------------------
+        # REEL
+        # ------------------------------------------------------
+
+        m = re.search(
+            r"/(?:reel|reels)/([^/?#]+)",
+            low,
+            re.I,
+        )
+
+        if m:
+
+            info["reel_id"] = unquote(
+                m.group(1)
+            )
+
+            return "REEL", info
+
+        # ------------------------------------------------------
+        # WATCH
+        # ------------------------------------------------------
+
+        if low.startswith("/watch"):
+
+            video = query.get(
+                "v",
+                [None],
+            )[-1]
+
+            if video:
+                info["video_id"] = video
+
+            return "VIDEO", info
+
+        # ------------------------------------------------------
+        # VIDEOS
+        # ------------------------------------------------------
+
+        m = re.search(
+            r"/videos/(?:[^/]+/)?([^/?#]+)",
+            low,
+            re.I,
+        )
+
+        if m:
+
+            info["video_id"] = unquote(
+                m.group(1)
+            )
+
+            return "VIDEO", info
+
+        # ------------------------------------------------------
+        # PHOTO
+        # ------------------------------------------------------
+
+        if low.startswith("/photo.php"):
+
+            photo = query.get(
+                "fbid",
+                [None],
+            )[-1]
+
+            if photo:
+                info["photo_id"] = photo
+
+            return "PHOTO", info
+
+        # ------------------------------------------------------
+        # /p/
+        # ------------------------------------------------------
+
+        m = re.search(
+            r"/p/([^/?#]+)",
+            low,
+            re.I,
+        )
+
+        if m:
+
+            info["post_id"] = unquote(
+                m.group(1)
+            )
+
+            return "POST", info
+
+        # ------------------------------------------------------
+        # USER/PAGE STYLE CONTENT
+        # ------------------------------------------------------
+
+        parts = [
+            unquote(x)
+            for x in path.split("/")
+            if x
+        ]
+
+        if parts:
+
+            username = parts[0]
+
+            ignored = {
+                "home",
+                "watch",
+                "groups",
+                "pages",
+                "videos",
+                "reels",
+                "gaming",
+                "events",
+                "marketplace",
+                "profile.php",
+                "photo.php",
+                "story.php",
+                "share",
+            }
+
+            if username.lower() not in ignored:
+
+                if len(parts) >= 3:
+
+                    action = parts[1].lower()
+                    obj = parts[2]
+
+                    info["publisher"] = username
+
+                    if action == "posts":
+                        info["post_id"] = obj
+                        return (
+                            "AMBIGUOUS_POST",
+                            info,
+                        )
+
+                    if action == "videos":
+                        info["video_id"] = obj
+                        return (
+                            "AMBIGUOUS_VIDEO",
+                            info,
+                        )
+
+                    if action == "photos":
+                        info["photo_id"] = obj
+                        return (
+                            "AMBIGUOUS_PHOTO",
+                            info,
+                        )
+
+                    if action in {
+                        "reel",
+                        "reels",
+                    }:
+                        info["reel_id"] = obj
+                        return (
+                            "AMBIGUOUS_REEL",
+                            info,
+                        )
+
+                if len(parts) == 1:
+                    info["publisher"] = username
+                    return (
+                        "PROFILE_CANDIDATE",
+                        info,
+                    )
+
+        return "UNKNOWN", info
 
 
-# ============================================================
-# HTTP FETCHER
-# ============================================================
+# ==============================================================
+# HTTP
+# ==============================================================
 
-class HTTPFetcher:
-    USER_AGENTS = (
-        "Mozilla/5.0 (Linux; Android 13; Mobile) "
-        "AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
+class HTTP:
 
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 Chrome/140 Safari/537.36",
+    def __init__(
+        self,
+        concurrency: int = MAX_CONCURRENT,
+    ):
 
-        "facebookexternalhit/1.1",
+        if httpx is None:
+            raise RuntimeError(
+                "Cần cài httpx: "
+                "pip install httpx"
+            )
+
+        self.sem = asyncio.Semaphore(
+            concurrency
+        )
+
+        self.timeout = httpx.Timeout(
+            connect=8,
+            read=15,
+            write=8,
+            pool=8,
+        )
+
+    async def get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+    ) -> Optional[Snapshot]:
+
+        async with self.sem:
+
+            try:
+
+                response = await client.get(
+                    url,
+                    follow_redirects=True,
+                    headers={
+                        "authority": "www.facebook.com",
+			            "accept": (
+			                "text/html,"
+			                "application/xhtml+xml,"
+			                "application/xml;q=0.9,"
+			                "image/avif,"
+			                "image/webp,"
+			                "image/apng,"
+			                "*/*;q=0.8"
+			            ),
+			            "accept-language": (
+			                "vi-VN,vi;q=0.9,"
+			                "en-US;q=0.8,en;q=0.7"
+			            ),
+			            "cache-control": "no-cache",
+			            "pragma": "no-cache",
+			            "sec-fetch-dest": "document",
+			            "sec-fetch-mode": "navigate",
+			            "sec-fetch-site": "none",
+			            "upgrade-insecure-requests": "1",
+			            "user-agent": (
+			                "Mozilla/5.0 "
+			                "(Windows NT 10.0; Win64; x64) "
+			                "AppleWebKit/537.36 "
+			                "(KHTML, like Gecko) "
+			                "Chrome/139.0.0.0 "
+			                "Safari/537.36"
+			            ),
+                    },
+                )
+
+                content_type = (
+                    response.headers
+                    .get(
+                        "content-type",
+                        "",
+                    )
+                    .lower()
+                )
+
+                if (
+                    "html" not in content_type
+                    and "text/" not in content_type
+                ):
+                    return None
+
+                raw = response.content[
+                    :MAX_HTML
+                ]
+
+                text = raw.decode(
+                    response.encoding
+                    or "utf-8",
+                    errors="replace",
+                )
+
+                return Snapshot(
+                    requested_url=url,
+                    final_url=str(
+                        response.url
+                    ),
+                    status=response.status_code,
+                    text=text,
+                    headers=dict(
+                        response.headers
+                    ),
+                )
+
+            except Exception as exc:
+
+                LOGGER.debug(
+                    "GET %s failed: %r",
+                    url,
+                    exc,
+                )
+
+                return None
+
+
+# ==============================================================
+# EXTRACTOR
+# ==============================================================
+
+class Extractor:
+
+    META_RE = re.compile(
+        r"""(?is)
+        <meta
+        [^>]+
+        (?:
+            property|name
+        )
+        \s*=\s*["']([^"']+)["']
+        [^>]+
+        content\s*=\s*["'](.*?)["']
+        [^>]*>
+        |
+        <meta
+        [^>]+
+        content\s*=\s*["'](.*?)["']
+        [^>]+
+        (?:
+            property|name
+        )
+        \s*=\s*["']([^"']+)["']
+        [^>]*>
+        """
+    )
+
+    LINK_RE = re.compile(
+        r"""(?is)
+        <link
+        [^>]*rel\s*=\s*["']([^"']+)["']
+        [^>]*href\s*=\s*["'](.*?)["']
+        [^>]*>
+        """
     )
 
     def __init__(
         self,
-        *,
-        concurrency: int = MAX_CONCURRENT,
-    ) -> None:
+        store: EvidenceStore,
+    ):
+        self.store = store
 
-        if httpx is None:
-            raise RuntimeError(
-                "Thiếu thư viện httpx. "
-                "Cài bằng: pip install httpx"
-            )
-
-        self.sem = asyncio.Semaphore(concurrency)
-
-        self.timeout = httpx.Timeout(
-            connect=8.0,
-            read=14.0,
-            write=8.0,
-            pool=8.0,
-        )
-
-    async def fetch(
-        self,
-        client: "httpx.AsyncClient",
-        url: str,
-    ) -> Optional[PageSnapshot]:
-
-        async with self.sem:
-            started = time.perf_counter()
-
-            last_error = None
-
-            for attempt in range(2):
-                headers = {
-                    "authority": "www.facebook.com",
-		            "accept": (
-		                "text/html,"
-		                "application/xhtml+xml,"
-		                "application/xml;q=0.9,"
-		                "image/avif,"
-		                "image/webp,"
-		                "image/apng,"
-		                "*/*;q=0.8"
-		            ),
-		            "accept-language": (
-		                "vi-VN,vi;q=0.9,"
-		                "en-US;q=0.8,en;q=0.7"
-		            ),
-		            "cache-control": "no-cache",
-		            "pragma": "no-cache",
-		            "sec-fetch-dest": "document",
-		            "sec-fetch-mode": "navigate",
-		            "sec-fetch-site": "none",
-		            "upgrade-insecure-requests": "1",
-		            "user-agent": (
-		                "Mozilla/5.0 "
-		                "(Windows NT 10.0; Win64; x64) "
-		                "AppleWebKit/537.36 "
-		                "(KHTML, like Gecko) "
-		                "Chrome/139.0.0.0 "
-		                "Safari/537.36"
-		            ),
-                }
-
-                try:
-                    response = await client.get(
-                        url,
-                        headers=headers,
-                        follow_redirects=True,
-                    )
-
-                    content_type = (
-                        response.headers.get(
-                            "content-type",
-                            "",
-                        )
-                    ).lower()
-
-                    if (
-                        "text/html" not in content_type
-                        and "application/xhtml" not in content_type
-                        and not content_type.startswith("text/")
-                    ):
-                        return PageSnapshot(
-                            url=url,
-                            final_url=str(response.url),
-                            status_code=response.status_code,
-                            content_type=content_type,
-                            text="",
-                            headers=dict(response.headers),
-                            elapsed_ms=int(
-                                (time.perf_counter() - started)
-                                * 1000
-                            ),
-                        )
-
-                    raw = response.content[:MAX_BODY]
-
-                    text = raw.decode(
-                        response.encoding or "utf-8",
-                        errors="replace",
-                    )
-
-                    return PageSnapshot(
-                        url=url,
-                        final_url=str(response.url),
-                        status_code=response.status_code,
-                        content_type=content_type,
-                        text=text,
-                        headers=dict(response.headers),
-                        elapsed_ms=int(
-                            (time.perf_counter() - started)
-                            * 1000
-                        ),
-                    )
-
-                except Exception as exc:
-                    last_error = exc
-
-                    if attempt == 0:
-                        await asyncio.sleep(0.25)
-
-            LOGGER.debug(
-                "HTTP failed %s: %r",
-                url,
-                last_error,
-            )
-
-        return None
-
-
-# ============================================================
-# HTML / JSON / JS EXTRACTOR
-# ============================================================
-
-class FacebookExtractor:
-    def __init__(
-        self,
-        *,
-        url_type: str,
-        evidence: EvidenceStore,
-    ) -> None:
-
-        self.url_type = url_type
-        self.evidence = evidence
-
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
     # META
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
 
-    def extract_meta(self, text: str) -> dict[str, str]:
-        meta: dict[str, str] = {}
+    def meta(
+        self,
+        text: str,
+    ) -> dict[str, str]:
 
-        for match in META_RE.finditer(text):
-            a, b, c, d = match.groups()
+        result = {}
+
+        for m in self.META_RE.finditer(text):
+
+            a, b, c, d = m.groups()
 
             if a and b:
-                key = clean_text(a).lower()
-                value = clean_text(b)
+                key = clean(a).lower()
+                value = clean(b)
             else:
-                key = clean_text(d).lower()
-                value = clean_text(c)
+                key = clean(d).lower()
+                value = clean(c)
 
             if not key or not value:
                 continue
 
-            meta[key] = value
+            result[key] = value
 
             if key in {
                 "og:url",
                 "og:title",
                 "og:description",
                 "og:type",
+                "al:web:url",
                 "al:ios:url",
                 "al:android:url",
-                "al:web:url",
             }:
-                self.evidence.add(
-                    field=key,
-                    value=value,
-                    source="meta",
-                    score=7,
-                    kind="metadata",
-                    independent_key="meta",
+
+                self.store.add(
+                    key,
+                    value,
+                    "meta",
+                    8,
+                    independent="meta",
                 )
 
-        return meta
+        return result
 
-    # --------------------------------------------------------
-    # LINKS
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
+    # CANONICAL
+    # ----------------------------------------------------------
 
-    def extract_links(self, text: str) -> list[str]:
-        links = []
+    def canonical(
+        self,
+        text: str,
+    ) -> list[str]:
 
-        for match in LINK_RE.finditer(text):
-            a, b, c, d = match.groups()
+        result = []
 
-            if a and b:
-                rel = clean_text(a).lower()
-                href = clean_text(b)
-            else:
-                href = clean_text(c)
-                rel = clean_text(d).lower()
+        for m in self.LINK_RE.finditer(text):
+
+            rel = clean(
+                m.group(1)
+            ).lower()
+
+            href = clean(
+                m.group(2)
+            )
 
             if "canonical" not in rel:
                 continue
 
-            href = unquote(href)
-
-            if href.startswith(("http://", "https://")):
-                href = normalize_url(href)
-
-                if href:
-                    links.append(href)
-
-                    self.evidence.add(
-                        field="canonical_url",
-                        value=href,
-                        source="canonical",
-                        score=28,
-                        direct=True,
-                        kind="url",
-                        independent_key="canonical",
-                    )
-
-        return list(dict.fromkeys(links))
-
-    # --------------------------------------------------------
-    # TITLE
-    # --------------------------------------------------------
-
-    def extract_title(self, text: str) -> str:
-        m = TITLE_RE.search(text)
-
-        if not m:
-            return ""
-
-        title = clean_text(m.group(1))
-
-        if title:
-            self.evidence.add(
-                field="title",
-                value=title,
-                source="html_title",
-                score=4,
-                kind="metadata",
-                independent_key="title",
+            href = normalize(
+                unquote(href)
             )
 
-        return title
+            if not href:
+                continue
 
-    # --------------------------------------------------------
+            result.append(href)
+
+            self.store.add(
+                "canonical_url",
+                href,
+                "canonical",
+                32,
+                direct=True,
+                independent="canonical",
+            )
+
+        return result
+
+    # ----------------------------------------------------------
     # JSON-LD
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
 
-    def extract_jsonld(self, text: str) -> None:
-        for script in SCRIPT_RE.findall(text):
-            if not re.search(
-                r"application/ld\+json",
-                script,
-                re.I,
-            ):
-                continue
+    def jsonld(
+        self,
+        text: str,
+    ):
 
-            body = clean_text(script)
+        scripts = re.findall(
+            r"""(?is)
+            <script[^>]+
+            type=["']application/ld\+json["']
+            [^>]*>
+            (.*?)
+            </script>
+            """,
+            text,
+        )
 
-            if not body:
-                continue
+        for body in scripts:
 
             try:
-                data = json.loads(body)
+                data = json.loads(
+                    html.unescape(body)
+                )
+
             except Exception:
                 continue
 
-            self._walk_json(
+            self.walk_json(
                 data,
                 source="jsonld",
-                depth=0,
             )
 
-    # --------------------------------------------------------
-    # GENERIC JSON WALK
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
+    # JSON WALK
+    # ----------------------------------------------------------
 
-    def _walk_json(
+    def walk_json(
         self,
-        value: Any,
+        obj: Any,
         *,
         source: str,
-        depth: int,
-        parent_key: str = "",
-    ) -> None:
+        depth: int = 0,
+    ):
 
-        if depth > 15:
+        if depth > 18:
             return
 
-        if isinstance(value, dict):
-            for key, child in value.items():
-                key_l = str(key).lower()
+        if isinstance(obj, dict):
 
-                if isinstance(child, (
-                    str,
-                    int,
-                    float,
-                )):
-                    self._inspect_key_value(
+            for key, value in obj.items():
+
+                key_l = str(
+                    key
+                ).lower()
+
+                if isinstance(
+                    value,
+                    (
+                        str,
+                        int,
+                        float,
+                    ),
+                ):
+                    self.key_value(
                         key_l,
-                        child,
+                        value,
                         source,
                     )
 
-                elif isinstance(child, (
-                    dict,
-                    list,
-                )):
-                    self._walk_json(
-                        child,
+                elif isinstance(
+                    value,
+                    (dict, list),
+                ):
+                    self.walk_json(
+                        value,
                         source=source,
                         depth=depth + 1,
-                        parent_key=key_l,
                     )
 
-        elif isinstance(value, list):
-            for child in value[:1000]:
-                self._walk_json(
-                    child,
+        elif isinstance(obj, list):
+
+            for value in obj[:1500]:
+                self.walk_json(
+                    value,
                     source=source,
                     depth=depth + 1,
-                    parent_key=parent_key,
                 )
 
-    # --------------------------------------------------------
-    # KEY / VALUE
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
+    # KEY VALUE
+    # ----------------------------------------------------------
 
-    def _inspect_key_value(
+    def key_value(
         self,
         key: str,
         value: Any,
         source: str,
-    ) -> None:
+    ):
 
-        value = clean_text(value)
+        value = clean(value)
 
-        if not value:
-            return
-
-        field_map = {
+        mapping = {
             "user_id": "user_uid",
             "userid": "user_uid",
             "profile_id": "profile_id",
@@ -1383,10 +1293,10 @@ class FacebookExtractor:
             "publisherid": "publisher_id",
             "entity_id": "entity_id",
             "entityid": "entity_id",
-            "story_fbid": "story_id",
-            "storyfbid": "story_id",
             "post_id": "post_id",
             "postid": "post_id",
+            "story_fbid": "story_id",
+            "storyfbid": "story_id",
             "media_fbid": "media_fbid",
             "mediafbid": "media_fbid",
             "video_id": "video_id",
@@ -1397,1619 +1307,1507 @@ class FacebookExtractor:
             "reelid": "reel_id",
         }
 
-        field = field_map.get(key)
+        field = mapping.get(key)
 
         if not field:
             return
 
-        # Numeric IDs.
-        if valid_numeric_id(value):
-            score = {
-                "user_uid": 12,
-                "profile_id": 14,
-                "actor_id": 10,
-                "page_id": 20,
-                "group_id": 30,
-                "owner_id": 10,
-                "publisher_id": 18,
-                "entity_id": 16,
-                "post_id": 18,
-                "story_id": 18,
-                "media_fbid": 18,
-                "video_id": 18,
-                "photo_id": 18,
-                "reel_id": 18,
-            }.get(field, 8)
+        if numeric(value):
 
-            self.evidence.add(
-                field=field,
-                value=value,
-                source=source,
-                score=score,
+            score = {
+                "group_id": 35,
+                "page_id": 28,
+                "profile_id": 24,
+                "publisher_id": 24,
+                "post_id": 24,
+                "story_id": 22,
+                "media_fbid": 22,
+                "video_id": 22,
+                "photo_id": 22,
+                "reel_id": 22,
+                "user_uid": 20,
+                "actor_id": 15,
+                "owner_id": 18,
+                "entity_id": 16,
+            }.get(field, 10)
+
+            self.store.add(
+                field,
+                value,
+                source,
+                score,
                 context=key,
-                kind="json",
-                independent_key=source,
+                independent=source,
             )
 
-            return
-
-        # Opaque IDs are still useful for post/media fields.
-        if field in {
+        elif field in {
             "post_id",
             "story_id",
             "media_fbid",
             "video_id",
             "photo_id",
             "reel_id",
-        }:
-            if valid_opaque_id(value):
-                self.evidence.add(
-                    field=field,
-                    value=value,
-                    source=source,
-                    score=14,
-                    context=key,
-                    kind="opaque",
-                    independent_key=source,
-                )
+        } and opaque(value):
 
-    # --------------------------------------------------------
-    # HTML / JS PATTERNS
-    # --------------------------------------------------------
+            self.store.add(
+                field,
+                value,
+                source,
+                18,
+                context=key,
+                independent=source,
+            )
 
-    def extract_html_js(self, text: str) -> None:
-        """
-        Extract identity keys from raw HTML / JS.
+    # ----------------------------------------------------------
+    # HTML / JS ID EXTRACTION
+    # ----------------------------------------------------------
 
-        We deliberately require the key itself to be close to the
-        numeric candidate. This prevents unrelated page numbers
-        from becoming UID candidates.
-        """
+    def html_ids(
+        self,
+        text: str,
+    ):
 
         patterns = {
+
             "user_uid": (
-                r"""
-                (?:
-                    user_id|
-                    userID|
-                    userId
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:user_id|userID|userId)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "profile_id": (
-                r"""
-                (?:
-                    profile_id|
-                    profileID|
-                    profileId
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:profile_id|profileID|profileId)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "actor_id": (
-                r"""
-                (?:
-                    actor_id|
-                    actorID|
-                    actorId
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:actor_id|actorID|actorId)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "page_id": (
-                r"""
-                (?:
-                    page_id|
-                    pageID|
-                    pageId
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:page_id|pageID|pageId)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "group_id": (
-                r"""
-                (?:
-                    group_id|
-                    groupID|
-                    groupId
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:group_id|groupID|groupId)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "owner_id": (
-                r"""
-                (?:
-                    owner_id|
-                    ownerID|
-                    ownerId
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:owner_id|ownerID|ownerId)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "publisher_id": (
-                r"""
-                (?:
-                    publisher_id|
-                    publisherID|
-                    publisherId
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:publisher_id|publisherID|publisherId)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "entity_id": (
-                r"""
-                (?:
-                    entity_id|
-                    entityID|
-                    entityId
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:entity_id|entityID|entityId)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "post_id": (
-                r"""
-                (?:
-                    post_id|
-                    postID|
-                    postId
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:post_id|postID|postId)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "story_id": (
-                r"""
-                (?:
-                    story_fbid|
-                    storyFbid
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:story_fbid|storyFbid)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
 
             "media_fbid": (
-                r"""
-                (?:
-                    media_fbid|
-                    mediaFbid
-                )
-                \s*[:=]\s*
-                ["']?(\d{5,30})["']?
-                """
+                r"(?:media_fbid|mediaFbid)"
+                r"\s*[:=]\s*"
+                r"""["']?(\d{5,30})"""
             ),
         }
 
         for field, pattern in patterns.items():
-            for match in re.finditer(
-                pattern,
-                text,
-                re.I | re.X,
-            ):
-                value = match.group(1)
 
-                if not valid_numeric_id(value):
+            try:
+                matches = re.finditer(
+                    pattern,
+                    text,
+                    re.I,
+                )
+
+            except re.error:
+                continue
+
+            for m in matches:
+
+                value = m.group(1)
+
+                if not numeric(value):
                     continue
 
-                context_start = max(
-                    0,
-                    match.start() - 300,
+                context = clean(
+                    text[
+                        max(
+                            0,
+                            m.start() - 500,
+                        ):
+                        min(
+                            len(text),
+                            m.end() + 500,
+                        )
+                    ]
                 )
 
-                context_end = min(
-                    len(text),
-                    match.end() + 300,
+                self.store.add(
+                    field,
+                    value,
+                    "html_js",
+                    {
+                        "group_id": 32,
+                        "page_id": 27,
+                        "profile_id": 24,
+                        "publisher_id": 24,
+                        "post_id": 23,
+                        "story_id": 22,
+                        "media_fbid": 22,
+                        "user_uid": 21,
+                        "owner_id": 19,
+                        "actor_id": 16,
+                        "entity_id": 16,
+                    }.get(field, 10),
+                    context=context,
+                    independent="html_js",
                 )
 
-                context = text[
-                    context_start:context_end
-                ]
-
-                self.evidence.add(
-                    field=field,
-                    value=value,
-                    source="html_js_key",
-                    score={
-                        "group_id": 24,
-                        "page_id": 18,
-                        "publisher_id": 16,
-                        "post_id": 17,
-                        "media_fbid": 17,
-                        "story_id": 17,
-                        "entity_id": 14,
-                        "profile_id": 12,
-                        "user_uid": 10,
-                        "actor_id": 9,
-                        "owner_id": 9,
-                    }.get(field, 8),
-                    context=clean_text(context[:500]),
-                    kind="html_js",
-                    independent_key="html_js_key",
-                )
-
-        # ----------------------------------------------------
         # pfbid
-        # ----------------------------------------------------
+        for token in PFID_RE.findall(text):
 
-        for token in PF_TOKEN_RE.findall(text):
-            self.evidence.add(
-                field="post_id",
-                value=token,
-                source="pfbid",
-                score=22,
-                direct=False,
-                kind="opaque",
-                independent_key="pfbid",
+            self.store.add(
+                "post_id",
+                token,
+                "pfbid",
+                30,
+                independent="pfbid",
             )
 
-        # ----------------------------------------------------
-        # Numeric values inside known URL patterns.
-        # ----------------------------------------------------
+    # ----------------------------------------------------------
+    # BASE64
+    # ----------------------------------------------------------
 
-        for match in re.finditer(
-            r"/(?:posts|permalink|videos|reels|photo)/(\d{5,30})",
-            text,
-            re.I,
-        ):
-            value = match.group(1)
+    def base64_ids(
+        self,
+        text: str,
+    ):
 
-            self.evidence.add(
-                field="entity_id",
-                value=value,
-                source="embedded_url",
-                score=10,
-                kind="url",
-                independent_key="embedded_url",
+        candidates = set(
+            re.findall(
+                r"(?<![A-Za-z0-9+/=_-])"
+                r"[A-Za-z0-9+/_=-]{20,180}"
+                r"(?![A-Za-z0-9+/=_-])",
+                text,
             )
-
-    # --------------------------------------------------------
-    # APP / DEEP LINKS
-    # --------------------------------------------------------
-
-    def extract_app_links(self, text: str) -> list[str]:
-        candidates = []
-
-        for match in re.finditer(
-            r"""(?is)
-            (?:
-                https?://
-                (?:www\.)?facebook\.com/
-                [^\s"'<>]+
-            )
-            """,
-            text,
-        ):
-            raw = clean_text(match.group(0))
-            normalized = normalize_url(raw)
-
-            if normalized:
-                candidates.append(normalized)
-
-        return list(
-            dict.fromkeys(candidates)
         )
 
-    # --------------------------------------------------------
-    # BASE64
-    # --------------------------------------------------------
+        for token in list(candidates)[
+            :1200
+        ]:
 
-    def inspect_base64_candidates(self, text: str) -> None:
-        """
-        Conservative Base64 decoder.
-
-        NEVER promotes an arbitrary decoded number to UID.
-        Only records decoded numeric values if they occur in
-        an identity-shaped payload.
-        """
-
-        tokens = set()
-
-        # Long alphanumeric tokens only.
-        for token in re.findall(
-            r"(?<![A-Za-z0-9+/=_-])"
-            r"[A-Za-z0-9+/_=-]{16,180}"
-            r"(?![A-Za-z0-9+/=_-])",
-            text,
-        ):
-            tokens.add(token)
-
-        for token in list(tokens)[:1500]:
-            decoded = self._decode_base64(token)
+            decoded = self.decode64(
+                token
+            )
 
             if not decoded:
                 continue
 
             low = decoded.lower()
 
-            identity_marker = any(
+            markers = (
+                "user_id",
+                "profile_id",
+                "actor_id",
+                "page_id",
+                "group_id",
+                "owner_id",
+                "publisher_id",
+                "entity_id",
+                "story_fbid",
+                "post_id",
+                "media_fbid",
+            )
+
+            if not any(
                 marker in low
-                for marker in (
-                    "actor_id",
-                    "profile_id",
-                    "user_id",
-                    "page_id",
-                    "group_id",
-                    "story_fbid",
-                    "media_fbid",
-                    "post_id",
-                    "entity_id",
-                    "owner_id",
-                )
-            )
-
-            if not identity_marker:
-                continue
-
-            for number in NUMERIC_RE.findall(decoded):
-                if not valid_numeric_id(number):
-                    continue
-
-                field = self._field_from_decoded_context(
-                    decoded
-                )
-
-                if not field:
-                    continue
-
-                self.evidence.add(
-                    field=field,
-                    value=number,
-                    source="base64_identity",
-                    score=8,
-                    context=clean_text(
-                        decoded[:700]
-                    ),
-                    kind="base64",
-                    independent_key="base64_identity",
-                )
-
-    @staticmethod
-    def _decode_base64(token: str) -> str:
-        variants = []
-
-        variants.append(token)
-
-        variants.append(
-            token.replace("-", "+")
-            .replace("_", "/")
-        )
-
-        for candidate in variants:
-            candidate = re.sub(
-                r"[^A-Za-z0-9+/=]",
-                "",
-                candidate,
-            )
-
-            padding = (
-                "="
-                * ((4 - len(candidate) % 4) % 4)
-            )
-
-            try:
-                raw = base64.b64decode(
-                    candidate + padding,
-                    validate=False,
-                )
-
-                if not raw:
-                    continue
-
-                decoded = raw.decode(
-                    "utf-8",
-                    errors="ignore",
-                )
-
-                if decoded:
-                    return decoded
-
-            except (
-                ValueError,
-                binascii.Error,
+                for marker in markers
             ):
                 continue
 
-        return ""
+            field = None
+
+            if "group_id" in low:
+                field = "group_id"
+
+            elif "page_id" in low:
+                field = "page_id"
+
+            elif "profile_id" in low:
+                field = "profile_id"
+
+            elif "user_id" in low:
+                field = "user_uid"
+
+            elif "publisher_id" in low:
+                field = "publisher_id"
+
+            elif "actor_id" in low:
+                field = "actor_id"
+
+            elif "owner_id" in low:
+                field = "owner_id"
+
+            elif "post_id" in low:
+                field = "post_id"
+
+            elif "media_fbid" in low:
+                field = "media_fbid"
+
+            if not field:
+                continue
+
+            for value in NUMERIC_ID_RE.findall(
+                decoded
+            ):
+
+                self.store.add(
+                    field,
+                    value,
+                    "base64",
+                    8,
+                    context=clean(
+                        decoded[:800]
+                    ),
+                    independent="base64",
+                )
 
     @staticmethod
-    def _field_from_decoded_context(
-        decoded: str,
-    ) -> Optional[str]:
+    def decode64(
+        token: str,
+    ) -> str:
 
-        low = decoded.lower()
-
-        mapping = (
-            ("group_id", "group_id"),
-            ("page_id", "page_id"),
-            ("profile_id", "profile_id"),
-            ("user_id", "user_uid"),
-            ("actor_id", "actor_id"),
-            ("publisher_id", "publisher_id"),
-            ("entity_id", "entity_id"),
-            ("story_fbid", "story_id"),
-            ("media_fbid", "media_fbid"),
-            ("post_id", "post_id"),
-            ("owner_id", "owner_id"),
+        token = token.replace(
+            "-",
+            "+",
+        ).replace(
+            "_",
+            "/",
         )
 
-        for marker, field in mapping:
-            if marker in low:
-                return field
+        token = re.sub(
+            r"[^A-Za-z0-9+/=]",
+            "",
+            token,
+        )
 
-        return None
+        token += "=" * (
+            (4 - len(token) % 4) % 4
+        )
+
+        try:
+
+            raw = base64.b64decode(
+                token,
+                validate=False,
+            )
+
+            return raw.decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+        except (
+            ValueError,
+            binascii.Error,
+        ):
+            return ""
 
 
-# ============================================================
-# CORRELATION ENGINE
-# ============================================================
+# ==============================================================
+# CORRELATION
+# ==============================================================
 
-class IdentityCorrelationEngine:
-    """
-    Precision-first entity resolver.
-
-    The central rule:
-
-        URL CONTEXT > EXPLICIT METADATA > CORRELATED IDS
-        > generic actor/profile candidates > random numbers
-    """
+class Correlator:
 
     def __init__(
         self,
-        *,
         url_type: str,
         url_info: dict[str, str],
-        evidence: EvidenceStore,
-    ) -> None:
+        store: EvidenceStore,
+    ):
 
         self.url_type = url_type
         self.url_info = url_info
-        self.evidence = evidence
+        self.store = store
 
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
     # MAIN
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
 
-    def resolve(
+    def build(
         self,
-        result: ResolveResult,
-    ) -> ResolveResult:
+        result: Result,
+    ) -> Result:
 
         result.url_type = self.url_type
 
-        # ----------------------------------------------------
-        # Structural IDs
-        # ----------------------------------------------------
+        self.structural(
+            result
+        )
 
-        self._apply_structural_ids(result)
+        self.entity_type(
+            result
+        )
 
-        # ----------------------------------------------------
-        # Context lock
-        # ----------------------------------------------------
+        # ======================================================
+        # GROUP LOCK
+        # ======================================================
+
+        if result.entity_type in GROUP_TYPES:
+
+            self.group(
+                result
+            )
+
+            # Absolute protection.
+            result.user_uid = None
+            result.page_id = None
+            result.publisher_id = (
+                None
+                if result.publisher_id
+                == result.group_id
+                else result.publisher_id
+            )
+
+        # ======================================================
+        # PAGE
+        # ======================================================
+
+        elif result.entity_type == "PAGE":
+
+            self.page(
+                result
+            )
+
+            result.user_uid = None
+
+        # ======================================================
+        # USER
+        # ======================================================
+
+        elif result.entity_type == "USER":
+
+            self.user(
+                result
+            )
+
+        # ======================================================
+        # GENERIC
+        # ======================================================
+
+        else:
+
+            self.generic(
+                result
+            )
+
+        self.objects(
+            result
+        )
+
+        self.publisher(
+            result
+        )
+
+        self.canonical(
+            result
+        )
+
+        self.finalize(
+            result
+        )
+
+        return result
+
+    # ----------------------------------------------------------
+    # STRUCTURAL
+    # ----------------------------------------------------------
+
+    def structural(
+        self,
+        result: Result,
+    ):
+
+        for key, value in self.url_info.items():
+
+            if key == "group_id":
+                result.group_id = value
+
+            elif key == "post_id":
+                result.post_id = value
+
+            elif key == "publisher":
+                result.publisher = value
+
+            elif key == "profile_id":
+                result.user_uid = value
+
+            elif key == "video_id":
+                result.video_id = value
+
+            elif key == "photo_id":
+                result.photo_id = value
+
+            elif key == "reel_id":
+                result.reel_id = value
+
+            elif key == "story_id":
+                result.story_id = value
+
+            elif key == "share_token":
+                result.share_token = value
+
+    # ----------------------------------------------------------
+    # ENTITY TYPE
+    # ----------------------------------------------------------
+
+    def entity_type(
+        self,
+        result: Result,
+    ):
 
         if self.url_type in GROUP_TYPES:
             result.entity_type = (
                 "GROUP_POST"
-                if self.url_type == "GROUP_POST"
+                if self.url_type
+                == "GROUP_POST"
                 else "GROUP"
             )
+            return
 
-        elif self.url_type in PAGE_TYPES:
+        if self.url_type in PAGE_TYPES:
             result.entity_type = "PAGE"
+            return
 
-        elif self.url_type in USER_TYPES:
+        if self.url_type in USER_TYPES:
             result.entity_type = "USER"
+            return
 
-        elif self.url_type in {
-            "STORY",
-            "REEL",
-            "VIDEO",
-            "PHOTO",
-            "POST",
-            "SHARE_POST",
-            "SHARE_VIDEO",
-            "SHARE_REEL",
-        }:
-            result.entity_type = self.url_type
-
-        else:
+        if self.url_type.startswith(
+            "AMBIGUOUS_"
+        ):
             result.entity_type = "UNKNOWN"
+            return
 
-        # ----------------------------------------------------
-        # Identity resolution
-        # ----------------------------------------------------
+        result.entity_type = self.url_type
 
-        if result.entity_type in GROUP_TYPES:
-            self._resolve_group(result)
-
-        elif result.entity_type == "PAGE":
-            self._resolve_page(result)
-
-        elif result.entity_type == "USER":
-            self._resolve_user(result)
-
-        else:
-            self._resolve_generic(result)
-
-        # ----------------------------------------------------
-        # Publisher
-        # ----------------------------------------------------
-
-        self._resolve_publisher(result)
-
-        # ----------------------------------------------------
-        # Object IDs
-        # ----------------------------------------------------
-
-        self._resolve_object_ids(result)
-
-        # ----------------------------------------------------
-        # Canonical
-        # ----------------------------------------------------
-
-        self._resolve_canonical(result)
-
-        # ----------------------------------------------------
-        # Final confidence
-        # ----------------------------------------------------
-
-        self._calculate_confidence(result)
-
-        return result
-
-    # --------------------------------------------------------
-    # STRUCTURAL
-    # --------------------------------------------------------
-
-    def _apply_structural_ids(
-        self,
-        result: ResolveResult,
-    ) -> None:
-
-        for field_name, value in self.url_info.items():
-
-            if field_name == "publisher_username":
-                result.publisher_username = value
-
-            elif field_name == "group_id":
-                if valid_numeric_id(value):
-                    result.group_id = value
-
-            elif field_name == "post_id":
-                if valid_opaque_id(value):
-                    result.post_id = value
-
-            elif field_name == "profile_id":
-                if valid_numeric_id(value):
-                    result.profile_id = value
-
-            elif field_name == "video_id":
-                if valid_opaque_id(value):
-                    result.video_id = value
-
-            elif field_name == "photo_id":
-                if valid_opaque_id(value):
-                    result.photo_id = value
-
-            elif field_name == "reel_id":
-                if valid_opaque_id(value):
-                    result.reel_id = value
-
-            elif field_name == "story_id":
-                if valid_opaque_id(value):
-                    result.story_id = value
-
-            elif field_name == "share_token":
-                result.share_token = value
-
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
     # GROUP
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
 
-    def _resolve_group(
+    def group(
         self,
-        result: ResolveResult,
-    ) -> None:
+        result: Result,
+    ):
 
-        # Structural group_id gets highest priority.
         if not result.group_id:
-            candidate = self._best(
+
+            candidate = self.best(
                 "group_id",
-                minimum=40,
+                55,
             )
 
             if candidate:
-                result.group_id = candidate.value
+                result.group_id = (
+                    candidate.value
+                )
 
-        # Post ID.
         if not result.post_id:
-            candidate = self._best(
+
+            candidate = self.best(
                 "post_id",
-                minimum=45,
+                45,
             )
 
             if candidate:
-                result.post_id = candidate.value
-
-        # CRITICAL LOCK:
-        # never derive user_uid/page_id from group context.
-        result.user_uid = None
-        result.page_id = None
-
-        # Actor/profile can still be internally useful, but
-        # intentionally NOT exposed unless explicitly needed.
-        result.actor_id = None
-        result.profile_id = None
+                result.post_id = (
+                    candidate.value
+                )
 
         if result.group_id:
-            result.status = "OBJECT_IDENTIFIED"
+            result.status = (
+                "OBJECT_IDENTIFIED"
+            )
 
         if (
-            self.url_type == "GROUP_POST"
+            result.group_id
             and result.post_id
-            and result.group_id
         ):
-            result.verification = "VERIFIED"
+            result.verification = (
+                "VERIFIED"
+            )
 
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
     # PAGE
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
 
-    def _resolve_page(
+    def page(
         self,
-        result: ResolveResult,
-    ) -> None:
+        result: Result,
+    ):
 
-        # Direct page_id evidence.
-        candidate = self._best(
+        candidate = self.best(
             "page_id",
-            minimum=42,
+            48,
         )
 
         if candidate:
-            result.page_id = candidate.value
 
-        # Publisher ID can become page_id only with
-        # page-specific corroboration.
+            result.page_id = (
+                candidate.value
+            )
+
         if not result.page_id:
-            publisher = self._best(
+
+            candidate = self.best(
                 "publisher_id",
-                minimum=55,
+                65,
             )
 
-            if publisher and (
-                publisher.independent_sources >= 2
-                or publisher.evidence_count >= 3
-            ):
-                result.page_id = publisher.value
+            if candidate:
 
-        # Never use generic actor/profile as page UID unless
-        # page context has independent confirmation.
-        if not result.page_id:
-            actor = self._best(
-                "actor_id",
-                minimum=75,
-            )
-
-            if actor and self._has_page_correlation(
-                actor.value
-            ):
-                result.page_id = actor.value
-
-        result.user_uid = None
+                # Must have page evidence.
+                if self.page_correlated(
+                    candidate.value
+                ):
+                    result.page_id = (
+                        candidate.value
+                    )
 
         if result.page_id:
-            result.status = "OBJECT_IDENTIFIED"
-            result.verification = "VERIFIED"
 
-    def _has_page_correlation(
-        self,
-        value: str,
-    ) -> bool:
+            result.status = (
+                "OBJECT_IDENTIFIED"
+            )
 
-        checks = (
-            self.evidence.for_value(
-                "page_id",
-                value,
-            ),
-            self.evidence.for_value(
-                "publisher_id",
-                value,
-            ),
-        )
+            result.verification = (
+                "VERIFIED"
+            )
 
-        sources = set()
-
-        for group in checks:
-            for item in group:
-                sources.add(
-                    item.independent_key
-                    or item.source
-                )
-
-        return len(sources) >= 2
-
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
     # USER
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
 
-    def _resolve_user(
+    def user(
         self,
-        result: ResolveResult,
-    ) -> None:
+        result: Result,
+    ):
 
-        candidates = []
-
-        for field in (
+        fields = (
             "user_uid",
             "profile_id",
             "publisher_id",
             "owner_id",
             "actor_id",
-        ):
-            for candidate in self.evidence.candidates(
-                field
-            ):
-                candidates.append(
-                    (field, candidate)
-                )
-
-        candidates.sort(
-            key=lambda x: x[1].score,
-            reverse=True,
         )
 
-        # Strict candidate acceptance.
-        for field, candidate in candidates:
-            if candidate.score < 65:
-                continue
+        ranked = []
 
-            if candidate.independent_sources < 2:
-                # A profile_id from explicit profile URL can
-                # still be accepted.
-                if not (
-                    field == "profile_id"
-                    and self.url_type
-                    in {
-                        "PROFILE",
-                        "PROFILE_CANDIDATE",
-                    }
+        for field in fields:
+
+            for candidate in self.store.candidates(
+                field
+            ):
+
+                if self.conflicts(
+                    candidate.value
                 ):
                     continue
 
-            if self._is_conflicted_user_candidate(
+                ranked.append(
+                    (
+                        candidate.score,
+                        field,
+                        candidate,
+                    )
+                )
+
+        ranked.sort(
+            reverse=True,
+            key=lambda x: x[0],
+        )
+
+        for score, field, candidate in ranked:
+
+            if score < 60:
+                continue
+
+            # Explicit profile_id from profile URL
+            # is already very strong.
+            if (
+                field == "profile_id"
+                and self.url_type
+                == "USER"
+            ):
+                result.user_uid = (
+                    candidate.value
+                )
+                break
+
+            # Normal publisher UID needs
+            # independent confirmation.
+            if candidate.score >= 70:
+
+                if (
+                    candidate.independent_sources
+                    >= 2
+                ):
+                    result.user_uid = (
+                        candidate.value
+                    )
+                    break
+
+        if result.user_uid:
+
+            result.status = (
+                "OBJECT_IDENTIFIED"
+            )
+
+            result.verification = (
+                "VERIFIED"
+            )
+
+    # ----------------------------------------------------------
+    # GENERIC
+    # ----------------------------------------------------------
+
+    def generic(
+        self,
+        result: Result,
+    ):
+
+        # Try publisher first.
+        for field in (
+            "user_uid",
+            "profile_id",
+            "publisher_id",
+            "owner_id",
+        ):
+
+            candidate = self.best(
+                field,
+                65,
+            )
+
+            if not candidate:
+                continue
+
+            if self.conflicts(
                 candidate.value
             ):
                 continue
 
-            result.user_uid = candidate.value
-            break
+            if (
+                candidate.independent_sources
+                >= 2
+            ):
+                result.user_uid = (
+                    candidate.value
+                )
+                break
 
         if result.user_uid:
-            result.status = "OBJECT_IDENTIFIED"
-            result.verification = "VERIFIED"
+            result.status = (
+                "OBJECT_IDENTIFIED"
+            )
 
-    def _is_conflicted_user_candidate(
+    # ----------------------------------------------------------
+    # OBJECTS
+    # ----------------------------------------------------------
+
+    def objects(
+        self,
+        result: Result,
+    ):
+
+        mappings = (
+            ("post_id", "post_id"),
+            ("reel_id", "reel_id"),
+            ("video_id", "video_id"),
+            ("photo_id", "photo_id"),
+            ("story_id", "story_id"),
+            ("media_fbid", "media_fbid"),
+        )
+
+        for target, field_name in mappings:
+
+            if getattr(
+                result,
+                target,
+            ):
+                continue
+
+            candidate = self.best(
+                field_name,
+                40,
+            )
+
+            if candidate:
+
+                setattr(
+                    result,
+                    target,
+                    candidate.value,
+                )
+
+    # ----------------------------------------------------------
+    # PUBLISHER
+    # ----------------------------------------------------------
+
+    def publisher(
+        self,
+        result: Result,
+    ):
+
+        if result.publisher:
+            return
+
+        candidate = self.best(
+            "publisher",
+            15,
+        )
+
+        if candidate:
+            result.publisher = (
+                candidate.value
+            )
+
+    # ----------------------------------------------------------
+    # CANONICAL
+    # ----------------------------------------------------------
+
+    def canonical(
+        self,
+        result: Result,
+    ):
+
+        candidate = self.best(
+            "canonical_url",
+            30,
+        )
+
+        if candidate:
+            result.canonical_url = (
+                candidate.value
+            )
+
+    # ----------------------------------------------------------
+    # PAGE CORRELATION
+    # ----------------------------------------------------------
+
+    def page_correlated(
         self,
         value: str,
     ) -> bool:
 
-        # A value appearing strongly as group/page identity
-        # cannot simultaneously become USER_UID.
-        if self.evidence.for_value(
+        sources = set()
+
+        for field in (
+            "page_id",
+            "publisher_id",
+            "actor_id",
+            "owner_id",
+        ):
+
+            for evidence in (
+                self.store.items
+            ):
+
+                if (
+                    evidence.field
+                    == field
+                    and evidence.value
+                    == value
+                ):
+
+                    sources.add(
+                        evidence.independent
+                        or evidence.source
+                    )
+
+        return len(sources) >= 2
+
+    # ----------------------------------------------------------
+    # CONFLICT
+    # ----------------------------------------------------------
+
+    def conflicts(
+        self,
+        value: str,
+    ) -> bool:
+
+        # Group ID always wins its own namespace.
+        if self.store.has(
             "group_id",
             value,
         ):
             return True
 
-        page_evidence = self.evidence.for_value(
-            "page_id",
-            value,
+        # A strongly established Page ID should
+        # not become a User UID.
+        page_candidates = (
+            self.store.candidates(
+                "page_id"
+            )
         )
 
-        if page_evidence:
-            return True
+        for candidate in page_candidates:
+
+            if (
+                candidate.value == value
+                and candidate.score >= 65
+            ):
+                return True
 
         return False
 
-    # --------------------------------------------------------
-    # GENERIC
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
+    # BEST
+    # ----------------------------------------------------------
 
-    def _resolve_generic(
-        self,
-        result: ResolveResult,
-    ) -> None:
-
-        # Group URL can NEVER fall here.
-        if self.url_type in GROUP_TYPES:
-            return
-
-        # Object IDs.
-        if not result.post_id:
-            candidate = self._best(
-                "post_id",
-                minimum=40,
-            )
-
-            if candidate:
-                result.post_id = candidate.value
-
-        # Do not promote actor/profile automatically.
-        # Generic URLs need stronger evidence.
-        user = self._best(
-            "user_uid",
-            minimum=75,
-        )
-
-        if (
-            user
-            and user.independent_sources >= 2
-            and not self._is_conflicted_user_candidate(
-                user.value
-            )
-        ):
-            result.user_uid = user.value
-
-        page = self._best(
-            "page_id",
-            minimum=60,
-        )
-
-        if page:
-            result.page_id = page.value
-
-    # --------------------------------------------------------
-    # PUBLISHER
-    # --------------------------------------------------------
-
-    def _resolve_publisher(
-        self,
-        result: ResolveResult,
-    ) -> None:
-
-        if not result.publisher_id:
-
-            if result.entity_type == "GROUP_POST":
-                # Never use group_id as publisher_id.
-                candidate = self._best(
-                    "publisher_id",
-                    minimum=70,
-                )
-
-            elif result.entity_type == "PAGE":
-                candidate = self._best(
-                    "page_id",
-                    minimum=50,
-                )
-
-            elif result.entity_type == "USER":
-                candidate = self._best(
-                    "user_uid",
-                    minimum=65,
-                )
-
-            else:
-                candidate = None
-
-            if candidate:
-                result.publisher_id = candidate.value
-
-    # --------------------------------------------------------
-    # OBJECT IDS
-    # --------------------------------------------------------
-
-    def _resolve_object_ids(
-        self,
-        result: ResolveResult,
-    ) -> None:
-
-        if not result.post_id:
-            candidate = self._best(
-                "post_id",
-                minimum=40,
-            )
-
-            if candidate:
-                result.post_id = candidate.value
-
-        if not result.media_fbid:
-            candidate = self._best(
-                "media_fbid",
-                minimum=45,
-            )
-
-            if candidate:
-                result.media_fbid = candidate.value
-
-        if not result.video_id:
-            candidate = self._best(
-                "video_id",
-                minimum=40,
-            )
-
-            if candidate:
-                result.video_id = candidate.value
-
-        if not result.photo_id:
-            candidate = self._best(
-                "photo_id",
-                minimum=40,
-            )
-
-            if candidate:
-                result.photo_id = candidate.value
-
-        if not result.reel_id:
-            candidate = self._best(
-                "reel_id",
-                minimum=40,
-            )
-
-            if candidate:
-                result.reel_id = candidate.value
-
-        if not result.story_id:
-            candidate = self._best(
-                "story_id",
-                minimum=40,
-            )
-
-            if candidate:
-                result.story_id = candidate.value
-
-        # entity_id is deliberately only used when no more
-        # specific object ID exists.
-        if not result.entity_id:
-            candidate = self._best(
-                "entity_id",
-                minimum=65,
-            )
-
-            if candidate:
-                result.entity_id = candidate.value
-
-    # --------------------------------------------------------
-    # CANONICAL
-    # --------------------------------------------------------
-
-    def _resolve_canonical(
-        self,
-        result: ResolveResult,
-    ) -> None:
-
-        candidates = self.evidence.candidates(
-            "canonical_url"
-        )
-
-        if candidates:
-            result.canonical_url = (
-                candidates[0].value
-            )
-
-    # --------------------------------------------------------
-    # BEST CANDIDATE
-    # --------------------------------------------------------
-
-    def _best(
+    def best(
         self,
         field: str,
-        *,
-        minimum: float = 0,
+        minimum: float,
     ) -> Optional[Candidate]:
 
-        candidates = self.evidence.candidates(
+        candidates = self.store.candidates(
             field
         )
 
         for candidate in candidates:
+
             if candidate.score >= minimum:
                 return candidate
 
         return None
 
-    # --------------------------------------------------------
-    # CONFIDENCE
-    # --------------------------------------------------------
+    # ----------------------------------------------------------
+    # FINAL
+    # ----------------------------------------------------------
 
-    def _calculate_confidence(
+    def finalize(
         self,
-        result: ResolveResult,
-    ) -> None:
+        result: Result,
+    ):
+
+        # ------------------------------------------------------
+        # Hard namespace protection.
+        # ------------------------------------------------------
+
+        if result.entity_type in GROUP_TYPES:
+
+            result.user_uid = None
+            result.page_id = None
+
+        if result.entity_type == "PAGE":
+
+            result.user_uid = None
+
+        # ------------------------------------------------------
+        # Confidence.
+        # ------------------------------------------------------
 
         score = 0
 
-        # ----------------------------------------------------
-        # Structural certainty
-        # ----------------------------------------------------
+        if result.group_id:
+            score += 35
 
-        if self.url_type in GROUP_TYPES:
+        if result.page_id:
             score += 45
 
-            if result.group_id:
-                score += 25
+        if result.user_uid:
+            score += 45
 
-            if result.post_id:
-                score += 15
+        if result.post_id:
+            score += 15
 
-        elif self.url_type in PAGE_TYPES:
-            score += 35
+        if result.publisher:
+            score += 5
 
-            if result.page_id:
-                score += 40
-
-            if result.post_id:
-                score += 10
-
-        elif self.url_type in USER_TYPES:
-            score += 35
-
-            if result.user_uid:
-                score += 40
-
-        else:
-            if result.post_id:
-                score += 20
-
-            if result.user_uid:
-                score += 35
-
-            if result.page_id:
-                score += 35
-
-        # ----------------------------------------------------
-        # Evidence quality
-        # ----------------------------------------------------
-
-        important_values = (
-            result.user_uid,
-            result.page_id,
-            result.group_id,
-            result.post_id,
-        )
-
-        for value in important_values:
-            if not value:
-                continue
-
-            relevant = [
-                e
-                for e in self.evidence.items
-                if e.value == value
-            ]
-
-            independent = len({
-                e.independent_key
-                for e in relevant
-            })
-
-            if independent >= 2:
-                score += 8
-
-            if independent >= 3:
-                score += 8
-
-        # ----------------------------------------------------
-        # Verification
-        # ----------------------------------------------------
+        if result.canonical_url:
+            score += 5
 
         if result.verification == "VERIFIED":
-            score += 8
+            score += 10
 
         result.confidence = min(
             99,
-            max(0, score),
+            score,
         )
 
-        result.confidence_label = (
-            confidence_label(
-                result.confidence
-            )
-        )
+        if result.confidence >= 95:
+            label = "VERY HIGH"
+        elif result.confidence >= 85:
+            label = "HIGH"
+        elif result.confidence >= 70:
+            label = "GOOD"
+        elif result.confidence >= 50:
+            label = "MEDIUM"
+        else:
+            label = "LOW"
+
+        # Stored dynamically for formatter.
+        result._confidence_label = label
 
         if (
             result.status == "FAILED"
             and (
-                result.group_id
+                result.user_uid
                 or result.page_id
-                or result.user_uid
+                or result.group_id
                 or result.post_id
-                or result.reel_id
                 or result.video_id
+                or result.reel_id
                 or result.photo_id
                 or result.story_id
             )
         ):
-            result.status = "OBJECT_IDENTIFIED"
+            result.status = (
+                "OBJECT_IDENTIFIED"
+            )
 
 
-# ============================================================
-# MAIN RESOLVER
-# ============================================================
+# ==============================================================
+# RESOLVER
+# ==============================================================
 
 class FacebookResolver:
+
     def __init__(
         self,
-        *,
-        max_concurrent: int = MAX_CONCURRENT,
-    ) -> None:
+        concurrency: int = MAX_CONCURRENT,
+    ):
 
-        self.fetcher = HTTPFetcher(
-            concurrency=max_concurrent
+        self.http = HTTP(
+            concurrency
         )
 
     async def resolve(
         self,
         url: str,
-    ) -> ResolveResult:
+    ) -> Result:
 
-        started = time.perf_counter()
-
-        normalized = normalize_url(url)
-
-        result = ResolveResult(
-            input_url=normalized or url
+        original = normalize(
+            unwrap(url)
         )
 
-        if not normalized:
-            result.status = "FAILED"
+        result = Result(
+            input_url=original or url
+        )
+
+        if not original:
+
             result.error = (
-                "URL không phải Facebook public URL"
+                "URL Facebook không hợp lệ"
             )
+
             return result
 
-        normalized = unwrap_redirect(normalized)
-
         url_type, url_info = (
-            FacebookURLClassifier.classify(
-                normalized
+            URLParser.parse(
+                original
             )
         )
 
-        result.url_type = url_type
+        store = EvidenceStore()
 
-        evidence = EvidenceStore()
+        # ------------------------------------------------------
+        # Structural evidence
+        # ------------------------------------------------------
 
-        # Structural evidence.
-        for field_name, value in url_info.items():
+        for field_name, value in (
+            url_info.items()
+        ):
 
-            if field_name == "group_id":
-                evidence.add(
-                    "group_id",
-                    value,
-                    "url_structure",
-                    45,
-                    direct=True,
-                    kind="url",
-                    independent_key="url_structure",
-                )
-
-            elif field_name == "profile_id":
-                evidence.add(
-                    "profile_id",
-                    value,
-                    "url_structure",
-                    42,
-                    direct=True,
-                    kind="url",
-                    independent_key="url_structure",
-                )
-
-            elif field_name == "post_id":
-                evidence.add(
-                    "post_id",
-                    value,
-                    "url_structure",
-                    38,
-                    direct=True,
-                    kind="url",
-                    independent_key="url_structure",
-                )
-
-            elif field_name == "publisher_username":
-                evidence.add(
-                    "publisher_username",
-                    value,
-                    "url_structure",
-                    20,
-                    direct=True,
-                    kind="url",
-                    independent_key="url_structure",
-                )
-
-            elif field_name == "share_token":
-                evidence.add(
-                    "share_token",
-                    value,
-                    "url_structure",
-                    38,
-                    direct=True,
-                    kind="url",
-                    independent_key="url_structure",
-                )
-
-        result.resolved_url = normalized
-
-        # ----------------------------------------------------
-        # HTTP crawl
-        # ----------------------------------------------------
-
-        snapshots: list[PageSnapshot] = []
-
-        if httpx is not None:
-
-            headers = {
-                "authority": "www.facebook.com",
-	            "accept": (
-	                "text/html,"
-	                "application/xhtml+xml,"
-	                "application/xml;q=0.9,"
-	                "image/avif,"
-	                "image/webp,"
-	                "image/apng,"
-	                "*/*;q=0.8"
-	            ),
-	            "accept-language": (
-	                "vi-VN,vi;q=0.9,"
-	                "en-US;q=0.8,en;q=0.7"
-	            ),
-	            "cache-control": "no-cache",
-	            "pragma": "no-cache",
-	            "sec-fetch-dest": "document",
-	            "sec-fetch-mode": "navigate",
-	            "sec-fetch-site": "none",
-	            "upgrade-insecure-requests": "1",
-	            "user-agent": (
-	                "Mozilla/5.0 "
-	                "(Windows NT 10.0; Win64; x64) "
-	                "AppleWebKit/537.36 "
-	                "(KHTML, like Gecko) "
-	                "Chrome/139.0.0.0 "
-	                "Safari/537.36"
-	            ),
+            scores = {
+                "group_id": 50,
+                "post_id": 40,
+                "profile_id": 50,
+                "publisher": 25,
+                "video_id": 35,
+                "photo_id": 35,
+                "reel_id": 35,
+                "story_id": 35,
+                "share_token": 30,
             }
 
-            try:
-                async with httpx.AsyncClient(
-                    timeout=self.fetcher.timeout,
-                    headers=headers,
-                    limits=httpx.Limits(
-                        max_connections=10,
-                        max_keepalive_connections=5,
-                    ),
-                    http2=False,
-                ) as client:
+            store.add(
+                field_name,
+                value,
+                "url_structure",
+                scores.get(
+                    field_name,
+                    20,
+                ),
+                direct=True,
+                independent="url_structure",
+            )
 
-                    first = await self.fetcher.fetch(
-                        client,
-                        normalized,
+        # Publisher isn't originally a dedicated
+        # extractor field in all paths.
+        if "publisher" in url_info:
+            store.add(
+                "publisher",
+                url_info["publisher"],
+                "url_structure",
+                25,
+                direct=True,
+                independent="url_structure",
+            )
+
+        result.resolved_url = original
+
+        # ------------------------------------------------------
+        # HTTP crawl
+        # ------------------------------------------------------
+
+        snapshots: list[Snapshot] = []
+
+        try:
+
+            async with httpx.AsyncClient(
+                timeout=self.http.timeout,
+                follow_redirects=True,
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=5,
+                ),
+                http2=False,
+            ) as client:
+
+                first = await self.http.get(
+                    client,
+                    original,
+                )
+
+                if first:
+                    snapshots.append(first)
+
+                    result.resolved_url = (
+                        normalize(
+                            first.final_url
+                        )
+                        or first.final_url
                     )
 
-                    if first:
-                        snapshots.append(first)
+                # ------------------------------------------------
+                # First-pass extraction.
+                # ------------------------------------------------
 
-                        result.resolved_url = (
-                            normalize_url(
-                                first.final_url
+                discovered = []
+
+                for snap in snapshots:
+
+                    extractor = Extractor(
+                        store
+                    )
+
+                    meta = extractor.meta(
+                        snap.text
+                    )
+
+                    discovered.extend(
+                        extractor.canonical(
+                            snap.text
+                        )
+                    )
+
+                    extractor.jsonld(
+                        snap.text
+                    )
+
+                    extractor.html_ids(
+                        snap.text
+                    )
+
+                    extractor.base64_ids(
+                        snap.text
+                    )
+
+                    # OG URL.
+                    og = meta.get(
+                        "og:url"
+                    )
+
+                    if og:
+
+                        og = normalize(
+                            unquote(og)
+                        )
+
+                        if og:
+                            store.add(
+                                "canonical_url",
+                                og,
+                                "og:url",
+                                35,
+                                direct=True,
+                                independent="og:url",
                             )
-                            or first.final_url
-                        )
 
-                    # ------------------------------------------------
-                    # Canonical discovery.
-                    # ------------------------------------------------
-
-                    discovered = []
-
-                    for snapshot in snapshots:
-                        extractor = FacebookExtractor(
-                            url_type=url_type,
-                            evidence=evidence,
-                        )
-
-                        canonical = (
-                            extractor.extract_links(
-                                snapshot.text
+                            discovered.append(
+                                og
                             )
-                        )
 
-                        extractor.extract_meta(
-                            snapshot.text
-                        )
+                    # Search Facebook URLs in page.
+                    for found in extract_urls(
+                        snap.text
+                    ):
 
-                        extractor.extract_title(
-                            snapshot.text
-                        )
-
-                        extractor.extract_jsonld(
-                            snapshot.text
-                        )
-
-                        extractor.extract_html_js(
-                            snapshot.text
-                        )
-
-                        extractor.inspect_base64_candidates(
-                            snapshot.text
-                        )
-
-                        app_links = (
-                            extractor.extract_app_links(
-                                snapshot.text
+                        if found != original:
+                            discovered.append(
+                                found
                             )
+
+                # ------------------------------------------------
+                # Canonical / publisher candidates.
+                # ------------------------------------------------
+
+                targets = []
+
+                for candidate in discovered:
+
+                    candidate = normalize(
+                        candidate
+                    )
+
+                    if not candidate:
+                        continue
+
+                    if candidate == original:
+                        continue
+
+                    if candidate in targets:
+                        continue
+
+                    targets.append(
+                        candidate
+                    )
+
+                # First crawl canonical/object URLs.
+                targets = targets[
+                    :MAX_CRAWL
+                ]
+
+                if targets:
+
+                    fetched = await asyncio.gather(
+                        *[
+                            self.http.get(
+                                client,
+                                target,
+                            )
+                            for target in targets
+                        ],
+                        return_exceptions=True,
+                    )
+
+                    for item in fetched:
+
+                        if isinstance(
+                            item,
+                            Snapshot,
+                        ):
+                            snapshots.append(
+                                item
+                            )
+
+                # ------------------------------------------------
+                # SECONDARY publisher discovery.
+                #
+                # This is the important part for:
+                #
+                # /username/posts/pfbid...
+                #
+                # We search the returned HTML for a
+                # profile/page URL and crawl it.
+                # ------------------------------------------------
+
+                profile_targets = []
+
+                for snap in snapshots:
+
+                    found_urls = (
+                        extract_urls(
+                            snap.text
                         )
+                    )
 
-                        discovered.extend(canonical)
-                        discovered.extend(app_links)
+                    for candidate in found_urls:
 
-                    # ------------------------------------------------
-                    # Fetch canonical first.
-                    # ------------------------------------------------
-
-                    crawl_targets = []
-
-                    for candidate in discovered:
-                        candidate = normalize_url(
-                            candidate
-                        )
-
-                        if not candidate:
-                            continue
-
-                        if candidate == normalized:
-                            continue
-
-                        if candidate == result.resolved_url:
-                            continue
-
-                        if candidate not in crawl_targets:
-                            crawl_targets.append(
+                        ctype, cinfo = (
+                            URLParser.parse(
                                 candidate
                             )
-
-                    # Keep crawl bounded.
-                    crawl_targets = crawl_targets[
-                        :MAX_DISCOVERED_LINKS
-                    ]
-
-                    if crawl_targets:
-
-                        fetched = await asyncio.gather(
-                            *[
-                                self.fetcher.fetch(
-                                    client,
-                                    candidate,
-                                )
-                                for candidate in crawl_targets
-                            ],
-                            return_exceptions=True,
                         )
 
-                        for item in fetched:
-                            if isinstance(
-                                item,
-                                PageSnapshot,
+                        if ctype in {
+                            "PROFILE_CANDIDATE",
+                            "PROFILE",
+                            "USER",
+                            "PAGE",
+                        }:
+
+                            if candidate not in (
+                                profile_targets
                             ):
-                                snapshots.append(item)
+                                profile_targets.append(
+                                    candidate
+                                )
 
-            except Exception as exc:
-                LOGGER.debug(
-                    "Resolver HTTP error: %r",
-                    exc,
+                profile_targets = (
+                    profile_targets[
+                        :MAX_PROFILE_CRAWL
+                    ]
                 )
 
-        # ----------------------------------------------------
-        # Parse all snapshots.
-        # ----------------------------------------------------
+                if profile_targets:
 
-        for snapshot in snapshots:
-
-            extractor = FacebookExtractor(
-                url_type=url_type,
-                evidence=evidence,
-            )
-
-            if snapshot.final_url:
-                final = normalize_url(
-                    snapshot.final_url
-                )
-
-                if final:
-                    evidence.add(
-                        "canonical_url",
-                        final,
-                        "redirect_final",
-                        25,
-                        direct=True,
-                        kind="url",
-                        independent_key="redirect_final",
+                    fetched = await asyncio.gather(
+                        *[
+                            self.http.get(
+                                client,
+                                target,
+                            )
+                            for target in profile_targets
+                        ],
+                        return_exceptions=True,
                     )
 
-            meta = extractor.extract_meta(
-                snapshot.text
+                    for item in fetched:
+
+                        if isinstance(
+                            item,
+                            Snapshot,
+                        ):
+                            snapshots.append(
+                                item
+                            )
+
+        except Exception as exc:
+
+            LOGGER.debug(
+                "Resolver error: %r",
+                exc,
             )
 
-            extractor.extract_links(
-                snapshot.text
+        # ------------------------------------------------------
+        # Parse ALL snapshots again.
+        # ------------------------------------------------------
+
+        for snap in snapshots:
+
+            extractor = Extractor(
+                store
             )
 
-            extractor.extract_title(
-                snapshot.text
+            meta = extractor.meta(
+                snap.text
             )
 
-            extractor.extract_jsonld(
-                snapshot.text
+            extractor.canonical(
+                snap.text
             )
 
-            extractor.extract_html_js(
-                snapshot.text
+            extractor.jsonld(
+                snap.text
             )
 
-            extractor.inspect_base64_candidates(
-                snapshot.text
+            extractor.html_ids(
+                snap.text
             )
 
-            # OG URL gets special correlation value.
-            og_url = meta.get("og:url")
+            extractor.base64_ids(
+                snap.text
+            )
 
-            if og_url:
-                og_url = normalize_url(
-                    unquote(og_url)
+            # --------------------------------------------------
+            # Profile URL / username correlations.
+            # --------------------------------------------------
+
+            for found in extract_urls(
+                snap.text
+            ):
+
+                ctype, cinfo = (
+                    URLParser.parse(
+                        found
+                    )
                 )
 
-                if og_url:
-                    evidence.add(
-                        "canonical_url",
-                        og_url,
-                        "og:url",
-                        30,
-                        direct=True,
-                        kind="metadata",
-                        independent_key="og:url",
+                publisher = cinfo.get(
+                    "publisher"
+                )
+
+                if publisher and USERNAME_RE.match(
+                    publisher
+                ):
+
+                    store.add(
+                        "publisher",
+                        publisher,
+                        "embedded_profile_url",
+                        12,
+                        independent=(
+                            "embedded_profile_url"
+                        ),
                     )
 
-        # ----------------------------------------------------
-        # Canonical URL classification can refine ambiguous
-        # user/page posts.
-        # ----------------------------------------------------
+                profile_id = cinfo.get(
+                    "profile_id"
+                )
+
+                if numeric(profile_id):
+
+                    store.add(
+                        "profile_id",
+                        profile_id,
+                        "embedded_profile_url",
+                        35,
+                        direct=True,
+                        independent=(
+                            "embedded_profile_url"
+                        ),
+                    )
+
+        # ------------------------------------------------------
+        # Determine canonical.
+        # ------------------------------------------------------
 
         canonical_candidates = (
-            evidence.candidates(
+            store.candidates(
                 "canonical_url"
             )
         )
 
-        refined_type = url_type
-        refined_info = dict(url_info)
+        # Refine ambiguous URL based on canonical.
+        final_type = url_type
+        final_info = dict(
+            url_info
+        )
 
-        for candidate in canonical_candidates[:3]:
-            candidate_url = candidate.value
+        for candidate in canonical_candidates:
 
             ctype, cinfo = (
-                FacebookURLClassifier.classify(
-                    candidate_url
+                URLParser.parse(
+                    candidate.value
                 )
             )
 
             if ctype in GROUP_TYPES:
-                refined_type = ctype
-                refined_info.update(cinfo)
+
+                final_type = ctype
+                final_info.update(
+                    cinfo
+                )
                 break
 
             if ctype in PAGE_TYPES:
-                refined_type = ctype
-                refined_info.update(cinfo)
+
+                final_type = ctype
+                final_info.update(
+                    cinfo
+                )
                 break
 
             if (
                 ctype in USER_TYPES
-                and refined_type
-                in {
-                    "AMBIGUOUS_POST",
-                    "AMBIGUOUS_VIDEO",
-                    "AMBIGUOUS_PHOTO",
-                    "AMBIGUOUS_REEL",
-                }
+                and final_type.startswith(
+                    "AMBIGUOUS_"
+                )
             ):
-                refined_type = ctype
-                refined_info.update(cinfo)
 
-        # ----------------------------------------------------
-        # Correlate
-        # ----------------------------------------------------
+                final_type = ctype
+                final_info.update(
+                    cinfo
+                )
 
-        engine = IdentityCorrelationEngine(
-            url_type=refined_type,
-            url_info=refined_info,
-            evidence=evidence,
+                break
+
+        # ------------------------------------------------------
+        # Correlation.
+        # ------------------------------------------------------
+
+        result = Correlator(
+            final_type,
+            final_info,
+            store,
+        ).build(
+            result
         )
 
-        result = engine.resolve(result)
+        # ------------------------------------------------------
+        # Evidence retained internally.
+        # ------------------------------------------------------
 
-        # Keep evidence internally, but output formatter decides
-        # what is visible.
         result.evidence = sorted(
-            evidence.items,
-            key=lambda x: x.score,
+            store.items,
+            key=lambda e: e.score,
             reverse=True,
         )
 
-        if not result.status:
-            result.status = "FAILED"
+        # ------------------------------------------------------
+        # Final error.
+        # ------------------------------------------------------
 
-        # ----------------------------------------------------
-        # Hard safety rules
-        # ----------------------------------------------------
-
-        if result.entity_type in GROUP_TYPES:
-            result.user_uid = None
-            result.page_id = None
-
-        if (
-            result.entity_type == "PAGE"
-            and result.page_id
-        ):
-            result.user_uid = None
-
-        # Never expose random actor/profile values as UID.
-        if (
-            result.user_uid
-            and result.group_id
-            and result.entity_type in GROUP_TYPES
-        ):
-            result.user_uid = None
-
-        elapsed = int(
-            (time.perf_counter() - started) * 1000
-        )
-
-        # Internal warning only.
         if (
             result.status == "FAILED"
             and not result.error
         ):
             result.error = (
-                "Không tìm thấy bằng chứng public đủ mạnh"
+                "Không tìm thấy ID public đủ mạnh"
             )
-
-        LOGGER.debug(
-            "Resolved %s in %sms: %s",
-            normalized,
-            elapsed,
-            result.status,
-        )
 
         return result
 
     async def resolve_many(
         self,
         urls: Iterable[str],
-    ) -> list[ResolveResult]:
+    ) -> list[Result]:
 
         unique = []
 
         for url in urls:
-            normalized = normalize_url(url)
 
-            if normalized and normalized not in unique:
-                unique.append(normalized)
+            normalized = normalize(
+                unwrap(url)
+            )
+
+            if (
+                normalized
+                and normalized not in unique
+            ):
+                unique.append(
+                    normalized
+                )
 
         if not unique:
             return []
@@ -3022,9 +2820,9 @@ class FacebookResolver:
         )
 
 
-# ============================================================
-# TELEGRAM FORMATTER
-# ============================================================
+# ==============================================================
+# OUTPUT
+# ==============================================================
 
 def esc(value: Any) -> str:
     return html.escape(
@@ -3033,177 +2831,37 @@ def esc(value: Any) -> str:
     )
 
 
-def format_result(
-    result: ResolveResult,
-    index: int,
+def icon(entity: str) -> str:
+
+    if entity in GROUP_TYPES:
+        return "👥"
+
+    if entity == "PAGE":
+        return "📄"
+
+    if entity == "USER":
+        return "👤"
+
+    if "VIDEO" in entity:
+        return "🎬"
+
+    if "REEL" in entity:
+        return "🎞"
+
+    if "PHOTO" in entity:
+        return "📷"
+
+    if "STORY" in entity:
+        return "📖"
+
+    return "📝"
+
+
+def pretty_type(
+    entity: str,
 ) -> str:
 
-    lines = [
-        f"<b>{index}.</b> "
-        f"{type_icon(result.entity_type)} "
-        f"<b>{esc(display_type(result.entity_type))}</b>"
-    ]
-
-    # --------------------------------------------------------
-    # Status
-    # --------------------------------------------------------
-
-    if result.status:
-        lines.append(
-            f"📊 <b>STATUS:</b> "
-            f"{esc(result.status)}"
-        )
-
-    # --------------------------------------------------------
-    # USER
-    # --------------------------------------------------------
-
-    if result.user_uid:
-        lines.append(
-            f"🆔 <b>USER UID:</b> "
-            f"<code>{esc(result.user_uid)}</code>"
-        )
-
-    # --------------------------------------------------------
-    # PAGE
-    # --------------------------------------------------------
-
-    if result.page_id:
-        lines.append(
-            f"📄 <b>PAGE UID:</b> "
-            f"<code>{esc(result.page_id)}</code>"
-        )
-
-    # --------------------------------------------------------
-    # GROUP
-    # --------------------------------------------------------
-
-    if result.group_id:
-        lines.append(
-            f"👥 <b>GROUP ID:</b> "
-            f"<code>{esc(result.group_id)}</code>"
-        )
-
-    # --------------------------------------------------------
-    # OBJECT
-    # --------------------------------------------------------
-
-    if result.post_id:
-        lines.append(
-            f"📝 <b>POST ID:</b> "
-            f"<code>{esc(result.post_id)}</code>"
-        )
-
-    if result.reel_id:
-        lines.append(
-            f"🎞 <b>REEL ID:</b> "
-            f"<code>{esc(result.reel_id)}</code>"
-        )
-
-    if result.video_id:
-        lines.append(
-            f"🎬 <b>VIDEO ID:</b> "
-            f"<code>{esc(result.video_id)}</code>"
-        )
-
-    if result.photo_id:
-        lines.append(
-            f"📷 <b>PHOTO ID:</b> "
-            f"<code>{esc(result.photo_id)}</code>"
-        )
-
-    if result.story_id:
-        lines.append(
-            f"📖 <b>STORY ID:</b> "
-            f"<code>{esc(result.story_id)}</code>"
-        )
-
-    if result.media_fbid:
-        lines.append(
-            f"🖼 <b>MEDIA FBID:</b> "
-            f"<code>{esc(result.media_fbid)}</code>"
-        )
-
-    # --------------------------------------------------------
-    # Publisher
-    # --------------------------------------------------------
-
-    if result.publisher_username:
-        lines.append(
-            f"👤 <b>PUBLISHER:</b> "
-            f"<code>{esc(result.publisher_username)}</code>"
-        )
-
-    # --------------------------------------------------------
-    # Share token
-    # --------------------------------------------------------
-
-    if result.share_token:
-        lines.append(
-            f"🔗 <b>SHARE TOKEN:</b> "
-            f"<code>{esc(result.share_token)}</code>"
-        )
-
-    # --------------------------------------------------------
-    # Canonical
-    # --------------------------------------------------------
-
-    if result.canonical_url:
-        lines.append(
-            f"🌐 <b>CANONICAL:</b> "
-            f'<a href="{esc(result.canonical_url)}">'
-            f"{esc(result.canonical_url)}"
-            f"</a>"
-        )
-
-    # --------------------------------------------------------
-    # Verification
-    # --------------------------------------------------------
-
-    if result.confidence:
-        lines.append(
-            f"🎯 <b>CONFIDENCE:</b> "
-            f"{result.confidence}% "
-            f"{esc(result.confidence_label)}"
-        )
-
-    if result.verification:
-        lines.append(
-            f"🔐 <b>VERIFICATION:</b> "
-            f"{esc(result.verification)}"
-        )
-
-    # --------------------------------------------------------
-    # Warnings ONLY when real warnings exist.
-    # --------------------------------------------------------
-
-    if result.warnings:
-        lines.append(
-            "⚠️ <b>WARNING:</b> "
-            + " • ".join(
-                esc(x)
-                for x in result.warnings
-            )
-        )
-
-    # --------------------------------------------------------
-    # Error ONLY when failed.
-    # --------------------------------------------------------
-
-    if (
-        result.status == "FAILED"
-        and result.error
-    ):
-        lines.append(
-            f"❌ <b>ERROR:</b> "
-            f"{esc(result.error)}"
-        )
-
-    return "\n".join(lines)
-
-
-def display_type(entity_type: str) -> str:
-    mapping = {
+    return {
         "USER": "USER",
         "USER_POST": "USER POST",
         "USER_VIDEO": "USER VIDEO",
@@ -3228,67 +2886,214 @@ def display_type(entity_type: str) -> str:
         "SHARE_POST": "SHARE POST",
         "SHARE_VIDEO": "SHARE VIDEO",
         "SHARE_REEL": "SHARE REEL",
-    }
-
-    return mapping.get(
-        entity_type,
-        entity_type or "UNKNOWN",
+    }.get(
+        entity,
+        entity or "UNKNOWN",
     )
 
 
-def type_icon(entity_type: str) -> str:
-    if entity_type in GROUP_TYPES:
-        return "👥"
+def format_result(
+    result: Result,
+    index: int,
+) -> str:
 
-    if entity_type == "PAGE":
-        return "📄"
+    lines = [
+        f"<b>{index}.</b> "
+        f"{icon(result.entity_type)} "
+        f"<b>{esc(pretty_type(result.entity_type))}</b>"
+    ]
 
-    if entity_type == "USER":
-        return "👤"
+    # ----------------------------------------------------------
+    # USER UID
+    # ----------------------------------------------------------
 
-    if "VIDEO" in entity_type:
-        return "🎬"
+    if result.user_uid:
 
-    if "REEL" in entity_type:
-        return "🎞"
+        lines.append(
+            "🆔 <b>USER UID:</b> "
+            f"<code>{esc(result.user_uid)}</code>"
+        )
 
-    if "PHOTO" in entity_type:
-        return "📷"
+    # ----------------------------------------------------------
+    # PAGE UID
+    # ----------------------------------------------------------
 
-    if "STORY" in entity_type:
-        return "📖"
+    if result.page_id:
 
-    return "📝"
+        lines.append(
+            "📄 <b>PAGE UID:</b> "
+            f"<code>{esc(result.page_id)}</code>"
+        )
+
+    # ----------------------------------------------------------
+    # GROUP
+    # ----------------------------------------------------------
+
+    if result.group_id:
+
+        lines.append(
+            "👥 <b>GROUP ID:</b> "
+            f"<code>{esc(result.group_id)}</code>"
+        )
+
+    # ----------------------------------------------------------
+    # POST
+    # ----------------------------------------------------------
+
+    if result.post_id:
+
+        lines.append(
+            "📝 <b>POST ID:</b> "
+            f"<code>{esc(result.post_id)}</code>"
+        )
+
+    # ----------------------------------------------------------
+    # MEDIA
+    # ----------------------------------------------------------
+
+    if result.reel_id:
+
+        lines.append(
+            "🎞 <b>REEL ID:</b> "
+            f"<code>{esc(result.reel_id)}</code>"
+        )
+
+    if result.video_id:
+
+        lines.append(
+            "🎬 <b>VIDEO ID:</b> "
+            f"<code>{esc(result.video_id)}</code>"
+        )
+
+    if result.photo_id:
+
+        lines.append(
+            "📷 <b>PHOTO ID:</b> "
+            f"<code>{esc(result.photo_id)}</code>"
+        )
+
+    if result.story_id:
+
+        lines.append(
+            "📖 <b>STORY ID:</b> "
+            f"<code>{esc(result.story_id)}</code>"
+        )
+
+    if result.media_fbid:
+
+        lines.append(
+            "🖼 <b>MEDIA FBID:</b> "
+            f"<code>{esc(result.media_fbid)}</code>"
+        )
+
+    # ----------------------------------------------------------
+    # PUBLISHER
+    # ----------------------------------------------------------
+
+    if result.publisher:
+
+        lines.append(
+            "👤 <b>PUBLISHER:</b> "
+            f"<code>{esc(result.publisher)}</code>"
+        )
+
+    # ----------------------------------------------------------
+    # CANONICAL
+    # ----------------------------------------------------------
+
+    if result.canonical_url:
+
+        lines.append(
+            "🌐 <b>CANONICAL:</b> "
+            f'<a href="{esc(result.canonical_url)}">'
+            f"{esc(result.canonical_url)}"
+            "</a>"
+        )
+
+    # ----------------------------------------------------------
+    # STATUS
+    # ----------------------------------------------------------
+
+    if result.status:
+
+        lines.append(
+            "📊 <b>STATUS:</b> "
+            f"{esc(result.status)}"
+        )
+
+    # ----------------------------------------------------------
+    # CONFIDENCE
+    # ----------------------------------------------------------
+
+    if result.confidence:
+
+        label = getattr(
+            result,
+            "_confidence_label",
+            "",
+        )
+
+        lines.append(
+            "🎯 <b>CONFIDENCE:</b> "
+            f"{result.confidence}%"
+            + (
+                f" {esc(label)}"
+                if label
+                else ""
+            )
+        )
+
+    # ----------------------------------------------------------
+    # WARNING ONLY IF REAL
+    # ----------------------------------------------------------
+
+    if result.warnings:
+
+        lines.append(
+            "⚠️ <b>WARNING:</b> "
+            + " • ".join(
+                esc(x)
+                for x in result.warnings
+            )
+        )
+
+    # ----------------------------------------------------------
+    # ERROR ONLY IF FAILED
+    # ----------------------------------------------------------
+
+    if (
+        result.status == "FAILED"
+        and result.error
+    ):
+
+        lines.append(
+            "❌ <b>ERROR:</b> "
+            f"{esc(result.error)}"
+        )
+
+    return "\n".join(lines)
 
 
-# ============================================================
-# TELEGRAM HANDLER
-# ============================================================
-
-async def _reply_help(event) -> None:
-    await event.respond(
-        GETUIDFB_HELP,
-        parse_mode="html",
-    )
-
+# ==============================================================
+# TELEGRAM REGISTER
+# ==============================================================
 
 def register(
     client,
     *args,
     **kwargs,
 ):
+
     """
-    Compatible with command loader:
+    Compatible:
 
-        module.register(client, ...)
+        module.register(client)
 
-    Additional positional/keyword arguments are intentionally
-    accepted so this module remains compatible with different
-    bot architectures.
+    or:
 
-    /start and /help are NOT registered here because they should
-    normally belong to commands/start.py. This avoids duplicate
-    Telegram handlers.
+        module.register(client, notify_bot)
+
+    or other existing loader signatures.
     """
 
     resolver = FacebookResolver()
@@ -3298,11 +3103,12 @@ def register(
             pattern=r"(?i)^/getuidfb(?:@\w+)?(?:\s+[\s\S]*)?$"
         )
     )
-    async def getuidfb_handler(event):
+    async def getuidfb_handler(
+        event,
+    ):
 
         text = event.raw_text or ""
 
-        # Remove command itself.
         payload = re.sub(
             r"(?i)^/getuidfb(?:@\w+)?",
             "",
@@ -3310,92 +3116,80 @@ def register(
             count=1,
         ).strip()
 
-        urls = extract_facebook_urls(payload)
+        urls = extract_urls(
+            payload
+        )
 
         if not urls:
+
             await event.respond(
-                GETUIDFB_HELP,
+                HELP_TEXT,
                 parse_mode="html",
             )
+
             return
 
-        # ----------------------------------------------------
-        # Initial response.
-        # ----------------------------------------------------
-
-        if len(urls) == 1:
-            progress_text = (
-                "🔎 <b>FACEBOOK UID V17</b>\n"
-                "⏳ Đang phân tích public data..."
-            )
-        else:
-            progress_text = (
-                "🔎 <b>FACEBOOK UID V17</b>\n"
-                f"📊 Đang xử lý <b>{len(urls)}</b> URL..."
-            )
-
         progress = await event.respond(
-            progress_text,
+            "🔎 <b>FACEBOOK UID V17.5</b>\n"
+            "⏳ Đang phân tích publisher "
+            "+ numeric UID...",
             parse_mode="html",
         )
 
+        started = time.perf_counter()
+
         try:
+
             results = await resolver.resolve_many(
                 urls
             )
 
         except Exception as exc:
+
             LOGGER.exception(
-                "getuidfb failed"
+                "getuidfb exception"
             )
 
             await progress.edit(
-                "❌ <b>Resolver error:</b> "
+                "❌ <b>Resolver Error</b>\n"
                 f"<code>{esc(exc)}</code>",
                 parse_mode="html",
             )
+
             return
 
-        # ----------------------------------------------------
-        # Build minimal output.
-        # ----------------------------------------------------
+        elapsed = int(
+            (
+                time.perf_counter()
+                - started
+            ) * 1000
+        )
 
-        successful = [
-            x
+        success = sum(
+            x.status != "FAILED"
             for x in results
-            if x.status != "FAILED"
-        ]
+        )
 
-        failed = [
-            x
-            for x in results
-            if x.status == "FAILED"
-        ]
+        failed = (
+            len(results)
+            - success
+        )
 
         blocks = [
             "<b>╭──────────────────────────────╮</b>",
-            "│ 🔎 <b>FACEBOOK UID V17</b>",
+            "│ 🔎 <b>FACEBOOK UID V17.5</b>",
             "<b>╰──────────────────────────────╯</b>",
+            f"📊 <b>TOTAL:</b> {len(results)}",
+            f"✅ <b>SUCCESS:</b> {success}",
+            f"❌ <b>FAILED:</b> {failed}",
+            "",
         ]
-
-        blocks.append(
-            f"📊 <b>TOTAL:</b> {len(results)}"
-        )
-
-        blocks.append(
-            f"✅ <b>SUCCESS:</b> {len(successful)}"
-        )
-
-        blocks.append(
-            f"❌ <b>FAILED:</b> {len(failed)}"
-        )
-
-        blocks.append("")
 
         for index, result in enumerate(
             results,
-            start=1,
+            1,
         ):
+
             blocks.append(
                 format_result(
                     result,
@@ -3403,10 +3197,17 @@ def register(
                 )
             )
 
-            if index != len(results):
+            if index < len(results):
                 blocks.append(
                     "━━━━━━━━━━━━━━━━━━━━"
                 )
+
+        blocks.extend(
+            [
+                "",
+                f"⏱️ <b>TIME:</b> {elapsed} ms",
+            ]
+        )
 
         await progress.edit(
             "\n".join(blocks),
@@ -3414,22 +3215,25 @@ def register(
             link_preview=False,
         )
 
-    # Expose resolver for other command modules/tests.
-    client.facebook_uid_resolver = resolver
+    # Allow other modules/tests to access
+    # the same resolver instance.
+    try:
+        client.facebook_uid_resolver = (
+            resolver
+        )
+    except Exception:
+        pass
 
     return resolver
 
 
-# ============================================================
-# OPTIONAL DIRECT API
-# ============================================================
+# ==============================================================
+# PROGRAMMATIC API
+# ==============================================================
 
 async def resolve_facebook_url(
     url: str,
-) -> ResolveResult:
-    """
-    Programmatic API for other modules.
-    """
+) -> Result:
 
     resolver = FacebookResolver()
 
@@ -3440,10 +3244,7 @@ async def resolve_facebook_url(
 
 async def resolve_facebook_urls(
     urls: Iterable[str],
-) -> list[ResolveResult]:
-    """
-    Concurrent programmatic API.
-    """
+) -> list[Result]:
 
     resolver = FacebookResolver()
 
@@ -3452,19 +3253,24 @@ async def resolve_facebook_urls(
     )
 
 
-# ============================================================
-# SELF TEST
-# ============================================================
+# ==============================================================
+# CLI TEST
+# ==============================================================
 
 if __name__ == "__main__":
+
     import sys
 
-    async def _main():
+    async def main():
+
         if len(sys.argv) < 2:
+
             print(
-                "Usage: python getuidfb.py "
+                "Usage:\n"
+                "python getuidfb.py "
                 "<facebook_url>"
             )
+
             return
 
         resolver = FacebookResolver()
@@ -3473,34 +3279,36 @@ if __name__ == "__main__":
             sys.argv[1]
         )
 
+        output = {
+            "status": result.status,
+            "url_type": result.url_type,
+            "entity_type": result.entity_type,
+            "user_uid": result.user_uid,
+            "page_id": result.page_id,
+            "group_id": result.group_id,
+            "post_id": result.post_id,
+            "reel_id": result.reel_id,
+            "video_id": result.video_id,
+            "photo_id": result.photo_id,
+            "story_id": result.story_id,
+            "media_fbid": result.media_fbid,
+            "publisher": result.publisher,
+            "canonical_url":
+                result.canonical_url,
+            "confidence":
+                result.confidence,
+            "verification":
+                result.verification,
+        }
+
         print(
             json.dumps(
-                {
-                    "status": result.status,
-                    "url_type": result.url_type,
-                    "entity_type": result.entity_type,
-                    "user_uid": result.user_uid,
-                    "page_id": result.page_id,
-                    "group_id": result.group_id,
-                    "post_id": result.post_id,
-                    "reel_id": result.reel_id,
-                    "video_id": result.video_id,
-                    "photo_id": result.photo_id,
-                    "story_id": result.story_id,
-                    "media_fbid": result.media_fbid,
-                    "publisher_username":
-                        result.publisher_username,
-                    "canonical_url":
-                        result.canonical_url,
-                    "confidence":
-                        result.confidence,
-                    "verification":
-                        result.verification,
-                },
+                output,
                 ensure_ascii=False,
                 indent=2,
             )
         )
 
-    asyncio.run(_main())
-
+    asyncio.run(
+        main()
+    )

@@ -111,46 +111,34 @@ FB_ALL_HOSTS = (
 # ============================================================
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/142.0.0.0 Safari/537.36"
-    ),
-
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,"
-        "image/avif,image/webp,"
-        "image/apng,*/*;q=0.8"
-    ),
-
-    "Accept-Language":
-        "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-
-    "Cache-Control":
-        "no-cache",
-
-    "Pragma":
-        "no-cache",
-
-    "Upgrade-Insecure-Requests":
-        "1",
-
-    "DNT":
-        "1",
-
-    "Sec-Fetch-Site":
-        "none",
-
-    "Sec-Fetch-Mode":
-        "navigate",
-
-    "Sec-Fetch-User":
-        "?1",
-
-    "Sec-Fetch-Dest":
-        "document",
+    "authority": "www.facebook.com",
+        "accept": (
+            "text/html,"
+            "application/xhtml+xml,"
+            "application/xml;q=0.9,"
+            "image/avif,"
+            "image/webp,"
+            "image/apng,"
+            "*/*;q=0.8"
+        ),
+        "accept-language": (
+            "vi-VN,vi;q=0.9,"
+            "en-US;q=0.8,en;q=0.7"
+        ),
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "upgrade-insecure-requests": "1",
+        "user-agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/139.0.0.0 "
+            "Safari/537.36"
+        ),
 }
 
 

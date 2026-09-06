@@ -418,7 +418,7 @@ class Parser(HTMLParser):
 
             value = attrs.get(
                 "content",
-                ""
+                "application/x-www-form-urlencoded"
             )
 
             if key:

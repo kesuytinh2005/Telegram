@@ -155,18 +155,13 @@ USER_AGENTS = [
 def extract_content_identifiers(text: str) -> List[str]:
     if not text:
         return []
-
     found = []
-
-    # Numeric Facebook object IDs
     found.extend(
         re.findall(
             r"(?<!\d)(\d{5,30})(?!\d)",
             text,
         )
     )
-
-    # Facebook opaque post/reel identifiers
     found.extend(
         re.findall(
             r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
@@ -174,7 +169,6 @@ def extract_content_identifiers(text: str) -> List[str]:
             re.I,
         )
     )
-
     return unique_keep_order(found)
 def make_headers(
     *,
@@ -244,39 +238,28 @@ def is_numeric_id(value: Any) -> bool:
 def is_opaque_content_id(value: Any) -> bool:
     if value is None:
         return False
-
     s = clean_text(value)
-
     if not s:
         return False
-
     if len(s) < 6 or len(s) > 300:
         return False
-
-    # Facebook opaque identifiers.
     if re.fullmatch(
         r"pfbid[A-Za-z0-9_-]+",
         s,
         re.I,
     ):
         return True
-
-    # Các ID dạng token/chữ số khác.
     if re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._:-]{5,299}",
         s,
     ):
         return not is_numeric_id(s)
-
     return False
-
-
 def is_content_id(value: Any) -> bool:
     return (
         is_numeric_id(value)
         or is_opaque_content_id(value)
     )
-
 def unique_keep_order(items: Iterable[str]) -> List[str]:
     seen = set()
     out = []
@@ -548,18 +531,14 @@ class URLParser:
             shape.route_entity = "GROUP"
             if "posts" in lower:
                 idx = lower.index("posts")
-
                 if idx + 1 < len(segments):
                     candidate = segments[idx + 1]
-
                     if is_content_id(candidate):
                         shape.post_id = candidate
-
                     if "groups" in lower:
                         shape.kind = "GROUP_POST"
                     else:
                         shape.kind = "POST"
-
                     shape.route_confidence = 99
             elif "reel" in lower or "reels" in lower:
                 shape.kind = "REEL"
@@ -1981,36 +1960,25 @@ def scan_scripts(
                     key=key,
                     weight=weight,
                 )
-        # ============================================================
-        # OPAQUE FACEBOOK CONTENT IDS
-        # ============================================================
-
         opaque_pattern = re.compile(
             r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
             re.I,
         )
-
         for match in opaque_pattern.finditer(script):
-
             value = match.group(0)
-
             if not is_opaque_content_id(value):
                 continue
-
             start = max(
                 0,
                 match.start() - 700,
             )
-
             end = min(
                 len(script),
                 match.end() + 700,
             )
-
             context = clean_text(
                 script[start:end]
             )
-
             collector.add(
                 value,
                 role="OBJECT_ID",
@@ -2569,7 +2537,6 @@ class EntityClassifier:
             result.confidence = 95
             result.event_id = event_ids[0]
         if result.publisher == "USER":
-
             if (
                 shape.kind == "PROFILE"
                 and shape.numeric_path_id
@@ -2580,15 +2547,12 @@ class EntityClassifier:
                 result.user_uid = (
                     shape.numeric_path_id
                 )
-
             else:
-
                 ranked = rank_user_candidates(
                     collector,
                     username=shape.username,
                     shape=shape,
                 )
-
                 if ranked:
                     result.user_uid = ranked[0][0]
         elif result.publisher == "UNKNOWN":
@@ -2725,18 +2689,12 @@ def rank_user_candidates(
     for evidence in collector.by_role(
         "USER_CANDIDATE"
     ):
-    	
         value = evidence.value
         if not is_numeric_id(value):
             continue
         if value in blocked:
             continue
-        # ============================================================
-        # HARD USER ROUTE
-        # ============================================================
-
         if route_entity == "USER":
-
             if evidence.entity_type in {
                 "PAGE",
                 "GROUP",
@@ -2859,7 +2817,6 @@ def rank_user_candidates(
                 "from.id",
             }
         )
-        
         if (
             shape
             and shape.kind in {
@@ -2889,7 +2846,7 @@ def rank_user_candidates(
         ):
             score += 25
         only_weak_identity = (
-            keys
+            bool(keys)
             and keys <= {
                 "creator_id",
                 "creatorid",
@@ -2900,7 +2857,7 @@ def rank_user_candidates(
             }
         )
         if only_weak_identity:
-            score -= 30
+            continue
         if score > 0:
             ranked.append(
                 (
@@ -3529,8 +3486,7 @@ class IdentityVerifier:
                     "publisher identity evidence."
                 )
                 return result
-        if shape.route_entity == "USER":
-
+                if shape.route_entity == "USER":
             evidence = [
                 e
                 for e in collector.by_role(
@@ -3538,12 +3494,10 @@ class IdentityVerifier:
                 )
                 if e.value == candidate
             ]
-
             keys = {
                 normalize_key(e.key)
                 for e in evidence
             }
-
             strong_identity = bool(
                 keys
                 & {
@@ -3567,9 +3521,12 @@ class IdentityVerifier:
                     "from.id",
                 }
             )
-
             if not strong_identity:
-                continue
+                result.reason = (
+                    "Candidate không có USER identity "
+                    "field đủ mạnh cho USER route."
+                )
+                return result
         if score < 78:
             result.reason = (
                 "UID candidate chưa đạt "

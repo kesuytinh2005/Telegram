@@ -1844,115 +1844,444 @@ def scan_scripts(
     snapshot: PageSnapshot,
     collector: EvidenceCollector,
 ):
-    for index, script in enumerate(
-        snapshot.scripts[:100]
-    ):
+    """
+    High-recall Facebook identity/object scanner.
+    IMPORTANT:
+    - Never treat arbitrary "id" as USER UID.
+    - Generic id is classified only from semantic context.
+    - creator_id / actor_id / owner_id are candidates,
+      not automatically verified UIDs.
+    """
+    for index, script in enumerate(snapshot.scripts[:150]):
         if not script:
             continue
         source = f"script:{index}"
-        # ----------------------------------------------------
-        # identity IDs
-        # ----------------------------------------------------
-        for key, weight in (
-            USER_FIELD_WEIGHTS.items()
-        ):
-            key_pattern = re.escape(
-                key.split(".")[-1]
-            )
+        # ====================================================
+        # 1. EXPLICIT IDENTITY KEYS
+        # ====================================================
+        identity_patterns = {
+            "user_id": 110,
+            "userid": 110,
+            "userId": 110,
+            "profile_id": 112,
+            "profileid": 112,
+            "profileId": 112,
+            "profile_uid": 112,
+            "profileuid": 112,
+            "profileUid": 112,
+            "owner_id": 100,
+            "ownerid": 100,
+            "ownerId": 100,
+            "publisher_id": 102,
+            "publisherid": 102,
+            "publisherId": 102,
+            "author_id": 100,
+            "authorid": 100,
+            "authorId": 100,
+            "from_id": 98,
+            "fromid": 98,
+            "fromId": 98,
+            "creator_id": 88,
+            "creatorid": 88,
+            "creatorId": 88,
+            "actor_id": 82,
+            "actorid": 82,
+            "actorId": 82,
+            "profile.uid": 112,
+            "profile.id": 108,
+            "owner.id": 102,
+            "publisher.id": 102,
+            "author.id": 100,
+            "creator.id": 88,
+            "actor.id": 82,
+            "legacy_id": 90,
+            "legacyId": 90,
+        }
+        for key, weight in identity_patterns.items():
+            escaped = re.escape(key)
             pattern = re.compile(
-                rf'"{key_pattern}"\s*:\s*"?('
-                r"\d{5,30}"
-                r')"?',
+                rf'["\']{escaped}["\']'
+                rf'\s*:\s*["\']?'
+                rf'(\d{{5,30}})'
+                rf'["\']?',
                 re.I,
             )
-            for match in pattern.finditer(
-                script
-            ):
+            for match in pattern.finditer(script):
                 value = match.group(1)
+                if not is_numeric_id(value):
+                    continue
+                # ------------------------------------------------
+                # Determine nearby semantic context
+                # ------------------------------------------------
+                start = max(0, match.start() - 500)
+                end = min(len(script), match.end() + 500)
+                context = script[start:end].lower()
+                entity_type = ""
+                if (
+                    "group_id" in context
+                    or "groupid" in context
+                    or '"group"' in context
+                ):
+                    entity_type = "GROUP"
+                elif (
+                    "page_id" in context
+                    or "pageid" in context
+                    or '"page"' in context
+                ):
+                    entity_type = "PAGE"
+                elif (
+                    "event_id" in context
+                    or "eventid" in context
+                    or '"event"' in context
+                ):
+                    entity_type = "EVENT"
                 collector.add(
                     value,
                     role="USER_CANDIDATE",
                     source=source,
                     key=key,
                     weight=weight,
+                    neighbor=clean_text(
+                        context[:500]
+                    ),
+                    entity_type=(
+                        entity_type or "UNKNOWN"
+                    ),
                 )
-        # ----------------------------------------------------
-        # object IDs
-        # ----------------------------------------------------
-        for key, weight in (
-            OBJECT_FIELD_WEIGHTS.items()
-        ):
-            key_pattern = re.escape(
-                key
-            )
-            pattern = re.compile(
-                rf'"{key_pattern}"\s*:\s*"?( '
-                rf'\d{{5,30}}'
-                rf')"?',
-                re.I | re.X,
-            )
-            for match in pattern.finditer(
-                script
-            ):
-                collector.add(
-                    match.group(1),
-                    role="OBJECT_ID",
-                    source=source,
-                    key=key,
-                    weight=weight,
-                )
-        # ----------------------------------------------------
-        # Easier regex fallback
-        # ----------------------------------------------------
-        patterns = {
-            "post_id": r'"post_id"\s*:\s*"?(?P<v>\d{5,30})',
-            "reel_id": r'"reel_id"\s*:\s*"?(?P<v>\d{5,30})',
-            "video_id": r'"video_id"\s*:\s*"?(?P<v>\d{5,30})',
-            "photo_id": r'"photo_id"\s*:\s*"?(?P<v>\d{5,30})',
-            "media_fbid": r'"media_fbid"\s*:\s*"?(?P<v>\d{5,30})',
-            "story_fbid": r'"story_fbid"\s*:\s*"?(?P<v>\d{5,30})',
-            "page_id": r'"page_id"\s*:\s*"?(?P<v>\d{5,30})',
-            "group_id": r'"group_id"\s*:\s*"?(?P<v>\d{5,30})',
+        # ====================================================
+        # 2. PAGE / GROUP / EVENT IDS
+        # ====================================================
+        explicit_entity_patterns = {
+            "page_id": ("PAGE_ID", 125),
+            "pageid": ("PAGE_ID", 125),
+            "pageId": ("PAGE_ID", 125),
+            "group_id": ("GROUP_ID", 125),
+            "groupid": ("GROUP_ID", 125),
+            "groupId": ("GROUP_ID", 125),
+            "event_id": ("EVENT_ID", 125),
+            "eventid": ("EVENT_ID", 125),
+            "eventId": ("EVENT_ID", 125),
         }
-        for key, pattern in patterns.items():
-            for match in re.finditer(
-                pattern,
-                script,
-                flags=re.I,
-            ):
-                value = match.group(
-                    "v"
-                )
-                role = (
-                    "PAGE_ID"
-                    if key == "page_id"
-                    else (
-                        "GROUP_ID"
-                        if key == "group_id"
-                        else "OBJECT_ID"
-                    )
+        for key, (role, weight) in explicit_entity_patterns.items():
+            pattern = re.compile(
+                rf'["\']{re.escape(key)}["\']'
+                rf'\s*:\s*["\']?'
+                rf'(\d{{5,30}})'
+                rf'["\']?',
+                re.I,
+            )
+            for match in pattern.finditer(script):
+                value = match.group(1)
+                if not is_numeric_id(value):
+                    continue
+                entity = (
+                    "PAGE"
+                    if role == "PAGE_ID"
+                    else
+                    "GROUP"
+                    if role == "GROUP_ID"
+                    else
+                    "EVENT"
                 )
                 collector.add(
                     value,
                     role=role,
                     source=source,
                     key=key,
-                    weight=(
-                        OBJECT_FIELD_WEIGHTS.get(
-                            key,
-                            50,
-                        )
-                    ),
-                    entity_type=(
-                        "PAGE"
-                        if key == "page_id"
-                        else (
-                            "GROUP"
-                            if key == "group_id"
-                            else ""
-                        )
-                    ),
+                    weight=weight,
+                    entity_type=entity,
                 )
+        # ====================================================
+        # 3. CONTENT IDS
+        # ====================================================
+        object_patterns = {
+            "post_id": 110,
+            "postid": 110,
+            "postId": 110,
+            "video_id": 110,
+            "videoid": 110,
+            "videoId": 110,
+            "reel_id": 110,
+            "reelid": 110,
+            "reelId": 110,
+            "photo_id": 110,
+            "photoid": 110,
+            "photoId": 110,
+            "media_fbid": 108,
+            "mediaFbid": 108,
+            "story_fbid": 110,
+            "storyFbid": 110,
+            "album_id": 100,
+            "albumid": 100,
+            "albumId": 100,
+        }
+        for key, weight in object_patterns.items():
+            pattern = re.compile(
+                rf'["\']{re.escape(key)}["\']'
+                rf'\s*:\s*["\']?'
+                rf'(\d{{5,30}})'
+                rf'["\']?',
+                re.I,
+            )
+            for match in pattern.finditer(script):
+                value = match.group(1)
+                if not is_numeric_id(value):
+                    continue
+                collector.add(
+                    value,
+                    role="OBJECT_ID",
+                    source=source,
+                    key=key,
+                    weight=weight,
+                )
+        # ====================================================
+        # 4. SEMANTIC OBJECTS
+        #
+        # Example:
+        #
+        # "owner": {
+        #     "id": "615..."
+        # }
+        #
+        # "author": {
+        #     "id": "615..."
+        # }
+        #
+        # Generic "id" is accepted ONLY when inside
+        # an identity semantic object.
+        # ====================================================
+        semantic_objects = (
+            "user",
+            "profile",
+            "owner",
+            "author",
+            "publisher",
+            "actor",
+            "creator",
+            "from",
+        )
+        for semantic in semantic_objects:
+            pattern = re.compile(
+                rf'["\']{semantic}["\']'
+                rf'\s*:\s*\{{'
+                rf'.{{0,4000}}?'
+                rf'["\']id["\']'
+                rf'\s*:\s*["\']'
+                rf'(\d{{5,30}})'
+                rf'["\']',
+                re.I | re.S,
+            )
+            for match in pattern.finditer(script):
+                value = match.group(1)
+                if not is_numeric_id(value):
+                    continue
+                weight_map = {
+                    "user": 112,
+                    "profile": 112,
+                    "owner": 102,
+                    "author": 100,
+                    "publisher": 100,
+                    "actor": 82,
+                    "creator": 88,
+                    "from": 96,
+                }
+                collector.add(
+                    value,
+                    role="USER_CANDIDATE",
+                    source=source,
+                    key=f"{semantic}.id",
+                    weight=weight_map.get(
+                        semantic,
+                        70,
+                    ),
+                    neighbor=semantic,
+                    entity_type="UNKNOWN",
+                )
+        # ====================================================
+        # 5. USERNAME / PROFILE URL
+        # ====================================================
+        username_pattern = re.compile(
+            r'["\'](?:username|user_name|profile_name)'
+            r'["\']\s*:\s*["\']([^"\']{1,200})["\']',
+            re.I,
+        )
+        for match in username_pattern.finditer(script):
+            username = clean_text(
+                match.group(1)
+            ).lstrip("@")
+            if username:
+                collector.add(
+                    username,
+                    role="USERNAME",
+                    source=source,
+                    key="username",
+                    weight=65,
+                )
+        profile_url_pattern = re.compile(
+            r'["\'](?:profile_url|profile_uri)'
+            r'["\']\s*:\s*["\']([^"\']+)["\']',
+            re.I,
+        )
+        for match in profile_url_pattern.finditer(script):
+            value = clean_text(
+                match.group(1)
+            )
+            if (
+                value
+                and is_facebook_host(
+                    urlparse(value).netloc
+                )
+            ):
+                collector.add(
+                    value,
+                    role="PROFILE_URL",
+                    source=source,
+                    key="profile_url",
+                    weight=80,
+                )
+class IdentityCorrelation:
+    IDENTITY_KEYS = {
+        "user",
+        "profile",
+        "owner",
+        "author",
+        "publisher",
+        "actor",
+        "creator",
+        "from",
+    }
+    @staticmethod
+    def normalize_username(value: str) -> str:
+        return clean_text(
+            value
+        ).lstrip("@").lower()
+    @classmethod
+    def score_candidate(
+        cls,
+        candidate: str,
+        username: str,
+        snapshots: List[PageSnapshot],
+        collector: EvidenceCollector,
+    ) -> Tuple[float, List[str]]:
+        if not is_numeric_id(candidate):
+            return 0.0, []
+        score = 0.0
+        signals = []
+        wanted_username = cls.normalize_username(
+            username
+        )
+        # ====================================================
+        # Evidence from structured collector
+        # ====================================================
+        candidate_evidence = [
+            e
+            for e in collector.by_role(
+                "USER_CANDIDATE"
+            )
+            if e.value == candidate
+        ]
+        if not candidate_evidence:
+            return 0.0, []
+        # Strong semantic field
+        strongest = max(
+            e.weight
+            for e in candidate_evidence
+        )
+        if strongest >= 108:
+            score += 35
+            signals.append(
+                "profile/user identity field"
+            )
+        elif strongest >= 100:
+            score += 28
+            signals.append(
+                "owner/author identity field"
+            )
+        elif strongest >= 88:
+            score += 18
+            signals.append(
+                "creator identity candidate"
+            )
+        # ====================================================
+        # Source diversity
+        # ====================================================
+        sources = {
+            e.source
+            for e in candidate_evidence
+        }
+        if len(sources) >= 2:
+            score += min(
+                20,
+                len(sources) * 7,
+            )
+            signals.append(
+                "UID xuất hiện nhiều nguồn"
+            )
+        # ====================================================
+        # Profile HTML correlation
+        # ====================================================
+        for snapshot in snapshots:
+            html = snapshot.html or ""
+            if not html:
+                continue
+            candidate_found = bool(
+                re.search(
+                    rf"(?<!\d)"
+                    rf"{re.escape(candidate)}"
+                    rf"(?!\d)",
+                    html,
+                )
+            )
+            if not candidate_found:
+                continue
+            score += 20
+            signals.append(
+                "profile HTML chứa candidate UID"
+            )
+            # ------------------------------------------------
+            # Username appears in same page
+            # ------------------------------------------------
+            if wanted_username:
+                if wanted_username in html.lower():
+                    score += 12
+                    signals.append(
+                        "profile HTML chứa username"
+                    )
+            # ------------------------------------------------
+            # Canonical
+            # ------------------------------------------------
+            canonical = clean_text(
+                snapshot.meta.get(
+                    "og:url",
+                    "",
+                )
+            )
+            if canonical:
+                if wanted_username in canonical.lower():
+                    score += 15
+                    signals.append(
+                        "canonical ↔ username"
+                    )
+            # ------------------------------------------------
+            # Profile title / metadata
+            # ------------------------------------------------
+            title = clean_text(
+                snapshot.meta.get(
+                    "og:title",
+                    "",
+                )
+            )
+            if (
+                wanted_username
+                and wanted_username in title.lower()
+            ):
+                score += 5
+                signals.append(
+                    "profile title ↔ username"
+                )
+        return min(score, 99.5), unique_keep_order(
+            signals
+        )
 # ============================================================
 # CANONICAL / URL EVIDENCE
 # ============================================================
@@ -2675,33 +3004,100 @@ class IdentityVerifier:
             collector
         )
         if not ranked:
-            # profile.php?id=...
             if (
                 shape.kind == "PROFILE"
                 and shape.numeric_path_id
+                and is_numeric_id(shape.numeric_path_id)
             ):
-                candidate = (
-                    shape.numeric_path_id
+                result.uid = shape.numeric_path_id
+                result.verified = True
+                result.confidence = 96.0
+                result.sources = 1
+                result.signals.append(
+                    "profile.php?id → explicit profile ID"
                 )
-                if is_numeric_id(
-                    candidate
-                ):
-                    result.uid = candidate
-                    result.verified = (
-                        True
-                    )
-                    result.confidence = (
-                        96.0
-                    )
-                    result.sources = 1
-                    result.signals.append(
-                        "profile.php?id → explicit profile ID"
-                    )
-                    return result
+                return result
             result.reason = (
                 "Không có identity ID công khai đủ mạnh."
             )
             return result
+        # ====================================================
+        # Re-rank by actual identity correlation
+        # ====================================================
+        correlated = []
+        correlator = IdentityCorrelation()
+        for candidate, base_score in ranked[:20]:
+            correlation_score, correlation_signals = (
+                correlator.score_candidate(
+                    candidate=candidate,
+                    username=profile.username,
+                    snapshots=profile_snapshots,
+                    collector=collector,
+                )
+            )
+            final_score = (
+                base_score * 0.45
+                +
+                correlation_score * 0.55
+            )
+            correlated.append(
+                (
+                    candidate,
+                    final_score,
+                    correlation_signals,
+                )
+            )
+        correlated.sort(
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        if not correlated:
+            result.reason = (
+                "Không tạo được identity correlation."
+            )
+            return result
+        candidate, final_score, correlation_signals = (
+            correlated[0]
+        )
+        # ====================================================
+        # Conflict detection
+        # ====================================================
+        if len(correlated) >= 2:
+            second = correlated[1]
+            if (
+                second[1] >= final_score * 0.92
+                and second[0] != candidate
+            ):
+                result.reason = (
+                    "Có nhiều UID cạnh tranh "
+                    "và chưa đủ bằng chứng phân giải."
+                )
+                return result
+        # ====================================================
+        # Verification
+        # ====================================================
+        if final_score >= 72:
+            result.uid = candidate
+            result.verified = True
+            result.confidence = min(
+                99.5,
+                final_score,
+            )
+            result.sources = len(
+                collector.sources_for(candidate)
+            )
+            result.signals.extend(
+                correlation_signals
+            )
+            result.signals = unique_keep_order(
+                result.signals
+            )[:MAX_SIGNALS]
+            return result
+        result.reason = (
+            "Facebook có ID ứng viên nhưng "
+            "chưa đủ correlation để xác minh UID."
+        )
+        return result
         candidate, score = ranked[0]
         candidate_sources = (
             collector.sources_for(
@@ -3956,16 +4352,11 @@ _pending_lock = asyncio.Lock()
 _pending_users: Set[
     Tuple[int, int]
 ] = set()
-
 # ============================================================
 # TELETHON FOLLOW-UP MESSAGE WAIT
 # ============================================================
-
 _pending_sessions = {}
-
 _pending_lock = asyncio.Lock()
-
-
 async def wait_for_next_facebook_url(
     bot,
     event,
@@ -3973,185 +4364,133 @@ async def wait_for_next_facebook_url(
 ):
     """
     Telethon-compatible replacement for wait_for().
-
     Không dùng:
         bot.wait_for()
-
     Vì TelegramClient của Telethon không có API này.
     """
-
     loop = asyncio.get_running_loop()
-
     future = loop.create_future()
-
     chat_id = event.chat_id
     sender_id = event.sender_id
-
     session_key = (
         int(chat_id or 0),
         int(sender_id or 0),
     )
-
     async def callback(new_event):
         try:
             # ------------------------------------------------
             # Chỉ nhận đúng chat
             # ------------------------------------------------
-
             if new_event.chat_id != chat_id:
                 return
-
             # ------------------------------------------------
             # Chỉ nhận đúng user
             # ------------------------------------------------
-
             if new_event.sender_id != sender_id:
                 return
-
             # ------------------------------------------------
             # Không lấy chính command /getuidfb
             # ------------------------------------------------
-
             text = (
                 new_event.raw_text
                 or ""
             ).strip()
-
             if not text:
                 return
-
             # ------------------------------------------------
             # Tìm Facebook URL
             # ------------------------------------------------
-
             urls = extract_urls(text)
-
             if not urls:
                 return
-
             if not future.done():
                 future.set_result(
                     urls
                 )
-
         except Exception as exc:
             LOGGER.debug(
                 "follow-up callback error: %r",
                 exc,
                 exc_info=True,
             )
-
     handler = events.NewMessage()
-
     # --------------------------------------------------------
     # Add temporary handler
     # --------------------------------------------------------
-
     bot.add_event_handler(
         callback,
         handler,
     )
-
     try:
-
         return await asyncio.wait_for(
             future,
             timeout=timeout,
         )
-
     except asyncio.TimeoutError:
-
         return []
-
     finally:
-
         # ----------------------------------------------------
         # ALWAYS remove temporary handler
         # ----------------------------------------------------
-
         try:
-
             bot.remove_event_handler(
                 callback,
                 handler,
             )
-
         except Exception:
-
             LOGGER.debug(
                 "Unable to remove temporary "
                 "Telethon handler",
                 exc_info=True,
             )
-
-
 # ============================================================
 # GETUIDFB ARGUMENT PARSER
 # ============================================================
-
 def get_command_args(
     text: str,
 ) -> str:
-
     if not text:
         return ""
-
     m = re.match(
         r"^/getuidfb(?:@\w+)?(?:\s+(.*))?$",
         text.strip(),
         flags=re.I | re.S,
     )
-
     if not m:
         return ""
-
     return (
         m.group(1)
         or ""
     ).strip()
-
-
 # ============================================================
 # ASYNC RESOLVER
 # ============================================================
-
 async def resolve_async(
     url: str,
 ) -> ResolveResult:
-
     return await asyncio.to_thread(
         _resolver.resolve,
         url,
     )
-
-
 async def resolve_many(
     urls: List[str],
 ) -> List[ResolveResult]:
-
     semaphore = asyncio.Semaphore(
         CONCURRENCY
     )
-
     async def worker(
         url: str,
     ) -> ResolveResult:
-
         async with semaphore:
-
             try:
-
                 return await resolve_async(
                     url
                 )
-
             except Exception as exc:
-
                 LOGGER.exception(
                     "Resolver worker failed: %s",
                     url,
                 )
-
                 return ResolveResult(
                     input_url=url,
                     canonical_url=url,
@@ -4161,37 +4500,29 @@ async def resolve_many(
                         "Không thể hoàn tất kiểm tra URL."
                     ],
                 )
-
     tasks = [
         asyncio.create_task(
             worker(url)
         )
         for url in urls
     ]
-
     return await asyncio.gather(
         *tasks
     )
-
-
 # ============================================================
 # REGISTER
 # ============================================================
-
 def register(
     bot,
     notify_bot=None,
 ):
     """
     Telethon command registration.
-
     REQUIRED BY:
         commands/__init__.py
-
     Example:
         module.register(bot, notify_bot)
     """
-
     @bot.on(
         events.NewMessage(
             pattern=r"^/getuidfb(?:@\w+)?(?:\s+.*)?$"
@@ -4200,67 +4531,49 @@ def register(
     async def getuidfb_handler(
         event,
     ):
-
         started = time.perf_counter()
-
         sender_id = (
             event.sender_id
             or 0
         )
-
         chat_id = (
             event.chat_id
             or sender_id
         )
-
         session_key = (
             int(chat_id),
             int(sender_id),
         )
-
         try:
-
             # =================================================
             # STEP 1
             # Parse command arguments
             # =================================================
-
             args = get_command_args(
                 event.raw_text
             )
-
             # =================================================
             # STEP 2
             # URL nằm ngay trên command
             # =================================================
-
             if args:
-
                 urls = extract_urls(
                     args
                 )
-
             # =================================================
             # STEP 3
             # Không có URL -> chờ message kế tiếp
             # =================================================
-
             else:
-
                 async with _pending_lock:
-
                     # Tránh một user mở nhiều session.
                     if session_key in _pending_sessions:
                         return
-
                     _pending_sessions[
                         session_key
                     ] = time.time()
-
                 prompt = None
-
                 try:
-
                     prompt = await event.reply(
                         (
                             "🔎 <b>FACEBOOK FORENSIC RESOLVER V60</b>\n\n"
@@ -4276,11 +4589,9 @@ def register(
                         ),
                         parse_mode="html",
                     )
-
                     # =================================================
                     # Telethon-compatible wait
                     # =================================================
-
                     urls = (
                         await wait_for_next_facebook_url(
                             bot,
@@ -4288,17 +4599,12 @@ def register(
                             SESSION_TIMEOUT,
                         )
                     )
-
                     # =================================================
                     # Timeout
                     # =================================================
-
                     if not urls:
-
                         if prompt:
-
                             try:
-
                                 await prompt.edit(
                                     (
                                         "⌛ <b>Hết thời gian chờ.</b>\n\n"
@@ -4307,28 +4613,20 @@ def register(
                                     ),
                                     parse_mode="html",
                                 )
-
                             except Exception:
                                 pass
-
                         return
-
                 finally:
-
                     async with _pending_lock:
-
                         _pending_sessions.pop(
                             session_key,
                             None,
                         )
-
             # =================================================
             # STEP 4
             # Validate URLs
             # =================================================
-
             if not urls:
-
                 await event.reply(
                     (
                         "⚠️ <b>Không tìm thấy link Facebook hợp lệ.</b>\n\n"
@@ -4337,14 +4635,11 @@ def register(
                     ),
                     parse_mode="html",
                 )
-
                 return
-
             # =================================================
             # STEP 5
             # Dedupe
             # =================================================
-
             urls = unique_keep_order(
                 [
                     normalize_facebook_url(x)
@@ -4352,25 +4647,19 @@ def register(
                     if x
                 ]
             )
-
             skipped = 0
-
             if len(urls) > MAX_INPUT_URLS:
-
                 skipped = (
                     len(urls)
                     - MAX_INPUT_URLS
                 )
-
                 urls = urls[
                     :MAX_INPUT_URLS
                 ]
-
             # =================================================
             # STEP 6
             # Processing message
             # =================================================
-
             processing = await event.reply(
                 (
                     "🔬 <b>ĐANG PHÂN TÍCH FACEBOOK</b>\n\n"
@@ -4384,41 +4673,31 @@ def register(
                 ),
                 parse_mode="html",
             )
-
             # =================================================
             # STEP 7
             # Resolve concurrently
             # =================================================
-
             results = await resolve_many(
                 urls
             )
-
             # =================================================
             # STEP 8
             # Build output
             # =================================================
-
             blocks = []
-
             for index, result in enumerate(
                 results,
                 start=1,
             ):
-
                 try:
-
                     block = format_result(
                         index,
                         result,
                     )
-
                 except Exception as exc:
-
                     LOGGER.exception(
                         "format_result failed",
                     )
-
                     block = (
                         "╭──────────────────────────\n"
                         f"│ 🔎 <b>FACEBOOK RESOLVER #{index}</b>\n"
@@ -4427,22 +4706,18 @@ def register(
                         "│ UID đã được bảo vệ, không suy đoán.\n"
                         "╰──────────────────────────"
                     )
-
                 blocks.append(
                     block
                 )
-
             # =================================================
             # STEP 9
             # Summary
             # =================================================
-
             verified_count = sum(
                 1
                 for result in results
                 if result.verified
             )
-
             header = (
                 "🔎 <b>FACEBOOK FORENSIC RESULT</b>\n"
                 f"📊 Đã kiểm tra: <b>{len(results)}</b>\n"
@@ -4450,14 +4725,11 @@ def register(
                 f"⏱ Tổng thời gian: "
                 f"<b>{time.perf_counter() - started:.2f}s</b>"
             )
-
             if skipped:
-
                 header += (
                     "\n⚠️ Bỏ qua: "
                     f"<b>{skipped}</b> URL vượt giới hạn."
                 )
-
             final_text = (
                 header
                 + "\n\n"
@@ -4465,75 +4737,52 @@ def register(
                     blocks
                 )
             )
-
             # =================================================
             # STEP 10
             # Telegram limit
             # =================================================
-
             if len(final_text) <= 3900:
-
                 await processing.edit(
                     final_text,
                     parse_mode="html",
                 )
-
             else:
-
                 chunks = []
-
                 current = header
-
                 for block in blocks:
-
                     candidate = (
                         current
                         + "\n\n"
                         + block
                     )
-
                     if len(candidate) > 3900:
-
                         if current.strip():
                             chunks.append(
                                 current
                             )
-
                         current = block
-
                     else:
-
                         current = candidate
-
                 if current.strip():
-
                     chunks.append(
                         current
                     )
-
                 if chunks:
-
                     await processing.edit(
                         chunks[0],
                         parse_mode="html",
                     )
-
                 for chunk in chunks[1:]:
-
                     await event.respond(
                         chunk,
                         parse_mode="html",
                     )
-
             # =================================================
             # STEP 11
             # Optional notification
             # =================================================
-
             if notify_bot:
-
                 try:
-
                     await notify_bot(
                         event,
                         (
@@ -4542,37 +4791,27 @@ def register(
                             f"{verified_count} verified"
                         ),
                     )
-
                 except Exception:
-
                     LOGGER.debug(
                         "notify_bot failed",
                         exc_info=True,
                     )
-
         except Exception as exc:
-
             LOGGER.exception(
                 "GETUIDFB HANDLER ERROR",
             )
-
             # -------------------------------------------------
             # Đảm bảo pending session được giải phóng
             # -------------------------------------------------
-
             async with _pending_lock:
-
                 _pending_sessions.pop(
                     session_key,
                     None,
                 )
-
             # -------------------------------------------------
             # Không để user thấy bot im lặng
             # -------------------------------------------------
-
             try:
-
                 await event.reply(
                     (
                         "❌ <b>FACEBOOK RESOLVER</b>\n\n"
@@ -4583,9 +4822,7 @@ def register(
                     ),
                     parse_mode="html",
                 )
-
             except Exception:
-
                 LOGGER.exception(
                     "Unable to send GETUIDFB error",
                 )

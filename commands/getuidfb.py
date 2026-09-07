@@ -704,15 +704,22 @@ class URLParser:
                 shape.kind = "HOME"
             elif len(segments) == 1:
                 first = segments[0]
+
                 if (
-                    first.lower()
-                    not in cls.RESERVED
+                    first.lower() not in cls.RESERVED
+                    and not generic_name(first)
                 ):
                     if is_numeric_id(first):
                         shape.numeric_path_id = first
                     else:
                         shape.username = first
+
                     shape.kind = "PROFILE"
+                    shape.route_entity = (
+                        "USER"
+                        if not is_numeric_id(first)
+                        else "USER"
+                    )
                     shape.route_confidence = 92
         if shape.kind in {
             "POST",
@@ -1778,6 +1785,253 @@ def scan_jsonld(
             obj,
             source=f"jsonld:{index}",
         )
+def add_user_candidate(
+    collector: EvidenceCollector,
+    value: Any,
+    *,
+    source: str,
+    key: str,
+    weight: float,
+    neighbor: str = "",
+    entity_type: str = "UNKNOWN",
+):
+    value = clean_text(value)
+
+    if not is_numeric_id(value):
+        return
+
+    # Tuyệt đối không nhận các entity/content ID rõ ràng
+    forbidden_keys = {
+        "page_id",
+        "pageid",
+        "pageid",
+        "group_id",
+        "groupid",
+        "event_id",
+        "eventid",
+        "post_id",
+        "postid",
+        "video_id",
+        "videoid",
+        "reel_id",
+        "reelid",
+        "photo_id",
+        "photoid",
+        "story_fbid",
+        "storyfbid",
+        "media_fbid",
+        "mediafbid",
+        "album_id",
+        "albumid",
+    }
+
+    nk = normalize_key(key)
+
+    if nk in forbidden_keys:
+        return
+
+    if entity_type in {"PAGE", "GROUP", "EVENT"}:
+        return
+
+    collector.add(
+        value,
+        role="USER_CANDIDATE",
+        source=source,
+        key=key,
+        weight=weight,
+        neighbor=neighbor,
+        entity_type=entity_type or "UNKNOWN",
+    )
+def scan_user_identity_patterns(
+    script: str,
+    source: str,
+    collector: EvidenceCollector,
+):
+    if not script:
+        return
+
+    patterns = [
+        # Direct identity fields
+        (
+            r'["\']user_id["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "user_id",
+            115,
+        ),
+        (
+            r'["\']userid["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "userid",
+            115,
+        ),
+        (
+            r'["\']userId["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "userId",
+            115,
+        ),
+        (
+            r'["\']profile_id["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "profile_id",
+            115,
+        ),
+        (
+            r'["\']profileid["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "profileid",
+            115,
+        ),
+        (
+            r'["\']profileId["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "profileId",
+            115,
+        ),
+
+        # Publisher / author
+        (
+            r'["\']publisher_id["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "publisher_id",
+            108,
+        ),
+        (
+            r'["\']author_id["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "author_id",
+            105,
+        ),
+        (
+            r'["\']owner_id["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "owner_id",
+            105,
+        ),
+        (
+            r'["\']from_id["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "from_id",
+            102,
+        ),
+
+        # Legacy / actor
+        (
+            r'["\']legacy_id["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "legacy_id",
+            92,
+        ),
+        (
+            r'["\']actor_id["\']\s*:\s*["\']?(\d{5,30})["\']?',
+            "actor_id",
+            82,
+        ),
+    ]
+
+    for pattern, key, weight in patterns:
+        try:
+            regex = re.compile(pattern, re.I)
+
+            for match in regex.finditer(script):
+                value = match.group(1)
+
+                start = max(0, match.start() - 1000)
+                end = min(len(script), match.end() + 1000)
+
+                context = clean_text(
+                    script[start:end]
+                )
+
+                lower_context = context.lower()
+
+                entity_type = "UNKNOWN"
+
+                if re.search(
+                    r'"group(?:_id|id)?"\s*:',
+                    lower_context,
+                ):
+                    entity_type = "GROUP"
+
+                elif re.search(
+                    r'"page(?:_id|id)?"\s*:',
+                    lower_context,
+                ):
+                    entity_type = "PAGE"
+
+                elif re.search(
+                    r'"event(?:_id|id)?"\s*:',
+                    lower_context,
+                ):
+                    entity_type = "EVENT"
+
+                # Không để generic ID của PAGE/GROUP
+                # biến thành USER UID
+                if entity_type != "UNKNOWN":
+                    continue
+
+                add_user_candidate(
+                    collector,
+                    value,
+                    source=source,
+                    key=key,
+                    weight=weight,
+                    neighbor=context,
+                    entity_type="UNKNOWN",
+                )
+
+        except Exception:
+            LOGGER.debug(
+                "identity pattern failed: %s",
+                key,
+                exc_info=True,
+            )
+def scan_nested_user_objects(
+    script: str,
+    source: str,
+    collector: EvidenceCollector,
+):
+    if not script:
+        return
+
+    semantic_names = {
+        "user": 115,
+        "profile": 115,
+        "owner": 105,
+        "publisher": 105,
+        "author": 105,
+        "from": 102,
+        "actor": 82,
+        "creator": 88,
+    }
+
+    for semantic, weight in semantic_names.items():
+
+        pattern = re.compile(
+            rf'["\']{re.escape(semantic)}["\']'
+            rf'\s*:\s*\{{'
+            rf'(.{{0,6000}}?)'
+            rf'["\']id["\']'
+            rf'\s*:\s*["\'](\d{{5,30}})["\']',
+            re.I | re.S,
+        )
+
+        for match in pattern.finditer(script):
+
+            value = match.group(2)
+
+            start = max(
+                0,
+                match.start() - 500,
+            )
+
+            end = min(
+                len(script),
+                match.end() + 500,
+            )
+
+            context = clean_text(
+                script[start:end]
+            )
+
+            add_user_candidate(
+                collector,
+                value,
+                source=source,
+                key=f"{semantic}.id",
+                weight=weight,
+                neighbor=context,
+                entity_type="UNKNOWN",
+            )
 def scan_scripts(
     snapshot: PageSnapshot,
     collector: EvidenceCollector,
@@ -1794,6 +2048,16 @@ def scan_scripts(
         if not script:
             continue
         source = f"script:{index}"
+        scan_user_identity_patterns(
+            script,
+            source,
+            collector,
+        )
+        scan_nested_user_objects(
+            script,
+            source,
+            collector,
+        )
         identity_patterns = {
             "user_id": 110,
             "userid": 110,
@@ -3494,12 +3758,10 @@ class IdentityVerifier:
                 )
                 if e.value == candidate
             ]
-
             keys = {
                 normalize_key(e.key)
                 for e in evidence
             }
-
             strong_identity = bool(
                 keys
                 & {
@@ -3523,7 +3785,6 @@ class IdentityVerifier:
                     "from.id",
                 }
             )
-
             if not strong_identity:
                 result.reason = (
                     "Candidate không có USER identity "

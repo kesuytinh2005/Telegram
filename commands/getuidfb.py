@@ -3486,7 +3486,7 @@ class IdentityVerifier:
                     "publisher identity evidence."
                 )
                 return result
-                if shape.route_entity == "USER":
+        if shape.route_entity == "USER":
             evidence = [
                 e
                 for e in collector.by_role(
@@ -3494,10 +3494,12 @@ class IdentityVerifier:
                 )
                 if e.value == candidate
             ]
+
             keys = {
                 normalize_key(e.key)
                 for e in evidence
             }
+
             strong_identity = bool(
                 keys
                 & {
@@ -3521,6 +3523,7 @@ class IdentityVerifier:
                     "from.id",
                 }
             )
+
             if not strong_identity:
                 result.reason = (
                     "Candidate không có USER identity "

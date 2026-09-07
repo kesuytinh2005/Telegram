@@ -152,24 +152,6 @@ USER_AGENTS = [
         "Chrome/140.0.0.0 Safari/537.36"  
     ),  
 ]  
-def extract_content_identifiers(text: str) -> List[str]:  
-    if not text:  
-        return []  
-    found = []  
-    found.extend(  
-        re.findall(  
-            r"(?<!\d)(\d{5,30})(?!\d)",  
-            text,  
-        )  
-    )  
-    found.extend(  
-        re.findall(  
-            r"\bpfbid[A-Za-z0-9_-]{6,299}\b",  
-            text,  
-            re.I,  
-        )  
-    )  
-    return unique_keep_order(found)  
 def make_headers(  
     *,  
     mobile: bool = False,  
@@ -234,31 +216,6 @@ def is_numeric_id(value: Any) -> bool:
     s = str(value).strip()  
     return bool(  
         re.fullmatch(r"\d{5,30}", s)  
-    )  
-def is_opaque_content_id(value: Any) -> bool:  
-    if value is None:  
-        return False  
-    s = clean_text(value)  
-    if not s:  
-        return False  
-    if len(s) < 6 or len(s) > 300:  
-        return False  
-    if re.fullmatch(  
-        r"pfbid[A-Za-z0-9_-]+",  
-        s,  
-        re.I,  
-    ):  
-        return True  
-    if re.fullmatch(  
-        r"[A-Za-z0-9][A-Za-z0-9._:-]{5,299}",  
-        s,  
-    ):  
-        return not is_numeric_id(s)  
-    return False  
-def is_content_id(value: Any) -> bool:  
-    return (  
-        is_numeric_id(value)  
-        or is_opaque_content_id(value)  
     )  
 def unique_keep_order(items: Iterable[str]) -> List[str]:  
     seen = set()  
@@ -533,13 +490,9 @@ class URLParser:
                 idx = lower.index("posts")  
                 if idx + 1 < len(segments):  
                     candidate = segments[idx + 1]  
-                    if is_content_id(candidate):  
+                    if is_numeric_id(candidate):  
                         shape.post_id = candidate  
-                    if "groups" in lower:  
-                        shape.kind = "GROUP_POST"  
-                    else:  
-                        shape.kind = "POST"  
-                    shape.route_confidence = 99  
+                shape.kind = "GROUP_POST"  
             elif "reel" in lower or "reels" in lower:  
                 shape.kind = "REEL"  
             elif "videos" in lower or "video" in lower:  
@@ -1945,13 +1898,13 @@ def scan_scripts(
             pattern = re.compile(  
                 rf'["\']{re.escape(key)}["\']'  
                 rf'\s*:\s*["\']?'  
-                rf'([A-Za-z0-9._:-]{{5,300}})'  
+                rf'(\d{{5,30}})'  
                 rf'["\']?',  
                 re.I,  
             )  
             for match in pattern.finditer(script):  
                 value = match.group(1)  
-                if not is_content_id(value):  
+                if not is_numeric_id(value):  
                     continue  
                 collector.add(  
                     value,  
@@ -1960,33 +1913,6 @@ def scan_scripts(
                     key=key,  
                     weight=weight,  
                 )  
-        opaque_pattern = re.compile(  
-            r"\bpfbid[A-Za-z0-9_-]{6,299}\b",  
-            re.I,  
-        )  
-        for match in opaque_pattern.finditer(script):  
-            value = match.group(0)  
-            if not is_opaque_content_id(value):  
-                continue  
-            start = max(  
-                0,  
-                match.start() - 700,  
-            )  
-            end = min(  
-                len(script),  
-                match.end() + 700,  
-            )  
-            context = clean_text(  
-                script[start:end]  
-            )  
-            collector.add(  
-                value,  
-                role="OBJECT_ID",  
-                source=source,  
-                key="opaque_content_id",  
-                weight=115,  
-                neighbor=context,  
-            )  
         semantic_objects = (  
             "user",  
             "profile",  
@@ -2537,24 +2463,7 @@ class EntityClassifier:
             result.confidence = 95  
             result.event_id = event_ids[0]  
         if result.publisher == "USER":  
-            if (  
-                shape.kind == "PROFILE"  
-                and shape.numeric_path_id  
-                and is_numeric_id(  
-                    shape.numeric_path_id  
-                )  
-            ):  
-                result.user_uid = (  
-                    shape.numeric_path_id  
-                )  
-            else:  
-                ranked = rank_user_candidates(  
-                    collector,  
-                    username=shape.username,  
-                    shape=shape,  
-                )  
-                if ranked:  
-                    result.user_uid = ranked[0][0]  
+            pass  
         elif result.publisher == "UNKNOWN":  
             if shape.group_id:  
                 result.publisher = "GROUP"  
@@ -2681,11 +2590,6 @@ def rank_user_candidates(
         | group_ids  
         | event_ids  
     )  
-    route_entity = (  
-        shape.route_entity  
-        if shape  
-        else ""  
-    )  
     for evidence in collector.by_role(  
         "USER_CANDIDATE"  
     ):  
@@ -2694,13 +2598,6 @@ def rank_user_candidates(
             continue  
         if value in blocked:  
             continue  
-        if route_entity == "USER":  
-            if evidence.entity_type in {  
-                "PAGE",  
-                "GROUP",  
-                "EVENT",  
-            }:  
-                continue  
         scores.setdefault(  
             value,  
             0.0,  
@@ -2767,13 +2664,13 @@ def rank_user_candidates(
             "creatorid",  
             "creator.id",  
         }:  
-            score += 5  
+            score += 18  
         if keys & {  
             "actor_id",  
             "actorid",  
             "actor.id",  
         }:  
-            score += 3  
+            score += 12  
         if len(sources) >= 2:  
             score += 18  
         if len(sources) >= 3:  
@@ -2799,7 +2696,7 @@ def rank_user_candidates(
                     username_match = True  
                     break  
             if username_match:  
-                score += 15  
+                score += 35  
         publisher_key_match = bool(  
             keys  
             & {  
@@ -3486,43 +3383,6 @@ class IdentityVerifier:
                     "publisher identity evidence."  
                 )  
                 return result  
-        if shape.route_entity == "USER":  
-            evidence = [  
-                e  
-                for e in collector.by_role(  
-                    "USER_CANDIDATE"  
-                )  
-                if e.value == candidate  
-            ]  
-            keys = {  
-                normalize_key(e.key)  
-                for e in evidence  
-            }  
-            strong_identity = bool(  
-                keys  
-                & {  
-                    "user_id",  
-                    "userid",  
-                    "profile_id",  
-                    "profileid",  
-                    "profile.uid",  
-                    "profile.id",  
-                    "publisher_id",  
-                    "publisherid",  
-                    "publisher.id",  
-                    "author_id",  
-                    "authorid",  
-                    "author.id",  
-                    "owner_id",  
-                    "ownerid",  
-                    "owner.id",  
-                    "from_id",  
-                    "fromid",  
-                    "from.id",  
-                }  
-            )  
-            if not strong_identity:  
-                continue  
         if score < 78:  
             result.reason = (  
                 "UID candidate chưa đạt "  

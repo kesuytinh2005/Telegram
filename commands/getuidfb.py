@@ -152,6 +152,30 @@ USER_AGENTS = [
         "Chrome/140.0.0.0 Safari/537.36"
     ),
 ]
+def extract_content_identifiers(text: str) -> List[str]:
+    if not text:
+        return []
+
+    found = []
+
+    # Numeric Facebook object IDs
+    found.extend(
+        re.findall(
+            r"(?<!\d)(\d{5,30})(?!\d)",
+            text,
+        )
+    )
+
+    # Facebook opaque post/reel identifiers
+    found.extend(
+        re.findall(
+            r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
+            text,
+            re.I,
+        )
+    )
+
+    return unique_keep_order(found)
 def make_headers(
     *,
     mobile: bool = False,
@@ -217,6 +241,42 @@ def is_numeric_id(value: Any) -> bool:
     return bool(
         re.fullmatch(r"\d{5,30}", s)
     )
+def is_opaque_content_id(value: Any) -> bool:
+    if value is None:
+        return False
+
+    s = clean_text(value)
+
+    if not s:
+        return False
+
+    if len(s) < 6 or len(s) > 300:
+        return False
+
+    # Facebook opaque identifiers.
+    if re.fullmatch(
+        r"pfbid[A-Za-z0-9_-]+",
+        s,
+        re.I,
+    ):
+        return True
+
+    # Các ID dạng token/chữ số khác.
+    if re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{5,299}",
+        s,
+    ):
+        return not is_numeric_id(s)
+
+    return False
+
+
+def is_content_id(value: Any) -> bool:
+    return (
+        is_numeric_id(value)
+        or is_opaque_content_id(value)
+    )
+
 def unique_keep_order(items: Iterable[str]) -> List[str]:
     seen = set()
     out = []
@@ -488,11 +548,19 @@ class URLParser:
             shape.route_entity = "GROUP"
             if "posts" in lower:
                 idx = lower.index("posts")
+
                 if idx + 1 < len(segments):
                     candidate = segments[idx + 1]
-                    if is_numeric_id(candidate):
+
+                    if is_content_id(candidate):
                         shape.post_id = candidate
-                shape.kind = "GROUP_POST"
+
+                    if "groups" in lower:
+                        shape.kind = "GROUP_POST"
+                    else:
+                        shape.kind = "POST"
+
+                    shape.route_confidence = 99
             elif "reel" in lower or "reels" in lower:
                 shape.kind = "REEL"
             elif "videos" in lower or "video" in lower:
@@ -685,65 +753,35 @@ class URLParser:
         shape: URLShape,
     ):
         segments = shape.segments
-
         if not segments:
             return
-
         lower = [
             x.lower()
             for x in segments
         ]
-
-        # ==================================================
-        # EXPLICIT GROUP
-        # ==================================================
-
         if "groups" in lower:
             idx = lower.index("groups")
-
             if idx + 1 < len(segments):
-
                 entity = segments[idx + 1]
-
                 if is_numeric_id(entity):
                     shape.group_id = entity
                 else:
                     shape.username = entity
-
                 shape.route_entity = "GROUP"
                 return
-
-        # ==================================================
-        # EXPLICIT PAGE
-        # ==================================================
-
         if "pages" in lower:
             idx = lower.index("pages")
-
             if idx + 1 < len(segments):
-
                 entity = segments[idx + 1]
-
                 if is_numeric_id(entity):
                     shape.page_id = entity
                 else:
                     shape.username = entity
-
                 shape.route_entity = "PAGE"
                 return
-
-        # ==================================================
-        # FIRST SEGMENT NUMERIC
-        # ==================================================
-
         if is_numeric_id(segments[0]):
             shape.numeric_path_id = segments[0]
             return
-
-        # ==================================================
-        # RESERVED ROUTE
-        # ==================================================
-
         reserved = {
             "watch",
             "reel",
@@ -765,23 +803,9 @@ class URLParser:
             "profile.php",
             "permalink.php",
         }
-
         first = segments[0]
-
         if first.lower() in reserved:
             return
-
-        # ==================================================
-        # USERNAME ROUTE
-        #
-        # /dxt2k4/posts/123
-        # /dxt2k4/reel/123
-        # /dxt2k4/videos/123
-        # /dxt2k4/photos/123
-        #
-        # => USER
-        # ==================================================
-
         shape.username = first
         shape.route_entity = "USER"
 class FBHTMLParser(HTMLParser):
@@ -1942,13 +1966,13 @@ def scan_scripts(
             pattern = re.compile(
                 rf'["\']{re.escape(key)}["\']'
                 rf'\s*:\s*["\']?'
-                rf'(\d{{5,30}})'
+                rf'([A-Za-z0-9._:-]{{5,300}})'
                 rf'["\']?',
                 re.I,
             )
             for match in pattern.finditer(script):
                 value = match.group(1)
-                if not is_numeric_id(value):
+                if not is_content_id(value):
                     continue
                 collector.add(
                     value,
@@ -1957,6 +1981,44 @@ def scan_scripts(
                     key=key,
                     weight=weight,
                 )
+        # ============================================================
+        # OPAQUE FACEBOOK CONTENT IDS
+        # ============================================================
+
+        opaque_pattern = re.compile(
+            r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
+            re.I,
+        )
+
+        for match in opaque_pattern.finditer(script):
+
+            value = match.group(0)
+
+            if not is_opaque_content_id(value):
+                continue
+
+            start = max(
+                0,
+                match.start() - 700,
+            )
+
+            end = min(
+                len(script),
+                match.end() + 700,
+            )
+
+            context = clean_text(
+                script[start:end]
+            )
+
+            collector.add(
+                value,
+                role="OBJECT_ID",
+                source=source,
+                key="opaque_content_id",
+                weight=115,
+                neighbor=context,
+            )
         semantic_objects = (
             "user",
             "profile",
@@ -2172,19 +2234,12 @@ class IdentityCorrelation:
         ).lower()
         if wanted:
             username_context_match = False
-
             for evidence in evidences:
-
                 context = clean_text(
                     evidence.neighbor
                 ).lower()
-
                 if not context:
                     continue
-
-                # Username phải nằm trong cùng semantic
-                # evidence với candidate.
-
                 if (
                     wanted in context
                     and any(
@@ -2201,7 +2256,6 @@ class IdentityCorrelation:
                 ):
                     username_context_match = True
                     break
-
             if username_context_match:
                 score += 25
                 signals.append(
@@ -2426,7 +2480,6 @@ class EntityClassifier:
         "ALBUM",
         "GROUP_POST",
     }
-
     @staticmethod
     def _candidate_has_entity(
         collector: EvidenceCollector,
@@ -2436,120 +2489,71 @@ class EntityClassifier:
         for evidence in collector.items:
             if evidence.value != value:
                 continue
-
             if evidence.role in roles:
                 return True
-
         return False
-
     @staticmethod
     def _route_publisher_type(
         shape: URLShape,
     ) -> str:
         """
         HARD ROUTE TYPE.
-
         Route semantics được ưu tiên hơn các ID phụ
         xuất hiện ngẫu nhiên trong HTML.
         """
-
-        # Explicit group route
         if shape.route_entity == "GROUP":
             return "GROUP"
-
-        # Explicit page route
         if shape.route_entity == "PAGE":
             return "PAGE"
-
-        # profile.php?id=...
         if shape.kind == "PROFILE":
             return "USER"
-
-        # Content route có username nhưng không có
-        # explicit PAGE/GROUP route.
         if (
             shape.kind in EntityClassifier.CONTENT_KINDS
             and shape.username
         ):
             return "USER"
-
         return "UNKNOWN"
-
     def classify(
         self,
         shape: URLShape,
         collector: EvidenceCollector,
         snapshots: List[PageSnapshot],
     ) -> EntityClassification:
-
         result = EntityClassification()
-
         page_ids = unique_keep_order(
             collector.values_for("PAGE_ID")
         )
-
         group_ids = unique_keep_order(
             collector.values_for("GROUP_ID")
         )
-
         event_ids = unique_keep_order(
             collector.values_for("EVENT_ID")
         )
-
         user_candidates = unique_keep_order(
             collector.values_for("USER_CANDIDATE")
         )
-
-        # ==================================================
-        # 1. HARD ROUTE CLASSIFICATION
-        # ==================================================
-
         route_type = self._route_publisher_type(shape)
-
-        # --------------------------------------------------
-        # GROUP
-        # --------------------------------------------------
-
         if route_type == "GROUP":
-
             result.publisher = "GROUP"
             result.confidence = 100
-
             if shape.group_id:
                 result.group_id = shape.group_id
-
             elif group_ids:
                 result.group_id = group_ids[0]
-
-        # --------------------------------------------------
-        # PAGE
-        # --------------------------------------------------
-
         elif route_type == "PAGE":
-
             result.publisher = "PAGE"
             result.confidence = 100
-
             if shape.page_id:
                 result.page_id = shape.page_id
-
             elif page_ids:
                 result.page_id = page_ids[0]
-
-        # --------------------------------------------------
-        # USER
-        # --------------------------------------------------
-
         elif route_type == "USER":
-
             result.publisher = "USER"
             result.confidence = (
                 100
                 if shape.kind == "PROFILE"
                 else 96
             )
-
-            # profile.php?id=...
             if (
                 shape.kind == "PROFILE"
                 and shape.numeric_path_id
@@ -2560,78 +2564,18 @@ class EntityClassifier:
                 result.user_uid = (
                     shape.numeric_path_id
                 )
-
-        # --------------------------------------------------
-        # EVENT
-        # --------------------------------------------------
-
         elif event_ids:
-
             result.publisher = "EVENT"
             result.confidence = 95
             result.event_id = event_ids[0]
-
-        # ==================================================
-        # 2. DO NOT LET RANDOM page_id/group_id OVERRIDE
-        #    USER ROUTE
-        # ==================================================
-
-        if result.publisher == "USER":
-
-            # page_id/group_id trong HTML có thể là:
-            #
-            # - suggested page
-            # - attached page
-            # - referenced entity
-            # - ad
-            # - comment
-            # - media metadata
-            #
-            # Chúng KHÔNG được phép đổi USER -> PAGE/GROUP.
-
-            pass
-
-        # ==================================================
-        # 3. ONLY FALLBACK TO EMBEDDED ENTITY WHEN ROUTE
-        #    DOES NOT TELL US THE PUBLISHER
-        # ==================================================
-
-        elif result.publisher == "UNKNOWN":
-
-            if shape.group_id:
-                result.publisher = "GROUP"
-                result.confidence = 100
-                result.group_id = shape.group_id
-
-            elif shape.page_id:
-                result.publisher = "PAGE"
-                result.confidence = 100
-                result.page_id = shape.page_id
-
-            elif group_ids:
-                result.publisher = "GROUP"
-                result.confidence = 90
-                result.group_id = group_ids[0]
-
-            elif page_ids:
-                result.publisher = "PAGE"
-                result.confidence = 90
-                result.page_id = page_ids[0]
-
-            elif event_ids:
-                result.publisher = "EVENT"
-                result.confidence = 90
-                result.event_id = event_ids[0]
-
-        # ==================================================
-        # 4. USER CANDIDATE RANKING
-        # ==================================================
-
         if result.publisher == "USER":
 
             if (
                 shape.kind == "PROFILE"
                 and shape.numeric_path_id
+                and is_numeric_id(
+                    shape.numeric_path_id
+                )
             ):
                 result.user_uid = (
                     shape.numeric_path_id
@@ -2647,198 +2591,188 @@ class EntityClassifier:
 
                 if ranked:
                     result.user_uid = ranked[0][0]
-
-        # ==================================================
-        # 5. AUTHOR FOR PAGE/GROUP
-        #
-        # IMPORTANT:
-        # publisher != author
-        #
-        # PAGE/GROUP can have a human author.
-        # ==================================================
-
+        elif result.publisher == "UNKNOWN":
+            if shape.group_id:
+                result.publisher = "GROUP"
+                result.confidence = 100
+                result.group_id = shape.group_id
+            elif shape.page_id:
+                result.publisher = "PAGE"
+                result.confidence = 100
+                result.page_id = shape.page_id
+            elif group_ids:
+                result.publisher = "GROUP"
+                result.confidence = 90
+                result.group_id = group_ids[0]
+            elif page_ids:
+                result.publisher = "PAGE"
+                result.confidence = 90
+                result.page_id = page_ids[0]
+            elif event_ids:
+                result.publisher = "EVENT"
+                result.confidence = 90
+                result.event_id = event_ids[0]
+        if result.publisher == "USER":
+            if (
+                shape.kind == "PROFILE"
+                and shape.numeric_path_id
+            ):
+                result.user_uid = (
+                    shape.numeric_path_id
+                )
+            else:
+                ranked = rank_user_candidates(
+                    collector,
+                    username=shape.username,
+                    shape=shape,
+                )
+                if ranked:
+                    result.user_uid = ranked[0][0]
         if result.publisher in {
             "PAGE",
             "GROUP",
         }:
-
             excluded = set(
                 page_ids
                 + group_ids
                 + event_ids
             )
-
             ranked = rank_author_candidates(
                 collector,
                 excluded_ids=excluded,
             )
-
             if ranked:
                 result.author_uid = ranked[0][0]
-
-        # ==================================================
-        # 6. SIGNALS
-        # ==================================================
-
         if shape.username:
             result.signals.append(
                 "route → publisher username"
             )
-
         if shape.kind in self.CONTENT_KINDS:
             result.signals.append(
                 f"route → {shape.kind}"
             )
-
         if result.publisher == "USER":
             result.signals.append(
                 "publisher type → USER"
             )
-
         elif result.publisher == "PAGE":
             result.signals.append(
                 "publisher type → PAGE"
             )
-
         elif result.publisher == "GROUP":
             result.signals.append(
                 "publisher type → GROUP"
             )
-
         if page_ids:
             result.signals.append(
                 "embedded page_id detected"
             )
-
         if group_ids:
             result.signals.append(
                 "embedded group_id detected"
             )
-
         if user_candidates:
             result.signals.append(
                 "identity candidate found"
             )
-
         result.signals = unique_keep_order(
             result.signals
         )[:MAX_SIGNALS]
-
         return result
 def rank_user_candidates(
     collector: EvidenceCollector,
     username: str = "",
     shape: Optional[URLShape] = None,
 ) -> List[Tuple[str, float]]:
-
     scores: Dict[str, float] = {}
     evidence_map: Dict[str, List[Evidence]] = {}
-
     wanted = (
         clean_text(username)
         .lstrip("@")
         .lower()
     )
-
-    # ==================================================
-    # OBJECT IDS MUST NEVER BECOME USER UID
-    # ==================================================
-
     object_ids = {
         e.value
         for e in collector.by_role("OBJECT_ID")
         if is_numeric_id(e.value)
     }
-
     page_ids = {
         e.value
         for e in collector.by_role("PAGE_ID")
         if is_numeric_id(e.value)
     }
-
     group_ids = {
         e.value
         for e in collector.by_role("GROUP_ID")
         if is_numeric_id(e.value)
     }
-
     event_ids = {
         e.value
         for e in collector.by_role("EVENT_ID")
         if is_numeric_id(e.value)
     }
-
     blocked = (
         object_ids
         | page_ids
         | group_ids
         | event_ids
     )
-
-    # ==================================================
-    # COLLECT CANDIDATES
-    # ==================================================
-
+    route_entity = (
+        shape.route_entity
+        if shape
+        else ""
+    )
     for evidence in collector.by_role(
         "USER_CANDIDATE"
     ):
-
+    	
         value = evidence.value
-
         if not is_numeric_id(value):
             continue
-
-        # Never accept object/entity IDs.
         if value in blocked:
             continue
+        # ============================================================
+        # HARD USER ROUTE
+        # ============================================================
 
+        if route_entity == "USER":
+
+            if evidence.entity_type in {
+                "PAGE",
+                "GROUP",
+                "EVENT",
+            }:
+                continue
         scores.setdefault(
             value,
             0.0,
         )
-
         evidence_map.setdefault(
             value,
             [],
         ).append(evidence)
-
-    # ==================================================
-    # SCORE
-    # ==================================================
-
     ranked = []
-
     for value, evidences in evidence_map.items():
-
         score = 0.0
-
         keys = {
             normalize_key(e.key)
             for e in evidences
         }
-
         sources = {
             e.source
             for e in evidences
             if e.independent
         }
-
         contexts = " ".join(
             clean_text(e.neighbor)
             for e in evidences
         ).lower()
-
-        # --------------------------------------------------
-        # HARD USER ID FIELDS
-        # --------------------------------------------------
-
         if keys & {
             "user_id",
             "userid",
             "userid",
         }:
             score += 50
-
         if keys & {
             "profile_id",
             "profileid",
@@ -2846,74 +2780,48 @@ def rank_user_candidates(
             "profile.id",
         }:
             score += 50
-
-        # --------------------------------------------------
-        # PUBLISHER ID FIELDS
-        # --------------------------------------------------
-
         if keys & {
             "publisher_id",
             "publisherid",
             "publisher.id",
         }:
             score += 55
-
         if keys & {
             "author_id",
             "authorid",
             "author.id",
         }:
             score += 48
-
         if keys & {
             "owner_id",
             "ownerid",
             "owner.id",
         }:
             score += 45
-
         if keys & {
             "from_id",
             "fromid",
             "from.id",
         }:
             score += 42
-
-        # --------------------------------------------------
-        # CREATOR / ACTOR ARE WEAKER
-        # --------------------------------------------------
-
         if keys & {
             "creator_id",
             "creatorid",
             "creator.id",
         }:
-            score += 18
-
+            score += 5
         if keys & {
             "actor_id",
             "actorid",
             "actor.id",
         }:
-            score += 12
-
-        # --------------------------------------------------
-        # SOURCE DIVERSITY
-        # --------------------------------------------------
-
+            score += 3
         if len(sources) >= 2:
             score += 18
-
         if len(sources) >= 3:
             score += 12
-
         if len(sources) >= 4:
             score += 8
-
-        # --------------------------------------------------
-        # USER SEMANTICS
-        # --------------------------------------------------
-
         if any(
             e.entity_type
             in {
@@ -2923,32 +2831,17 @@ def rank_user_candidates(
             for e in evidences
         ):
             score += 15
-
-        # --------------------------------------------------
-        # USERNAME CORRELATION
-        # --------------------------------------------------
-
         username_match = False
-
         if wanted:
-
             for evidence in evidences:
-
                 context = clean_text(
                     evidence.neighbor
                 ).lower()
-
                 if wanted in context:
                     username_match = True
                     break
-
             if username_match:
-                score += 35
-
-        # --------------------------------------------------
-        # CONTENT → PUBLISHER CORRELATION
-        # --------------------------------------------------
-
+                score += 15
         publisher_key_match = bool(
             keys
             & {
@@ -2966,7 +2859,7 @@ def rank_user_candidates(
                 "from.id",
             }
         )
-
+        
         if (
             shape
             and shape.kind in {
@@ -2979,11 +2872,6 @@ def rank_user_candidates(
             and publisher_key_match
         ):
             score += 30
-
-        # --------------------------------------------------
-        # WRONG ENTITY PENALTY
-        # --------------------------------------------------
-
         if any(
             e.entity_type
             in {
@@ -2994,23 +2882,12 @@ def rank_user_candidates(
             for e in evidences
         ):
             score -= 100
-
-        # --------------------------------------------------
-        # USER ROUTE BONUS
-        # --------------------------------------------------
-
         if (
             shape
             and shape.username
             and shape.route_entity == "USER"
         ):
             score += 25
-
-        # --------------------------------------------------
-        # IMPORTANT:
-        # creator/actor alone is NEVER enough.
-        # --------------------------------------------------
-
         only_weak_identity = (
             keys
             and keys <= {
@@ -3022,10 +2899,8 @@ def rank_user_candidates(
                 "actor.id",
             }
         )
-
         if only_weak_identity:
             score -= 30
-
         if score > 0:
             ranked.append(
                 (
@@ -3033,12 +2908,10 @@ def rank_user_candidates(
                     score,
                 )
             )
-
     ranked.sort(
         key=lambda x: x[1],
         reverse=True,
     )
-
     return ranked
 def rank_author_candidates(
     collector: EvidenceCollector,
@@ -3470,7 +3343,6 @@ class VerificationResult:
     )
     reason: str = ""
 class IdentityVerifier:
-
     def verify(
         self,
         *,
@@ -3481,26 +3353,13 @@ class IdentityVerifier:
         classification: EntityClassification,
         profile: ProfileInfo,
     ) -> VerificationResult:
-
         result = VerificationResult()
-
-        # ==================================================
-        # ONLY USER PUBLISHER REACHES THIS BRANCH
-        # ==================================================
-
         if classification.publisher != "USER":
-
             result.reason = (
                 "Publisher không phải USER. "
                 "Không trả UID cá nhân."
             )
-
             return result
-
-        # ==================================================
-        # EXPLICIT PROFILE.PHP ID
-        # ==================================================
-
         if (
             shape.kind == "PROFILE"
             and shape.numeric_path_id
@@ -3508,25 +3367,16 @@ class IdentityVerifier:
                 shape.numeric_path_id
             )
         ):
-
             result.uid = (
                 shape.numeric_path_id
             )
-
             result.verified = True
             result.confidence = 99.5
             result.sources = 1
-
             result.signals.append(
                 "profile.php?id → explicit USER UID"
             )
-
             return result
-
-        # ==================================================
-        # USER CONTENT MUST HAVE USERNAME
-        # ==================================================
-
         if (
             shape.kind in {
                 "POST",
@@ -3538,48 +3388,29 @@ class IdentityVerifier:
             }
             and not shape.username
         ):
-
             result.reason = (
                 "Content URL không có publisher "
                 "username để correlation."
             )
-
             return result
-
-        # ==================================================
-        # RANK CANDIDATES
-        # ==================================================
-
         ranked = rank_user_candidates(
             collector,
             username=profile.username or shape.username,
             shape=shape,
         )
-
         if not ranked:
-
             result.reason = (
                 "Không có USER UID candidate "
                 "đủ điều kiện."
             )
-
             return result
-
-        # ==================================================
-        # CORRELATION
-        # ==================================================
-
         correlator = IdentityCorrelation()
-
         correlated = []
-
         username = (
             profile.username
             or shape.username
         )
-
         for candidate, base_score in ranked[:20]:
-
             correlation_score, signals = (
                 correlator.score_candidate(
                     candidate=candidate,
@@ -3589,16 +3420,13 @@ class IdentityVerifier:
                     shape=shape,
                 )
             )
-
             if correlation_score <= 0:
                 continue
-
             final_score = (
                 base_score * 0.40
                 +
                 correlation_score * 0.60
             )
-
             correlated.append(
                 (
                     candidate,
@@ -3606,55 +3434,32 @@ class IdentityVerifier:
                     signals,
                 )
             )
-
-        # ==================================================
-        # NO CORRELATION
-        # ==================================================
-
         if not correlated:
-
             result.reason = (
                 "Có USER candidate nhưng "
                 "không chứng minh được candidate "
                 "thuộc publisher."
             )
-
             return result
-
         correlated.sort(
             key=lambda x: x[1],
             reverse=True,
         )
-
         candidate, score, signals = (
             correlated[0]
         )
-
-        # ==================================================
-        # CONFLICT DETECTION
-        # ==================================================
-
         if len(correlated) >= 2:
-
             second_candidate = correlated[1]
-
             if (
                 second_candidate[1]
                 >= score * 0.92
             ):
-
                 result.reason = (
                     "Có nhiều USER UID cạnh tranh "
                     "và chưa đủ bằng chứng để "
                     "chọn publisher UID."
                 )
-
                 return result
-
-        # ==================================================
-        # HARD REQUIREMENTS FOR CONTENT
-        # ==================================================
-
         if shape.kind in {
             "POST",
             "REEL",
@@ -3663,7 +3468,6 @@ class IdentityVerifier:
             "STORY",
             "ALBUM",
         }:
-
             evidence = [
                 e
                 for e in collector.by_role(
@@ -3671,12 +3475,10 @@ class IdentityVerifier:
                 )
                 if e.value == candidate
             ]
-
             keys = {
                 normalize_key(e.key)
                 for e in evidence
             }
-
             has_strong_user_field = bool(
                 keys
                 & {
@@ -3688,7 +3490,6 @@ class IdentityVerifier:
                     "profile.id",
                 }
             )
-
             has_publisher_field = bool(
                 keys
                 & {
@@ -3706,7 +3507,6 @@ class IdentityVerifier:
                     "from.id",
                 }
             )
-
             has_username_signal = any(
                 "username"
                 in clean_text(
@@ -3719,63 +3519,80 @@ class IdentityVerifier:
                 for e in evidence
                 if username
             )
-
-            # --------------------------------------------------
-            # STRICT PUBLISHER REQUIREMENT
-            # --------------------------------------------------
-
             if not (
                 has_strong_user_field
                 or has_publisher_field
                 or has_username_signal
             ):
-
                 result.reason = (
                     "Candidate có UID nhưng không có "
                     "publisher identity evidence."
                 )
-
                 return result
+        if shape.route_entity == "USER":
 
-        # ==================================================
-        # FINAL THRESHOLD
-        # ==================================================
+            evidence = [
+                e
+                for e in collector.by_role(
+                    "USER_CANDIDATE"
+                )
+                if e.value == candidate
+            ]
 
+            keys = {
+                normalize_key(e.key)
+                for e in evidence
+            }
+
+            strong_identity = bool(
+                keys
+                & {
+                    "user_id",
+                    "userid",
+                    "profile_id",
+                    "profileid",
+                    "profile.uid",
+                    "profile.id",
+                    "publisher_id",
+                    "publisherid",
+                    "publisher.id",
+                    "author_id",
+                    "authorid",
+                    "author.id",
+                    "owner_id",
+                    "ownerid",
+                    "owner.id",
+                    "from_id",
+                    "fromid",
+                    "from.id",
+                }
+            )
+
+            if not strong_identity:
+                continue
         if score < 78:
-
             result.reason = (
                 "UID candidate chưa đạt "
                 "ngưỡng publisher correlation."
             )
-
             return result
-
-        # ==================================================
-        # VERIFY
-        # ==================================================
-
         result.uid = candidate
         result.verified = True
-
         result.confidence = min(
             99.5,
             score,
         )
-
         result.sources = len(
             collector.sources_for(
                 candidate
             )
         )
-
         result.signals.extend(
             signals
         )
-
         result.signals = unique_keep_order(
             result.signals
         )[:MAX_SIGNALS]
-
         return result
 @dataclass
 class ResolveResult:

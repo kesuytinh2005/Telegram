@@ -34,6 +34,7 @@ Không bao giờ đoán UID khi evidence không đủ.
 """
 from __future__ import annotations
 import asyncio
+import base64
 import html as html_lib
 import json
 import logging
@@ -258,6 +259,28 @@ def is_content_id(value: Any) -> bool:
         is_numeric_id(value)
         or is_opaque_content_id(value)
     )
+def decode_facebook_story_token(value: str) -> List[str]:
+    """Extract safe numeric identifiers from a Facebook story token.
+
+    This is not UID guessing: it only decodes an explicitly supplied story
+    token and returns numeric values actually encoded in it.
+    """
+    out: List[str] = []
+    value = unquote(clean_text(value))
+    candidates = [value]
+    try:
+        padded = value + ("=" * (-len(value) % 4))
+        raw = base64.b64decode(padded, validate=False).decode("utf-8", "ignore")
+        candidates.extend([raw, unquote(raw)])
+    except Exception:
+        pass
+    for text in candidates:
+        for n in re.findall(r"(?<!\d)(\d{10,30})(?!\d)", text):
+            if n not in out:
+                out.append(n)
+    return out
+
+
 def unique_keep_order(
     items: Iterable[str],
 ) -> List[str]:
@@ -750,13 +773,33 @@ class URLParser:
             "story.php" in p.path.lower()
             or "stories" in lower
         ):
+            # Facebook story URLs can carry TWO important identifiers:
+            #   /stories/<owner_numeric_id>/<opaque_story_token>/
+            # The first numeric segment is the public owner/profile UID
+            # candidate; the second segment may be a base64-ish story object
+            # token.  Do not throw either away.
+            idx = lower.index("stories") if "stories" in lower else -1
+            if idx >= 0 and idx + 1 < len(segments):
+                owner_candidate = segments[idx + 1]
+                if is_numeric_id(owner_candidate):
+                    shape.numeric_path_id = owner_candidate
+                    shape.route_entity = "USER"
+                    shape.route_confidence = max(shape.route_confidence, 97)
+                if idx + 2 < len(segments):
+                    story_token = segments[idx + 2]
+                    if is_content_id(story_token):
+                        shape.story_id = story_token
+                    else:
+                        # Preserve opaque story tokens such as
+                        # UzpfSVNDOjEwODI2OTkxNDA5MzYwNjI= for PASS 2.
+                        shape.opaque_token = story_token
             for key in (
                 "story_fbid",
                 "fbid",
             ):
                 if key in shape.query:
                     candidate = shape.query[key][0]
-                    if is_numeric_id(candidate):
+                    if is_content_id(candidate):
                         shape.story_id = candidate
                         break
             shape.kind = "STORY"
@@ -2909,7 +2952,9 @@ class EntityClassifier:
         if (
             shape.kind
             in EntityClassifier.CONTENT_KINDS
-            and shape.username
+            and (shape.username or (shape.kind == "STORY" and shape.numeric_path_id))
+            and shape.route_entity != "PAGE"
+            and shape.route_entity != "GROUP"
         ):
             return "USER"
         return "UNKNOWN"
@@ -3796,13 +3841,30 @@ class IdentityVerifier:
                 "ALBUM",
             }
             and not shape.username
+            and not (shape.kind == "STORY" and shape.numeric_path_id and shape.route_entity == "USER")
         ):
             result.reason = (
-                "Content URL không có "
-                "publisher username "
-                "để correlation."
+                "Content URL không có publisher username "
+                "hoặc explicit story owner để correlation."
             )
             return result
+        # Explicit /stories/<owner_id>/<token> route: the owner ID is a
+        # first-class public identity signal. Only use it when the route is
+        # classified as USER and no page/group veto exists.
+        if (
+            shape.kind == "STORY"
+            and shape.route_entity == "USER"
+            and is_numeric_id(shape.numeric_path_id)
+            and not collector.by_role("PAGE_ID")
+            and not collector.by_role("GROUP_ID")
+        ):
+            result.uid = shape.numeric_path_id
+            result.verified = True
+            result.confidence = 99.0
+            result.sources = 1
+            result.signals.append("/stories/<owner_id>/ → explicit USER owner UID")
+            return result
+
         ranked = rank_user_candidates(
             collector,
             username=(
@@ -4450,6 +4512,7 @@ class FacebookResolver:
         for attr in (
             "post_id", "reel_id", "video_id",
             "photo_id", "story_id", "album_id",
+            "numeric_path_id", "opaque_token", "username",
         ):
             original_value = getattr(original_shape, attr, "")
             if original_value and not getattr(shape, attr, ""):
@@ -4601,6 +4664,106 @@ class FacebookResolver:
             key = (kind, ident, source)
             if key not in pass2_ids:
                 pass2_ids.append(key)
+
+        # IMPORTANT: PASS 2 also inspects the ORIGINAL INPUT URL.
+        # A share permalink can be accompanied by a resolved /stories/... URL
+        # containing the owner UID and an opaque story token.  The original
+        # URL is stronger evidence than generic landing-page HTML.
+        original_input_urls = [original_shape.original, url]
+        for original_input_url in original_input_urls:
+            try:
+                os = URLParser.parse(original_input_url)
+            except Exception:
+                continue
+            if os.numeric_path_id and os.route_entity == "USER":
+                add_pass2_id("author", os.numeric_path_id, "original_story_owner")
+            if os.story_id:
+                add_pass2_id("story", os.story_id, "original_url_story_id")
+            if os.opaque_token:
+                for decoded_id in decode_facebook_story_token(os.opaque_token):
+                    add_pass2_id("story", decoded_id, "decoded_story_token")
+                result.debug.setdefault("pass2", {}).setdefault("opaque_tokens", []).append(
+                    truncate(os.opaque_token, 120)
+                )
+
+        # PASS 2 also follows an explicitly supplied share_url query parameter.
+        # Facebook story/shared URLs commonly contain:
+        #   share_url=https://www.facebook.com/share/<token>/
+        # This is a user-provided/public URL reference, not an auth bypass.
+        def harvest_nested_public_urls(seed_url: str):
+            seen_local = set()
+            queue = [seed_url]
+            while queue and len(seen_local) < 12:
+                current = queue.pop(0)
+                if not current or current in seen_local:
+                    continue
+                seen_local.add(current)
+                try:
+                    parsed_current = urlparse(current)
+                    qs = parse_qs(parsed_current.query, keep_blank_values=True)
+                except Exception:
+                    continue
+                for key in ("share_url", "url", "target", "redirect_uri"):
+                    for value in qs.get(key, []):
+                        value = unquote(value)
+                        if is_facebook_host(urlparse(value).netloc):
+                            try:
+                                nested_shape = URLParser.parse(value)
+                            except Exception:
+                                continue
+                            if nested_shape.story_id:
+                                add_pass2_id("story", nested_shape.story_id, "nested_share_url")
+                            if nested_shape.post_id:
+                                add_pass2_id("post", nested_shape.post_id, "nested_share_url")
+                            if nested_shape.reel_id:
+                                add_pass2_id("reel", nested_shape.reel_id, "nested_share_url")
+                            if nested_shape.video_id:
+                                add_pass2_id("video", nested_shape.video_id, "nested_share_url")
+                            if nested_shape.photo_id:
+                                add_pass2_id("photo", nested_shape.photo_id, "nested_share_url")
+                            if nested_shape.album_id:
+                                add_pass2_id("album", nested_shape.album_id, "nested_share_url")
+                            if nested_shape.numeric_path_id and nested_shape.route_entity == "USER":
+                                add_pass2_id("author", nested_shape.numeric_path_id, "nested_story_owner")
+                            queue.append(value)
+                # The current URL itself may be a story route.
+                try:
+                    cs = URLParser.parse(current)
+                    if cs.numeric_path_id and cs.route_entity == "USER":
+                        add_pass2_id("author", cs.numeric_path_id, "story_owner_route")
+                    if cs.story_id:
+                        add_pass2_id("story", cs.story_id, "story_route")
+                    if cs.opaque_token:
+                        for decoded_id in decode_facebook_story_token(cs.opaque_token):
+                            add_pass2_id("story", decoded_id, "nested_decoded_story_token")
+                except Exception:
+                    pass
+
+        harvest_nested_public_urls(url)
+
+        # The caller may have supplied a canonical/forwarded URL in the query.
+        # Inspect the original raw URL too, before normalize_facebook_url strips
+        # tracking parameters such as share_url.
+        harvest_nested_public_urls(original_shape.original)
+
+        # Explicit story-owner evidence: /stories/<numeric-owner>/<story-token>/
+        # carries a public owner identifier in the route. Treat it as USER
+        # identity evidence, while still allowing later page/group evidence to
+        # veto it.
+        story_owner = getattr(original_shape, "numeric_path_id", "")
+        if story_owner and original_shape.kind == "STORY" and is_numeric_id(story_owner):
+            collector.add(
+                story_owner,
+                role="USER_CANDIDATE",
+                source="original_story_owner_route",
+                key="profile_owner_id",
+                neighbor="/stories/<owner_id>/<story_id>",
+                url=original_shape.original,
+                weight=108.0,
+                independent=True,
+                entity_type="USER",
+            )
+            result.debug.setdefault("pass2", {})["explicit_story_owner"] = story_owner
 
         # PASS 2 ID harvesting is deliberately broader than PASS 1, but still
         # evidence-based.  For a share wrapper, inspect every response's
@@ -4772,6 +4935,21 @@ class FacebookResolver:
             probe_urls = self.build_object_probe_urls(
                 shape, result.content_url or snapshot.final_url or url
             )
+            # Direct owner/profile probing for IDs explicitly present in
+            # /stories/<numeric-owner>/<story-token>/ URLs.
+            author_ids = [i for k, i, _ in pass2_ids if k == "author" and is_numeric_id(i)]
+            for author_id in unique_keep_order(author_ids):
+                for profile_url in (
+                    f"https://www.facebook.com/profile.php?id={author_id}",
+                    f"https://m.facebook.com/profile.php?id={author_id}",
+                ):
+                    try:
+                        ps = self.fetcher.fetch(profile_url, referer=result.content_url or url)
+                    except Exception:
+                        continue
+                    phase2_snapshots.append(ps)
+                    self.merge_snapshot_evidence(ps, collector)
+
             for kind, ident, source in pass2_ids:
                 temp = URLShape(
                     original=result.content_url or url,
@@ -4868,9 +5046,9 @@ class FacebookResolver:
                 "profile_count": len(profile_snapshots),
                 "source_snapshot_count": len(pass2_source_snapshots),
                 "reason": (
-                    "No explicit object ID in route, redirect/canonical URLs, "
-                    "or recognizable pfbid evidence. Share token is opaque and "
-                    "is not treated as a UID/content ID."
+                    "No explicit object ID in input route, nested share_url, "
+                    "redirect/canonical URLs, or recognizable pfbid evidence. "
+                    "Opaque share tokens are not treated as UID guesses."
                 ),
             }
 
@@ -4978,6 +5156,10 @@ class FacebookResolver:
             result.debug["uid_candidates"] = [
                 {"uid": uid, "base_score": round(float(score), 2)}
                 for uid, score in ranked_debug
+            ]
+            result.debug.setdefault("candidate_chain", {})["story_owner_from_input"] = getattr(original_shape, "numeric_path_id", "")
+            result.debug.setdefault("candidate_chain", {})["nested_share_urls"] = [
+                v for v in original_shape.query.get("share_url", [])[:10]
             ]
             result.debug["pass1"] = {
                 "input": url,
@@ -5111,6 +5293,17 @@ class FacebookResolver:
         for ident in extract_content_identifiers(base_url):
             if is_content_id(ident):
                 add(f"https://{host}/{quote(ident, safe='')}")
+        # Repeat the same object representations on mobile/public hosts.
+        # This is still ordinary public HTTP and gives Facebook different
+        # rendering paths that may expose metadata absent from www.
+        base_urls = list(urls)
+        for u in base_urls:
+            pu = urlparse(u)
+            if pu.netloc == "www.facebook.com":
+                for host2 in ("m.facebook.com", "mbasic.facebook.com"):
+                    urls.append(urlunparse((
+                        pu.scheme, host2, pu.path, pu.params, pu.query, pu.fragment
+                    )))
         return unique_keep_order(urls)[:MAX_OBJECT_PROBES]
 
     @staticmethod

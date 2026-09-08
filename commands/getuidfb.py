@@ -4567,7 +4567,7 @@ class FacebookResolver:
         # the final result.  Once PASS 2 resolves a real object, shape will be
         # upgraded and the later reclassification below can describe it.
         if original_shape.wrapper and shape.kind == "SHARE_WRAPPER":
-            content = ContentInfo()
+            content = ContentClassification()
         entity_classifier = (
             EntityClassifier()
         )
@@ -4751,7 +4751,16 @@ class FacebookResolver:
         # identity evidence, while still allowing later page/group evidence to
         # veto it.
         story_owner = getattr(original_shape, "numeric_path_id", "")
-        if story_owner and original_shape.kind == "STORY" and is_numeric_id(story_owner):
+        # URL-level fallback: /stories/<numeric-owner>/<opaque-token>/ is an
+        # explicit owner route even when URLParser cannot classify route_entity
+        # because Facebook changed the route grammar. Never depend on the
+        # classifier to recover an ID that is literally present in the URL.
+        if not story_owner and original_shape.original:
+            _m = re.search(r"/stories/(\d{10,30})/", original_shape.original, re.I)
+            if _m:
+                story_owner = _m.group(1)
+                result.debug.setdefault("pass2", {})["explicit_story_owner_regex"] = story_owner
+        if story_owner and is_numeric_id(story_owner):
             collector.add(
                 story_owner,
                 role="USER_CANDIDATE",
@@ -4798,13 +4807,13 @@ class FacebookResolver:
             # Restrict this extraction to Facebook's recognizable pfbid form;
             # arbitrary alphanumeric tokens in a landing page are not objects.
             for ident in re.findall(
-                r"\\bpfbid[A-Za-z0-9_-]{6,299}\\b",
+                r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
                 ps.html or "",
                 re.I,
             ):
                 add_pass2_id("post", ident, "explicit_pfbid_html")
             for ident in re.findall(
-                r"\\bpfbid[A-Za-z0-9_-]{6,299}\\b",
+                r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
                 ps.text or "",
                 re.I,
             ):

@@ -34,6 +34,7 @@ Không bao giờ đoán UID khi evidence không đủ.
 """
 from __future__ import annotations
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import html as html_lib
 import json
 import logging
@@ -166,24 +167,34 @@ def make_headers(
         else random.choice(USER_AGENTS[2:])
     )
     headers = {
-        'authority': 'www.facebook.com',
-		'accept': '*/*',
-		'accept-language': 'vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5',
-		'content-type': 'application/x-www-form-urlencoded',
-		'dnt': '1',
-		'origin': 'https://www.facebook.com',
-		'sec-ch-prefers-color-scheme': 'dark',
-		'sec-ch-ua': '"Chromium";v="117", "Not;A=Brand";v="8"',
-		'sec-ch-ua-full-version-list': '"Chromium";v="117.0.5938.157", "Not;A=Brand";v="8.0.0.0"',
-		'sec-ch-ua-mobile': '?0',
-		'sec-ch-ua-model': '""',
-		'sec-ch-ua-platform': '"Windows"',
-		'sec-ch-ua-platform-version': '"15.0.0"',
-		'sec-fetch-dest': 'empty',
-		'sec-fetch-mode': 'cors',
-		'sec-fetch-site': 'same-origin',
-		'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-		'x-fb-friendly-name': 'useCometConsentPromptEndOfFlowBatchedMutation',
+        "authority": "www.facebook.com",
+        "accept": (
+            "text/html,"
+            "application/xhtml+xml,"
+            "application/xml;q=0.9,"
+            "image/avif,"
+            "image/webp,"
+            "image/apng,"
+            "*/*;q=0.8"
+        ),
+        "accept-language": (
+            "vi-VN,vi;q=0.9,"
+            "en-US;q=0.8,en;q=0.7"
+        ),
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "upgrade-insecure-requests": "1",
+        "user-agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/139.0.0.0 "
+            "Safari/537.36"
+        ),
     }
     if referer:
         headers["Referer"] = referer
@@ -450,6 +461,76 @@ class URLShape:
     wrapper: bool = False
     route_entity: str = ""
     route_confidence: float = 0.0
+
+
+AUTH_PATH_MARKERS = {
+    "login.php",
+    "login",
+    "logout.php",
+    "checkpoint",
+    "recover",
+    "registration",
+    "reg",
+    "privacy",
+    "security",
+    "save-device",
+    "device-based",
+}
+
+def is_facebook_auth_url(url: str) -> bool:
+    """Detect Facebook auth/system redirects without treating them as content."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if not is_facebook_host(parsed.netloc):
+        return False
+    parts = [
+        unquote(part).strip().lower()
+        for part in (parsed.path or "").split("/")
+        if part
+    ]
+    return bool(parts and any(part in AUTH_PATH_MARKERS for part in parts))
+
+
+def public_fallback_urls(url: str, shape: URLShape) -> List[str]:
+    """Build public HTTP variants; never authenticate or reuse cookies/tokens."""
+    normalized = normalize_facebook_url(url)
+    out = [normalized] if normalized else []
+    p = urlparse(normalized)
+
+    for host in ("mbasic.facebook.com", "m.facebook.com", "www.facebook.com"):
+        if host == normalize_host(p.netloc):
+            continue
+        out.append(
+            urlunparse((
+                "https",
+                host,
+                p.path or "/",
+                "",
+                p.query,
+                "",
+            ))
+        )
+
+    # Public embed pages may expose author/content metadata even when the
+    # ordinary post page redirects unauthenticated requests to login.
+    if shape.kind in {"POST", "GROUP_POST", "PHOTO", "REEL", "VIDEO"}:
+        encoded = quote(normalized, safe="")
+        if shape.kind in {"VIDEO", "REEL"}:
+            out.append(
+                "https://www.facebook.com/plugins/video.php"
+                f"?href={encoded}&show_text=true"
+            )
+        else:
+            out.append(
+                "https://www.facebook.com/plugins/post.php"
+                f"?href={encoded}&show_text=true"
+            )
+    return unique_keep_order(out)
+
 class URLParser:
     RESERVED = {
         "watch",
@@ -4053,6 +4134,29 @@ class FacebookResolver:
             result,
         )
         return result
+    @staticmethod
+    def _snapshot_richness(snapshot: PageSnapshot) -> int:
+        """Rank fetched pages by useful public HTML/metadata evidence."""
+        if not snapshot:
+            return 0
+        score = 0
+        if snapshot.ok:
+            score += 5
+        if snapshot.status == 200:
+            score += 5
+        score += min(len(snapshot.scripts), 40)
+        score += min(len(snapshot.json_objects), 20) * 3
+        score += min(len(snapshot.jsonld), 20) * 3
+        score += min(len(snapshot.links), 100) // 5
+        score += min(len(snapshot.html or ""), 200_000) // 20_000
+        if snapshot.meta.get("og:url"):
+            score += 8
+        if snapshot.meta.get("og:title"):
+            score += 4
+        if snapshot.text:
+            score += 2
+        return score
+
     def _resolve(
         self,
         url: str,
@@ -4078,15 +4182,78 @@ class FacebookResolver:
         final_shape = URLParser.parse(
             final_url
         )
-        if shape.kind == "UNKNOWN" and not shape.wrapper and any(
-            x.lower() in {"login.php", "logout.php", "checkpoint", "recover", "registration", "reg", "privacy", "security"}
-            for x in shape.segments
-        ):
-            result.status = "FETCH_LIMITED" if snapshot.limited or snapshot.error else "NOT_VERIFIED"
-            result.notes.append("Facebook authentication/system endpoint; không phải profile công khai.")
-            return result
-        if shape.wrapper:
+        original_shape = URLParser.parse(url)
+        redirected_to_auth = is_facebook_auth_url(final_url)
+
+        # IMPORTANT: a Facebook login/checkpoint redirect is not the content
+        # URL and must not erase the original route/publisher context.
+        if redirected_to_auth:
+            result.signals.append(
+                "redirect → Facebook login/auth; giữ route gốc"
+            )
+            if shape.kind in {"UNKNOWN", "SHARE_WRAPPER"}:
+                shape = original_shape
+
+            # Try only public HTTP representations. No credentials, cookies,
+            # access tokens, or Graph authentication are introduced.
+            best_snapshot = snapshot
+            best_score = self._snapshot_richness(snapshot)
+            fallback_urls = [
+                x for x in public_fallback_urls(
+                    url,
+                    original_shape,
+                )
+                if x not in {url, final_url}
+            ]
+
+            def _fetch_public_fallback(
+                fallback_url: str,
+            ) -> PageSnapshot:
+                with self.profile_sem:
+                    return self.fetcher.fetch(
+                        fallback_url,
+                        referer=url,
+                    )
+
+            # Run the public variants in parallel so an auth redirect does
+            # not turn one resolver call into several serial timeout windows.
+            with ThreadPoolExecutor(
+                max_workers=min(3, max(1, len(fallback_urls)))
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        _fetch_public_fallback,
+                        fallback_url,
+                    ): fallback_url
+                    for fallback_url in fallback_urls
+                }
+                for future in as_completed(futures):
+                    try:
+                        fallback = future.result()
+                    except Exception:
+                        LOGGER.debug(
+                            "Public fallback fetch failed",
+                            exc_info=True,
+                        )
+                        continue
+                    if is_facebook_auth_url(fallback.final_url):
+                        continue
+                    fallback_score = self._snapshot_richness(
+                        fallback
+                    )
+                    if fallback_score > best_score:
+                        best_snapshot = fallback
+                        best_score = fallback_score
+
+            if best_snapshot is not snapshot:
+                snapshot = best_snapshot
+                result.http_status = snapshot.status
+                final_url = snapshot.final_url or url
+                final_shape = URLParser.parse(final_url)
+
+        if shape.wrapper and not redirected_to_auth:
             shape = final_shape
+
         if (
             shape.kind
             == "SHARE_WRAPPER"
@@ -4098,13 +4265,22 @@ class FacebookResolver:
                 "Share wrapper không expose "
                 "canonical content."
             )
+
+        public_og_url = snapshot.meta.get(
+            "og:url",
+            "",
+        )
         canonical = (
-            snapshot.meta.get(
-                "og:url",
-                "",
+            public_og_url
+            if public_og_url
+            and not is_facebook_auth_url(
+                public_og_url
             )
-            or final_url
-            or url
+            else (
+                url
+                if redirected_to_auth
+                else final_url
+            )
         )
         if is_facebook_host(
             urlparse(
@@ -4121,8 +4297,8 @@ class FacebookResolver:
         )
         result.content_url = (
             canonical
-            if canonical
-            else final_url
+            if canonical and not is_facebook_auth_url(canonical)
+            else url
         )
         canonical_shape = (
             URLParser.parse(

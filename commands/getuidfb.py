@@ -4275,29 +4275,16 @@ class FacebookResolver:
                             (90.0, candidate, parsed)
                         )
 
-                # Finally inspect canonical/identity links. Do not accept
-                # arbitrary numeric IDs from the landing document.
-                for href in ps.links[:MAX_DISCOVERED_URLS]:
-                    candidate = urljoin(
-                        ps.final_url or ps.url,
-                        href,
-                    )
-                    if not is_facebook_host(
-                        urlparse(candidate).netloc
-                    ):
-                        continue
-                    parsed = URLParser.parse(candidate)
-                    if (
-                        parsed.kind in {
-                            "POST", "REEL", "VIDEO", "PHOTO",
-                            "STORY", "ALBUM", "GROUP_POST",
-                            "PROFILE",
-                        }
-                        and parsed.route_confidence >= 92
-                    ):
-                        candidates.append(
-                            (70.0, candidate, parsed)
-                        )
+                # IMPORTANT: never promote arbitrary links from a share
+                # landing page to the share target. Facebook landing pages
+                # contain generic STORY/VIDEO/PAGE links (for example Terms,
+                # login/help pages). Those links are not evidence that the
+                # opaque share token points to that object.
+                #
+                # Only explicit redirect targets and explicit canonical
+                # metadata are allowed to resolve a share token. Identity
+                # links remain useful later, after a real target has been
+                # established, for author correlation.
 
                 if not candidates:
                     return None
@@ -4360,6 +4347,15 @@ class FacebookResolver:
                     canonical = normalize_facebook_url(canonical)
 
                 canonical_shape = URLParser.parse(canonical)
+                if canonical_shape.kind == "UNKNOWN" and any(
+                    part.lower() in {
+                        "login.php", "login", "checkpoint", "recover",
+                        "registration", "reg", "privacy", "security",
+                    }
+                    for part in canonical_shape.segments
+                ):
+                    canonical = ""
+                    canonical_shape = URLShape()
                 if canonical_shape.kind in {
                     "POST", "REEL", "VIDEO", "PHOTO",
                     "STORY", "ALBUM", "GROUP_POST",
@@ -4373,7 +4369,7 @@ class FacebookResolver:
                     result.content_url = result.canonical_url
 
                 result.notes.append(
-                    "Share wrapper resolved via public redirect/canonical metadata."
+                    "Share wrapper resolved only from explicit public redirect/canonical metadata."
                 )
 
             if shape.kind == "SHARE_WRAPPER":

@@ -81,6 +81,7 @@ MAX_JSON_DEPTH = 12
 MAX_STRING_SCAN = 500_000
 MAX_EVIDENCE_PER_SOURCE = 80
 MAX_SIGNALS = 5
+MAX_DEBUG_CANDIDATES = 30
 CONCURRENCY = 4
 CACHE_TTL = 120
 RETRY_COUNT = 2
@@ -4058,6 +4059,7 @@ class ResolveResult:
     status: str = "NOT_VERIFIED"
     elapsed: float = 0.0
     http_status: int = 0
+    debug: Dict[str, Any] = field(default_factory=dict)
 class ResultCache:
     def __init__(
         self,
@@ -4375,19 +4377,23 @@ class FacebookResolver:
                 )
 
             if shape.kind == "SHARE_WRAPPER":
-                result.status = (
-                    "FETCH_LIMITED"
-                    if any(
-                        ps.limited or ps.error
-                        for _, ps in snapshots
-                    )
-                    else "NOT_VERIFIED"
-                )
+                # PASS 1 failed to resolve the wrapper. Do NOT return yet:
+                # fixed6 always enters PASS 2 and looks for an explicit object
+                # identifier exposed by the responses themselves.
                 result.notes.append(
-                    "Share token không expose public canonical content "
-                    "trong các response HTTP công khai; không suy diễn UID."
+                    "PASS 1: share wrapper chưa resolve được canonical target; chuyển bắt buộc sang PASS 2."
                 )
-                return result
+                # Keep the best observed snapshot for evidence scanning, but
+                # never treat generic landing-page links as the target.
+                best_snapshot = max(
+                    snapshots,
+                    key=lambda pair: (
+                        0 if pair[1].limited or pair[1].error else 1,
+                        len(pair[1].html or ""),
+                    ),
+                )[1]
+                snapshot = best_snapshot
+                result.http_status = snapshot.status
         else:
             shape = final_shape
         canonical = (
@@ -4559,29 +4565,107 @@ class FacebookResolver:
                     weight=90,
                 )
         # ------------------------------------------------------------------
-        # PHASE 2: OBJECT-ID -> PUBLIC AUTHOR/PROFILE CORRELATION
+        # PASS 2 (MANDATORY): OBJECT-ID -> PUBLIC AUTHOR/PROFILE CORRELATION
         # ------------------------------------------------------------------
-        # If the first pass did not produce a verified UID, use IDs that were
-        # actually observed in the route/metadata and fetch bounded public
-        # object representations.  This handles routes where the canonical
-        # URL contains an object ID (including opaque pfbid-style IDs) while
-        # the first response did not contain the author identity.
+        # fixed6 deliberately executes this phase after every unsuccessful
+        # first-pass resolution. It may have no usable object ID (e.g. a bare
+        # opaque share token); in that case it records why it cannot continue.
         phase2_snapshots: List[PageSnapshot] = []
-        if not any([
-            bool(getattr(shape, "post_id", "")),
-            bool(getattr(shape, "story_id", "")),
-            bool(getattr(shape, "reel_id", "")),
-            bool(getattr(shape, "video_id", "")),
-            bool(getattr(shape, "photo_id", "")),
-            bool(getattr(shape, "album_id", "")),
-        ]):
-            # No concrete object ID was observed.  A share token alone is not
-            # a reversible encoding of a user's UID, so do not manufacture one.
+        pass2_ids: List[Tuple[str, str, str]] = []
+
+        def add_pass2_id(kind: str, ident: str, source: str):
+            ident = clean_text(ident)
+            if not is_content_id(ident):
+                return
+            key = (kind, ident, source)
+            if key not in pass2_ids:
+                pass2_ids.append(key)
+
+        # Highest-confidence IDs: URL route first.
+        for kind, attr in (
+            ("post", "post_id"), ("story", "story_id"),
+            ("reel", "reel_id"), ("video", "video_id"),
+            ("photo", "photo_id"), ("album", "album_id"),
+        ):
+            value = getattr(shape, attr, "")
+            if value:
+                add_pass2_id(kind, value, "url_route")
+
+        # Then only object IDs actually classified by the evidence engine.
+        # Generic raw numeric strings are intentionally excluded.
+        for ev in collector.items:
+            if ev.role not in {"OBJECT_ID", "POST_ID", "STORY_ID", "VIDEO_ID", "REEL_ID", "PHOTO_ID", "ALBUM_ID"}:
+                continue
+            if not is_content_id(ev.value):
+                continue
+            key = normalize_key(ev.key)
+            if "story" in key:
+                kind = "story"
+            elif "reel" in key:
+                kind = "reel"
+            elif "video" in key:
+                kind = "video"
+            elif "photo" in key or "media" in key:
+                kind = "photo"
+            elif "album" in key:
+                kind = "album"
+            else:
+                kind = "post"
+            add_pass2_id(kind, ev.value, ev.source)
+
+        # Content IDs can be present in explicit canonical metadata. Parse the
+        # URL itself, but never mine arbitrary numbers from generic HTML.
+        explicit_urls = [
+            snapshot.final_url,
+            snapshot.meta.get("og:url", ""),
+            snapshot.meta.get("profile:url", ""),
+        ]
+        for candidate_url in explicit_urls:
+            if not candidate_url or not is_facebook_host(urlparse(candidate_url).netloc):
+                continue
+            cs = URLParser.parse(candidate_url)
+            for kind, attr in (
+                ("post", "post_id"), ("story", "story_id"),
+                ("reel", "reel_id"), ("video", "video_id"),
+                ("photo", "photo_id"), ("album", "album_id"),
+            ):
+                value = getattr(cs, attr, "")
+                if value:
+                    add_pass2_id(kind, value, "explicit_metadata_url")
+
+        if pass2_ids:
             result.notes.append(
-                "Phase 2 skipped: URL không expose content ID công khai để resolve."
+                f"PASS 2: found {len(pass2_ids)} explicit content-ID candidate(s)."
             )
-        else:
-            probe_urls = self.build_object_probe_urls(shape, result.content_url or url)
+            for kind, ident, source in pass2_ids[:MAX_DEBUG_CANDIDATES]:
+                result.notes.append(
+                    f"PASS2 candidate: {kind}={truncate(ident, 80)} source={source}"
+                )
+
+            # Probe representations using the observed shape, plus a shape
+            # cloned from each explicit ID where appropriate.
+            probe_urls = self.build_object_probe_urls(
+                shape, result.content_url or snapshot.final_url or url
+            )
+            for kind, ident, source in pass2_ids:
+                temp = URLShape(
+                    original=result.content_url or url,
+                    normalized=result.content_url or url,
+                    host="www.facebook.com",
+                    path="/",
+                    kind=kind.upper(),
+                    username=shape.username,
+                    route_entity=shape.route_entity,
+                )
+                setattr(temp, {
+                    "post":"post_id", "story":"story_id", "reel":"reel_id",
+                    "video":"video_id", "photo":"photo_id", "album":"album_id",
+                }[kind], ident)
+                probe_urls.extend(
+                    self.build_object_probe_urls(temp, result.content_url or url)
+                )
+            probe_urls = unique_keep_order(probe_urls)[:MAX_OBJECT_PROBES]
+
             for probe_url in probe_urls:
                 try:
                     ps = self.fetcher.fetch(
@@ -4589,71 +4673,69 @@ class FacebookResolver:
                         referer=result.content_url or url,
                     )
                 except Exception:
-                    LOGGER.debug("phase2 probe failed: %s", probe_url, exc_info=True)
+                    LOGGER.debug("PASS2 probe failed: %s", probe_url, exc_info=True)
                     continue
                 phase2_snapshots.append(ps)
                 self.merge_snapshot_evidence(ps, collector)
 
-            # Re-run identity/profile extraction using all newly observed
-            # public responses.  This is the key fallback for vanity/opaque
-            # content URLs that expose the numeric owner only on the object
-            # representation.
-            all_snapshots = profile_snapshots + phase2_snapshots
+            # Re-run classification against ALL evidence, including pass2.
+            all_public_snapshots = profile_snapshots + phase2_snapshots
             entity = entity_classifier.classify(
-                shape,
-                collector,
-                all_snapshots or [snapshot],
+                shape, collector, all_public_snapshots or [snapshot]
             )
             profile = extract_profile_info(
-                shape,
-                snapshot,
-                collector,
-                entity,
+                shape, snapshot, collector, entity
             )
-            if not profile.username:
-                for ps in phase2_snapshots:
-                    p2 = extract_profile_info(
-                        shape,
-                        ps,
-                        collector,
-                        entity,
-                    )
-                    if p2.username or p2.profile_url or p2.name:
-                        if p2.username: profile.username = p2.username
-                        if p2.profile_url: profile.profile_url = p2.profile_url
-                        if p2.name: profile.name = p2.name
-                        if p2.bio: profile.bio = p2.bio
-                        if p2.avatar_url: profile.avatar_url = p2.avatar_url
-                        break
 
-            # Fetch newly discovered profile URLs once more, then re-score.
-            phase2_profile_urls = self.extract_profile_urls(
-                shape,
-                phase2_snapshots[0] if phase2_snapshots else snapshot,
-                profile,
-                entity,
+            # Discover and fetch profiles from every useful pass2 snapshot.
+            discovered_profiles: List[str] = []
+            for ps in phase2_snapshots:
+                discovered_profiles.extend(
+                    self.extract_profile_urls(shape, ps, profile, entity)
+                )
+            discovered_profiles.extend(
+                self.extract_profile_urls(shape, snapshot, profile, entity)
             )
-            known_profile_urls = {ps.url for ps in profile_snapshots}
-            for profile_url in phase2_profile_urls[:MAX_PROFILE_CHECKS]:
-                if profile_url in known_profile_urls:
+            discovered_profiles = unique_keep_order(discovered_profiles)
+            existing = {
+                normalize_facebook_url(x.url) for x in profile_snapshots if x.url
+            }
+            for profile_url in discovered_profiles[:MAX_PROFILE_CHECKS]:
+                if normalize_facebook_url(profile_url) in existing:
                     continue
                 try:
                     ps = self.fetcher.fetch(
-                        profile_url,
-                        referer=result.content_url or url,
+                        profile_url, referer=result.content_url or url
                     )
                 except Exception:
                     continue
                 profile_snapshots.append(ps)
+                existing.add(normalize_facebook_url(profile_url))
                 self.merge_snapshot_evidence(ps, collector)
 
-            entity = entity_classifier.classify(
-                shape,
-                collector,
-                profile_snapshots + phase2_snapshots or [snapshot],
+            result.debug["pass2"] = {
+                "executed": True,
+                "content_id_candidates": [
+                    {"kind": k, "id": truncate(i, 120), "source": src}
+                    for k, i, src in pass2_ids[:MAX_DEBUG_CANDIDATES]
+                ],
+                "probe_urls": probe_urls[:MAX_DEBUG_CANDIDATES],
+                "probe_count": len(phase2_snapshots),
+                "profile_count": len(profile_snapshots),
+            }
+        else:
+            result.notes.append(
+                "PASS 2: executed nhưng không tìm thấy content ID công khai đủ tin cậy; không thể request object cụ thể."
             )
-            profile.entity_type = entity.publisher
+            result.debug["pass2"] = {
+                "executed": True,
+                "content_id_candidates": [],
+                "probe_urls": [],
+                "probe_count": 0,
+                "profile_count": len(profile_snapshots),
+            }
 
+        # Final reclassification and verification always use pass2 snapshots.
         entity = (
             entity_classifier.classify(
                 shape,
@@ -4670,7 +4752,7 @@ class FacebookResolver:
             verifier.verify(
                 shape=shape,
                 snapshot=snapshot,
-                profile_snapshots=profile_snapshots,
+                profile_snapshots=(profile_snapshots + phase2_snapshots),
                 collector=collector,
                 classification=entity,
                 profile=profile,
@@ -4746,6 +4828,28 @@ class FacebookResolver:
         result.evidence_sources = (
             verification.sources
         )
+        # Candidate-chain debug: expose scoring/evidence provenance without
+        # exposing cookies, headers, tokens, or private data.
+        try:
+            ranked_debug = rank_user_candidates(
+                collector,
+                username=(profile.username or shape.username),
+                shape=shape,
+            )[:MAX_DEBUG_CANDIDATES]
+            result.debug["uid_candidates"] = [
+                {"uid": uid, "base_score": round(float(score), 2)}
+                for uid, score in ranked_debug
+            ]
+            result.debug["pass1"] = {
+                "input": url,
+                "initial_kind": original_shape.kind,
+                "canonical": result.canonical_url,
+                "content": result.content_url,
+                "publisher": entity.publisher,
+                "verification_confidence": round(float(verification.confidence), 2),
+            }
+        except Exception:
+            LOGGER.debug("debug scoring failed", exc_info=True)
         result.signals = (
             unique_keep_order(
                 content.signals

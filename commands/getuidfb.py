@@ -321,7 +321,41 @@ def is_numeric_id(value: Any) -> bool:
             s,
         )
     )
+def is_opaque_content_id(value: Any) -> bool:
+    if value is None:
+        return False
 
+    s = clean_text(value)
+
+    if not s:
+        return False
+
+    if len(s) < 6 or len(s) > 300:
+        return False
+
+    # Facebook opaque identifiers.
+    if re.fullmatch(
+        r"pfbid[A-Za-z0-9_-]+",
+        s,
+        re.I,
+    ):
+        return True
+
+    # Các ID dạng token/chữ số khác.
+    if re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{5,299}",
+        s,
+    ):
+        return not is_numeric_id(s)
+
+    return False
+
+
+def is_content_id(value: Any) -> bool:
+    return (
+        is_numeric_id(value)
+        or is_opaque_content_id(value)
+    )
 
 def unique_keep_order(
     items: Iterable[str],
@@ -560,7 +594,30 @@ def looks_like_video_title(
         or "video" in value.lower()
     )
 
+def extract_content_identifiers(text: str) -> List[str]:
+    if not text:
+        return []
 
+    found = []
+
+    # Numeric Facebook object IDs
+    found.extend(
+        re.findall(
+            r"(?<!\d)(\d{5,30})(?!\d)",
+            text,
+        )
+    )
+
+    # Facebook opaque post/reel identifiers
+    found.extend(
+        re.findall(
+            r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
+            text,
+            re.I,
+        )
+    )
+
+    return unique_keep_order(found)
 # ============================================================
 # URL SHAPE
 # ============================================================
@@ -741,17 +798,20 @@ class URLParser:
             shape.route_entity = "GROUP"
 
             if "posts" in lower:
-
                 idx = lower.index("posts")
 
                 if idx + 1 < len(segments):
-
                     candidate = segments[idx + 1]
 
-                    if is_numeric_id(candidate):
+                    if is_content_id(candidate):
                         shape.post_id = candidate
 
-                shape.kind = "GROUP_POST"
+                    if "groups" in lower:
+                        shape.kind = "GROUP_POST"
+                    else:
+                        shape.kind = "POST"
+
+                    shape.route_confidence = 99
 
             elif (
                 "reel" in lower
@@ -818,7 +878,7 @@ class URLParser:
 
                 candidate = segments[idx + 1]
 
-                if is_numeric_id(candidate):
+                if is_content_id(candidate):
                     shape.reel_id = candidate
 
             shape.kind = "REEL"
@@ -870,7 +930,7 @@ class URLParser:
 
                 candidate = shape.query["v"][0]
 
-                if is_numeric_id(candidate):
+                if is_content_id(candidate):
                     shape.video_id = candidate
 
             if not shape.video_id:
@@ -889,7 +949,7 @@ class URLParser:
 
                     for candidate in segments[idx + 1:]:
 
-                        if is_numeric_id(candidate):
+                        if is_content_id(candidate):
                             shape.video_id = candidate
                             break
 
@@ -922,7 +982,7 @@ class URLParser:
 
                     candidate = shape.query[key][0]
 
-                    if is_numeric_id(candidate):
+                    if is_content_id(candidate):
                         shape.photo_id = candidate
                         break
 
@@ -942,7 +1002,7 @@ class URLParser:
 
                     for candidate in segments[idx + 1:]:
 
-                        if is_numeric_id(candidate):
+                        if is_content_id(candidate):
                             shape.photo_id = candidate
                             break
 
@@ -2749,7 +2809,7 @@ def scan_scripts(
             pattern = re.compile(
                 rf'["\']{re.escape(key)}["\']'
                 rf'\s*:\s*["\']?'
-                rf'(\d{{5,30}})'
+                rf'([A-Za-z0-9._:-]{{5,300}})'
                 rf'["\']?',
                 re.I,
             )
@@ -2758,7 +2818,7 @@ def scan_scripts(
 
                 value = match.group(1)
 
-                if not is_numeric_id(value):
+                if not is_content_id(value):
                     continue
 
                 collector.add(
@@ -2772,7 +2832,44 @@ def scan_scripts(
         # ----------------------------------------------------
         # semantic objects
         # ----------------------------------------------------
+        # ============================================================
+        # OPAQUE FACEBOOK CONTENT IDS
+        # ============================================================
 
+        opaque_pattern = re.compile(
+            r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
+            re.I,
+        )
+
+        for match in opaque_pattern.finditer(script):
+
+            value = match.group(0)
+
+            if not is_opaque_content_id(value):
+                continue
+
+            start = max(
+                0,
+                match.start() - 700,
+            )
+
+            end = min(
+                len(script),
+                match.end() + 700,
+            )
+
+            context = clean_text(
+                script[start:end]
+            )
+
+            collector.add(
+                value,
+                role="OBJECT_ID",
+                source=source,
+                key="opaque_content_id",
+                weight=115,
+                neighbor=context,
+            )
         semantic_objects = (
             "user",
             "profile",
@@ -3735,6 +3832,11 @@ def rank_user_candidates(
         | group_ids
         | event_ids
     )
+    route_entity = (
+        shape.route_entity
+        if shape
+        else ""
+    )
 
     for evidence in collector.by_role(
         "USER_CANDIDATE"
@@ -3747,6 +3849,13 @@ def rank_user_candidates(
 
         if value in blocked:
             continue
+        if route_entity == "USER":
+            if evidence.entity_type in {
+                "PAGE",
+                "GROUP",
+                "EVENT",
+            }:
+                continue
 
         scores.setdefault(
             value,
@@ -3834,7 +3943,7 @@ def rank_user_candidates(
             "creator.id",
         }:
 
-            score += 18
+            score += 5
 
         if keys & {
             "actor_id",
@@ -3842,7 +3951,7 @@ def rank_user_candidates(
             "actor.id",
         }:
 
-            score += 12
+            score += 3
 
         if len(sources) >= 2:
             score += 18
@@ -3880,7 +3989,7 @@ def rank_user_candidates(
                     break
 
         if username_match:
-            score += 35
+            score += 15
 
         publisher_key_match = bool(
             keys & {
@@ -4834,7 +4943,50 @@ class IdentityVerifier:
                 )
 
                 return result
+        if shape.route_entity == "USER":
+            evidence = [
+                e
+                for e in collector.by_role(
+                    "USER_CANDIDATE"
+                )
+                if e.value == candidate
+            ]
 
+            keys = {
+                normalize_key(e.key)
+                for e in evidence
+            }
+
+            strong_identity = bool(
+                keys
+                & {
+                    "user_id",
+                    "userid",
+                    "profile_id",
+                    "profileid",
+                    "profile.uid",
+                    "profile.id",
+                    "publisher_id",
+                    "publisherid",
+                    "publisher.id",
+                    "author_id",
+                    "authorid",
+                    "author.id",
+                    "owner_id",
+                    "ownerid",
+                    "owner.id",
+                    "from_id",
+                    "fromid",
+                    "from.id",
+                }
+            )
+
+            if not strong_identity:
+                result.reason = (
+                    "Candidate không có USER identity "
+                    "field đủ mạnh cho USER route."
+                )
+                return result
         if score < 78:
 
             result.reason = (

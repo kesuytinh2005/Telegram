@@ -1,5 +1,5 @@
 """
-FACEBOOK FORENSIC RESOLVER V60
+FACEBOOK FORENSIC RESOLVER V61
 Telegram / Telethon module
 PUBLIC HTTP ONLY
 NO:
@@ -75,6 +75,8 @@ MAX_INPUT_URLS = 8
 MAX_DISCOVERED_URLS = 100
 MAX_PROFILE_CHECKS = 5
 MAX_SHARE_PROBES = 8
+MAX_OBJECT_PROBES = 10
+MAX_OBJECT_DEPTH = 2
 MAX_JSON_DEPTH = 12
 MAX_STRING_SCAN = 500_000
 MAX_EVIDENCE_PER_SOURCE = 80
@@ -4556,6 +4558,102 @@ class FacebookResolver:
                     source="profile_meta",
                     weight=90,
                 )
+        # ------------------------------------------------------------------
+        # PHASE 2: OBJECT-ID -> PUBLIC AUTHOR/PROFILE CORRELATION
+        # ------------------------------------------------------------------
+        # If the first pass did not produce a verified UID, use IDs that were
+        # actually observed in the route/metadata and fetch bounded public
+        # object representations.  This handles routes where the canonical
+        # URL contains an object ID (including opaque pfbid-style IDs) while
+        # the first response did not contain the author identity.
+        phase2_snapshots: List[PageSnapshot] = []
+        if not any([
+            bool(getattr(shape, "post_id", "")),
+            bool(getattr(shape, "story_id", "")),
+            bool(getattr(shape, "reel_id", "")),
+            bool(getattr(shape, "video_id", "")),
+            bool(getattr(shape, "photo_id", "")),
+            bool(getattr(shape, "album_id", "")),
+        ]):
+            # No concrete object ID was observed.  A share token alone is not
+            # a reversible encoding of a user's UID, so do not manufacture one.
+            result.notes.append(
+                "Phase 2 skipped: URL không expose content ID công khai để resolve."
+            )
+        else:
+            probe_urls = self.build_object_probe_urls(shape, result.content_url or url)
+            for probe_url in probe_urls:
+                try:
+                    ps = self.fetcher.fetch(
+                        probe_url,
+                        referer=result.content_url or url,
+                    )
+                except Exception:
+                    LOGGER.debug("phase2 probe failed: %s", probe_url, exc_info=True)
+                    continue
+                phase2_snapshots.append(ps)
+                self.merge_snapshot_evidence(ps, collector)
+
+            # Re-run identity/profile extraction using all newly observed
+            # public responses.  This is the key fallback for vanity/opaque
+            # content URLs that expose the numeric owner only on the object
+            # representation.
+            all_snapshots = profile_snapshots + phase2_snapshots
+            entity = entity_classifier.classify(
+                shape,
+                collector,
+                all_snapshots or [snapshot],
+            )
+            profile = extract_profile_info(
+                shape,
+                snapshot,
+                collector,
+                entity,
+            )
+            if not profile.username:
+                for ps in phase2_snapshots:
+                    p2 = extract_profile_info(
+                        shape,
+                        ps,
+                        collector,
+                        entity,
+                    )
+                    if p2.username or p2.profile_url or p2.name:
+                        if p2.username: profile.username = p2.username
+                        if p2.profile_url: profile.profile_url = p2.profile_url
+                        if p2.name: profile.name = p2.name
+                        if p2.bio: profile.bio = p2.bio
+                        if p2.avatar_url: profile.avatar_url = p2.avatar_url
+                        break
+
+            # Fetch newly discovered profile URLs once more, then re-score.
+            phase2_profile_urls = self.extract_profile_urls(
+                shape,
+                phase2_snapshots[0] if phase2_snapshots else snapshot,
+                profile,
+                entity,
+            )
+            known_profile_urls = {ps.url for ps in profile_snapshots}
+            for profile_url in phase2_profile_urls[:MAX_PROFILE_CHECKS]:
+                if profile_url in known_profile_urls:
+                    continue
+                try:
+                    ps = self.fetcher.fetch(
+                        profile_url,
+                        referer=result.content_url or url,
+                    )
+                except Exception:
+                    continue
+                profile_snapshots.append(ps)
+                self.merge_snapshot_evidence(ps, collector)
+
+            entity = entity_classifier.classify(
+                shape,
+                collector,
+                profile_snapshots + phase2_snapshots or [snapshot],
+            )
+            profile.entity_type = entity.publisher
+
         entity = (
             entity_classifier.classify(
                 shape,
@@ -4715,6 +4813,71 @@ class FacebookResolver:
                 result.name
             )
         return result
+    def build_object_probe_urls(self, shape: URLShape, base_url: str) -> List[str]:
+        """Build public HTTP representations from an already observed content ID.
+
+        This is a bounded second-pass resolver.  It never invents a UID from an
+        object ID; it simply asks Facebook's public HTML endpoints whether the
+        object exposes an author/profile identity.
+        """
+        host = "www.facebook.com"
+        username = clean_text(shape.username).lstrip("@")
+        urls: List[str] = []
+        def add(u: str):
+            if u and is_facebook_host(urlparse(u).netloc):
+                urls.append(normalize_facebook_url(u))
+
+        ids = []
+        if shape.post_id: ids.append(("post", shape.post_id))
+        if shape.story_id: ids.append(("story", shape.story_id))
+        if shape.reel_id: ids.append(("reel", shape.reel_id))
+        if shape.video_id: ids.append(("video", shape.video_id))
+        if shape.photo_id: ids.append(("photo", shape.photo_id))
+        if shape.album_id: ids.append(("album", shape.album_id))
+
+        for kind, ident in ids:
+            ident = clean_text(ident)
+            if not is_content_id(ident):
+                continue
+            if kind == "post":
+                if username:
+                    add(f"https://{host}/{quote(username, safe='@.*-')}/posts/{quote(ident, safe='')}")
+                add(f"https://{host}/{quote(ident, safe='')}")
+                add(f"https://{host}/permalink.php?story_fbid={quote(ident, safe='')}")
+            elif kind == "story":
+                add(f"https://{host}/story.php?story_fbid={quote(ident, safe='')}")
+                if username:
+                    add(f"https://{host}/{quote(username, safe='@.*-')}/posts/{quote(ident, safe='')}")
+            elif kind == "reel":
+                add(f"https://{host}/reel/{quote(ident, safe='')}")
+                add(f"https://{host}/{quote(ident, safe='')}")
+            elif kind == "video":
+                add(f"https://{host}/watch/?v={quote(ident, safe='')}")
+                add(f"https://{host}/videos/{quote(ident, safe='')}")
+                add(f"https://{host}/{quote(ident, safe='')}")
+            elif kind == "photo":
+                add(f"https://{host}/photo/?fbid={quote(ident, safe='')}")
+                add(f"https://{host}/{quote(ident, safe='')}")
+            elif kind == "album":
+                add(f"https://{host}/media/set/?set={quote(ident, safe='')}")
+                add(f"https://{host}/{quote(ident, safe='')}")
+
+        # A bare numeric/opaque object identifier can sometimes resolve to a
+        # public object/profile page.  It is deliberately fetched as an object,
+        # never interpreted as a USER UID without explicit user evidence.
+        for ident in extract_content_identifiers(base_url):
+            if is_content_id(ident):
+                add(f"https://{host}/{quote(ident, safe='')}")
+        return unique_keep_order(urls)[:MAX_OBJECT_PROBES]
+
+    @staticmethod
+    def merge_snapshot_evidence(snapshot: PageSnapshot, collector: EvidenceCollector):
+        scan_meta(snapshot, collector)
+        scan_jsonld(snapshot, collector)
+        scan_scripts(snapshot, collector)
+        scan_html_identity(snapshot, collector)
+        scan_html_profile_links(snapshot, collector)
+
     def extract_profile_urls(
         self,
         shape: URLShape,

@@ -6295,7 +6295,7 @@ if __name__ == "__main__":
         "https://www.facebook.com/groups/123456789/posts/987654321/",
         "https://www.facebook.com/share/r/1H1EjsEW7J/",
         "https://www.facebook.com/profile.php?id=61553239356646",
-        "https://www.facebook.com/stories/122099490590156326/UzpfSVNDOjEwODI2OTkxNDA5MzYwNjI=/?view_single=1&source=shared_permalink&rdid=JoY9AeuK1Pctj32T&share_url=https://www.facebook.com/share/1bjvB1fyoz/"
+        "https://www.facebook.com/stories/122099490590156326/UzpfSVNDOjEwODI2OTkxNDA5MzYwNjI="
     ]
     for test in tests:
         shape = URLParser.parse(

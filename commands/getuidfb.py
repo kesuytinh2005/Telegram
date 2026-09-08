@@ -532,6 +532,19 @@ class URLParser:
             x.lower()
             for x in segments
         ]
+        # Authentication/system endpoints are not Facebook publishers.
+        blocked_paths = {
+            "login.php", "logout.php", "checkpoint", "recover",
+            "registration", "reg", "privacy", "security",
+        }
+        if (
+            p.path.lower().strip("/") in blocked_paths
+            or any(x in blocked_paths for x in lower)
+        ):
+            shape.kind = "UNKNOWN"
+            shape.route_entity = ""
+            shape.route_confidence = 100
+            return shape
         if (
             p.path.lower().endswith("/profile.php")
             and "id" in shape.query
@@ -1569,6 +1582,38 @@ class JSONEvidenceScanner:
                 )
             ):
                 local_entity = "EVENT"
+            # Many Facebook payloads use a generic `id` inside a user
+            # object. Accept it only when the same object has a username/profile
+            # identity signal, and let page/group/event semantics block it.
+            generic_id = local_strings.get("id", "")
+            if (
+                is_numeric_id(generic_id)
+                and not local_entity
+                and (
+                    local_strings.get("username")
+                    or local_strings.get("profile_url")
+                    or local_strings.get("profile_uri")
+                )
+            ):
+                identity_neighbor = clean_text(
+                    " ".join(
+                        x for x in (
+                            local_strings.get("username", ""),
+                            local_strings.get("name", ""),
+                            local_strings.get("profile_url", ""),
+                        ) if x
+                    )
+                )
+                self.collector.add(
+                    generic_id,
+                    role="USER_CANDIDATE",
+                    source=source,
+                    path=path,
+                    key="id",
+                    neighbor=identity_neighbor,
+                    weight=106,
+                    entity_type="USER_CANDIDATE",
+                )
             for key, value in local_strings.items():
                 role = key_role(key)
                 if role:
@@ -1828,50 +1873,75 @@ def scan_scripts(
             continue
         source = f"script:{index}"
         identity_patterns = {
-            "user_id": 110,
-            "userid": 110,
-            "userId": 110,
-            "profile_id": 112,
-            "profileid": 112,
-            "profileId": 112,
-            "profile_uid": 112,
-            "profileuid": 112,
-            "profileUid": 112,
-            "owner_id": 100,
-            "ownerid": 100,
-            "ownerId": 100,
-            "publisher_id": 102,
-            "publisherid": 102,
-            "publisherId": 102,
-            "author_id": 100,
-            "authorid": 100,
-            "authorId": 100,
-            "from_id": 98,
-            "fromid": 98,
-            "fromId": 98,
-            "creator_id": 88,
-            "creatorid": 88,
-            "creatorId": 88,
-            "actor_id": 82,
-            "actorid": 82,
-            "actorId": 82,
-            "profile.uid": 112,
-            "profile.id": 108,
-            "owner.id": 102,
-            "publisher.id": 102,
-            "author.id": 100,
-            "creator.id": 88,
-            "actor.id": 82,
-            "legacy_id": 90,
-            "legacyId": 90,
+            # Strong direct USER identity fields.
+            "user_id": 118,
+            "userid": 118,
+            "userId": 118,
+            "userID": 118,
+            "uid": 116,
+            "user_uid": 118,
+            "userUid": 118,
+            "profile_id": 120,
+            "profileid": 120,
+            "profileId": 120,
+            "profileID": 120,
+            "profile_uid": 120,
+            "profileuid": 120,
+            "profileUid": 120,
+            "profileUID": 120,
+            "profile_owner_id": 118,
+            "profileOwnerId": 118,
+            "profile_owner_uid": 120,
+            "profileOwnerUid": 120,
+            # Publisher / author identity fields.
+            "publisher_id": 112,
+            "publisherid": 112,
+            "publisherId": 112,
+            "publisherID": 112,
+            "author_id": 110,
+            "authorid": 110,
+            "authorId": 110,
+            "authorID": 110,
+            "owner_id": 108,
+            "ownerid": 108,
+            "ownerId": 108,
+            "ownerID": 108,
+            "from_id": 108,
+            "fromid": 108,
+            "fromId": 108,
+            "fromID": 108,
+            "creator_id": 94,
+            "creatorid": 94,
+            "creatorId": 94,
+            "creatorID": 94,
+            "actor_id": 92,
+            "actorid": 92,
+            "actorId": 92,
+            "actorID": 92,
+            # Nested identity aliases seen in serialized state.
+            "profile.uid": 120,
+            "profile.id": 116,
+            "profile.owner_id": 118,
+            "profile.ownerId": 118,
+            "owner.id": 110,
+            "publisher.id": 112,
+            "author.id": 110,
+            "from.id": 108,
+            "creator.id": 94,
+            "actor.id": 92,
+            "legacy_id": 92,
+            "legacyId": 92,
+            "legacyID": 92,
         }
         for key, weight in identity_patterns.items():
             escaped = re.escape(key)
+            # Accept JSON, JS object literals and GraphQL-like key/value
+            # forms.  The key itself is semantic, so this is much safer than
+            # globally harvesting every numeric ``id`` in the document.
             pattern = re.compile(
-                rf'["\']{escaped}["\']'
-                rf'\s*:\s*["\']?'
-                rf'(\d{{5,30}})'
-                rf'["\']?',
+                rf'(?:["\']{escaped}["\']|(?<![A-Za-z0-9_$]){escaped}(?![A-Za-z0-9_$]))'
+                rf'\s*[:=]\s*'
+                rf'(?:["\']?)(\d{{5,30}})(?:["\']?)',
                 re.I,
             )
             for match in pattern.finditer(script):
@@ -1965,10 +2035,9 @@ def scan_scripts(
             weight,
         ) in explicit_entity_patterns.items():
             pattern = re.compile(
-                rf'["\']{re.escape(key)}["\']'
-                rf'\s*:\s*["\']?'
-                rf'(\d{{5,30}})'
-                rf'["\']?',
+                rf'(?:["\']{re.escape(key)}["\']|(?<![A-Za-z0-9_$]){re.escape(key)}(?![A-Za-z0-9_$]))'
+                rf'\s*[:=]\s*'
+                rf'(?:["\']?)(\d{{5,30}})(?:["\']?)',
                 re.I,
             )
             for match in pattern.finditer(script):
@@ -2015,10 +2084,9 @@ def scan_scripts(
         }
         for key, weight in object_patterns.items():
             pattern = re.compile(
-                rf'["\']{re.escape(key)}["\']'
-                rf'\s*:\s*["\']?'
-                rf'([A-Za-z0-9._:-]{{5,300}})'
-                rf'["\']?',
+                rf'(?:["\']{re.escape(key)}["\']|(?<![A-Za-z0-9_$]){re.escape(key)}(?![A-Za-z0-9_$]))'
+                rf'\s*[:=]\s*'
+                rf'(?:["\']?)([A-Za-z0-9._:-]{{5,300}})(?:["\']?)',
                 re.I,
             )
             for match in pattern.finditer(script):
@@ -2071,13 +2139,11 @@ def scan_scripts(
         )
         for semantic in semantic_objects:
             pattern = re.compile(
-                rf'["\']{semantic}["\']'
+                rf'(?:["\']{semantic}["\']|(?<![A-Za-z0-9_$]){semantic}(?![A-Za-z0-9_$]))'
                 rf'\s*:\s*\{{'
-                rf'.{{0,4000}}?'
-                rf'["\']id["\']'
-                rf'\s*:\s*["\']'
-                rf'(\d{{5,30}})'
-                rf'["\']',
+                rf'.{{0,5000}}?'
+                rf'(?:["\']id["\']|(?<![A-Za-z0-9_$])id(?![A-Za-z0-9_$]))'
+                rf'\s*:\s*(?:["\']?)(\d{{5,30}})(?:["\']?)',
                 re.I | re.S,
             )
             for match in pattern.finditer(script):
@@ -2149,6 +2215,188 @@ def scan_scripts(
                     key="profile_url",
                     weight=80,
                 )
+def scan_html_identity(
+    snapshot: PageSnapshot,
+    collector: EvidenceCollector,
+):
+    """High-recall HTML identity pass with strict semantic guards.
+
+    This complements JSON/script parsing because Facebook frequently leaves
+    serialized profile state in raw HTML, escaped HTML attributes, meta tags,
+    and bootstrap payloads.  Numeric values are only promoted when they occur
+    in a USER/profile semantic pattern; arbitrary numeric IDs are ignored.
+    """
+    html = snapshot.html or ""
+    if not html:
+        return
+
+    # Direct identity keys that are safe enough to harvest from HTML.
+    direct_patterns = {
+        "user_id": 122,
+        "userid": 122,
+        "userId": 122,
+        "userID": 122,
+        "profile_id": 124,
+        "profileid": 124,
+        "profileId": 124,
+        "profileID": 124,
+        "profile_uid": 124,
+        "profileUid": 124,
+        "profileUID": 124,
+        "profile_owner_id": 122,
+        "profileOwnerId": 122,
+        "owner_id": 106,
+        "ownerId": 106,
+        "ownerID": 106,
+        "author_id": 108,
+        "authorId": 108,
+        "authorID": 108,
+        "publisher_id": 110,
+        "publisherId": 110,
+        "publisherID": 110,
+        "from_id": 106,
+        "fromId": 106,
+        "fromID": 106,
+        "actor_id": 92,
+        "actorId": 92,
+        "creator_id": 92,
+        "creatorId": 92,
+    }
+    for key, weight in direct_patterns.items():
+        pattern = re.compile(
+            rf'(?:["\']{re.escape(key)}["\']|(?<![A-Za-z0-9_$]){re.escape(key)}(?![A-Za-z0-9_$]))'
+            rf'\s*[:=]\s*(?:["\']?)(\d{{5,30}})(?:["\']?)',
+            re.I,
+        )
+        for m in pattern.finditer(html):
+            value = m.group(1)
+            if not is_numeric_id(value):
+                continue
+            a = max(0, m.start() - 900)
+            b = min(len(html), m.end() + 900)
+            context = clean_text(html[a:b])
+            low = context.lower()
+            entity_type = "UNKNOWN"
+            if any(x in low for x in ("group_id", "groupid", '"group"', "group/")):
+                entity_type = "GROUP"
+            elif any(x in low for x in ("page_id", "pageid", '"page"', "page/")):
+                entity_type = "PAGE"
+            elif any(x in low for x in ("event_id", "eventid", '"event"', "event/")):
+                entity_type = "EVENT"
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source="html:identity",
+                key=key,
+                weight=weight,
+                neighbor=context[:1200],
+                entity_type=entity_type,
+            )
+
+    # profile.php?id=... is one of the strongest public profile-ID forms.
+    profile_route = re.compile(
+        r'(?:profile\.php\?(?:[^"\'<>#&]*&)?id=|profile\.php\?id=|fb://profile/)'
+        r'(\d{5,30})',
+        re.I,
+    )
+    for m in profile_route.finditer(html):
+        value = m.group(1)
+        if is_numeric_id(value):
+            a = max(0, m.start() - 500)
+            b = min(len(html), m.end() + 700)
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source="html:profile_route",
+                key="profile.php?id",
+                weight=128,
+                neighbor=clean_text(html[a:b]),
+                entity_type="USER",
+            )
+
+    # Nested semantic objects: {"profile_owner":{"id":"..."}},
+    # {"author":{"id":...}}, etc.  The bounded window prevents a random
+    # ID thousands of characters away from being associated with a user.
+    for semantic, weight in {
+        "profile_owner": 124,
+        "profileOwner": 124,
+        "user": 118,
+        "profile": 118,
+        "author": 108,
+        "publisher": 110,
+        "owner": 106,
+        "from": 104,
+        "actor": 92,
+        "creator": 92,
+    }.items():
+        pattern = re.compile(
+            rf'(?:["\']{re.escape(semantic)}["\']|(?<![A-Za-z0-9_$]){re.escape(semantic)}(?![A-Za-z0-9_$]))'
+            rf'\s*:\s*\{{[^\{{\}}]{{0,5000}}?'
+            rf'(?:["\']id["\']|(?<![A-Za-z0-9_$])id(?![A-Za-z0-9_$]))'
+            rf'\s*:\s*(?:["\']?)(\d{{5,30}})(?:["\']?)',
+            re.I | re.S,
+        )
+        for m in pattern.finditer(html):
+            value = m.group(1)
+            if not is_numeric_id(value):
+                continue
+            a = max(0, m.start() - 700)
+            b = min(len(html), m.end() + 700)
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source="html:nested_identity",
+                key=f"{semantic}.id",
+                weight=weight,
+                neighbor=clean_text(html[a:b]),
+                entity_type="USER" if semantic in {"user", "profile", "profile_owner", "profileOwner"} else "UNKNOWN",
+            )
+
+    # A username/profile URL and UID occurring in the same small HTML window
+    # is an important correlation signal, but not a standalone proof.
+    username = clean_text(
+        getattr(snapshot, "meta", {}).get("profile:username", "")
+    ).lstrip("@")
+    username_candidates = []
+    if username:
+        username_candidates.append(username)
+    for m in re.finditer(
+        r'(?:["\']username["\']|username)\s*[:=]\s*["\']([^"\']{1,120})["\']',
+        html,
+        re.I,
+    ):
+        u = clean_text(m.group(1)).lstrip("@")
+        if u:
+            username_candidates.append(u)
+    username_candidates = unique_keep_order(username_candidates)
+
+    if username_candidates:
+        for u in username_candidates[:20]:
+            if not u:
+                continue
+            for m in re.finditer(re.escape(u), html, re.I):
+                a = max(0, m.start() - 1200)
+                b = min(len(html), m.end() + 1200)
+                window = html[a:b]
+                for im in re.finditer(
+                    r'(?:profile(?:_owner)?(?:_id|Id|ID)?|user(?:_id|Id|ID)|owner_id|author_id|publisher_id|from_id)'
+                    r'\s*["\']?\s*[:=]\s*["\']?(\d{5,30})',
+                    window,
+                    re.I,
+                ):
+                    value = im.group(1)
+                    if not is_numeric_id(value):
+                        continue
+                    collector.add(
+                        value,
+                        role="USER_CANDIDATE",
+                        source="html:username_window",
+                        key="username_correlated_id",
+                        weight=126,
+                        neighbor=clean_text(window[:1800]),
+                        entity_type="USER",
+                    )
+
 class IdentityCorrelation:
     IDENTITY_KEYS = {
         "user",
@@ -2402,6 +2650,9 @@ class IdentityCorrelation:
                     "owner.id",
                     "from_id",
                     "from.id",
+                    "profile_owner_id",
+                    "profileownerid",
+                    "profile_owner.uid",
                 }:
                     score += 20
                     signals.append(
@@ -2825,15 +3076,24 @@ def rank_user_candidates(
         if keys & {
             "user_id",
             "userid",
+            "user.uid",
+            "uid",
+            "user_uid",
+            "useruid",
         }:
-            score += 50
+            score += 58
         if keys & {
             "profile_id",
             "profileid",
             "profile.uid",
             "profile.id",
+            "profile_uid",
+            "profileuid",
+            "profile_owner_id",
+            "profileownerid",
+            "profile_owner.uid",
         }:
-            score += 50
+            score += 58
         if keys & {
             "publisher_id",
             "publisherid",
@@ -3549,6 +3809,11 @@ class IdentityVerifier:
                     "profileid",
                     "profile.uid",
                     "profile.id",
+                    "profile_uid",
+                    "profileuid",
+                    "profile_owner_id",
+                    "profileownerid",
+                    "uid",
                 }
             )
             has_publisher_field = bool(
@@ -3629,6 +3894,7 @@ class IdentityVerifier:
                     "from_id",
                     "fromid",
                     "from.id",
+                    "id",
                 }
             )
             if not strong_identity:
@@ -3822,6 +4088,13 @@ class FacebookResolver:
         final_shape = URLParser.parse(
             final_url
         )
+        if shape.kind == "UNKNOWN" and not shape.wrapper and any(
+            x.lower() in {"login.php", "logout.php", "checkpoint", "recover", "registration", "reg", "privacy", "security"}
+            for x in shape.segments
+        ):
+            result.status = "FETCH_LIMITED" if snapshot.limited or snapshot.error else "NOT_VERIFIED"
+            result.notes.append("Facebook authentication/system endpoint; không phải profile công khai.")
+            return result
         if shape.wrapper:
             shape = final_shape
         if (
@@ -3875,6 +4148,19 @@ class FacebookResolver:
             }
         ):
             shape = canonical_shape
+        # Preserve exact content identity from the original URL when a
+        # redirect/og:url loses the more specific route.
+        original_shape = URLParser.parse(url)
+        for attr in (
+            "post_id", "reel_id", "video_id",
+            "photo_id", "story_id", "album_id",
+        ):
+            original_value = getattr(original_shape, attr, "")
+            if original_value and not getattr(shape, attr, ""):
+                setattr(shape, attr, original_value)
+                if shape.kind == "UNKNOWN":
+                    shape.kind = original_shape.kind
+                    shape.route_entity = original_shape.route_entity
         collector = EvidenceCollector()
         scan_url_evidence(
             shape,
@@ -3890,6 +4176,10 @@ class FacebookResolver:
             collector,
         )
         scan_scripts(
+            snapshot,
+            collector,
+        )
+        scan_html_identity(
             snapshot,
             collector,
         )
@@ -3954,6 +4244,10 @@ class FacebookResolver:
                 collector,
             )
             scan_scripts(
+                ps,
+                collector,
+            )
+            scan_html_identity(
                 ps,
                 collector,
             )
@@ -4074,6 +4368,21 @@ class FacebookResolver:
                 + verification.signals
             )[:MAX_SIGNALS]
         )
+        # Recover content IDs from HTML only as a content fallback; never
+        # promote these values to USER UID candidates.
+        if result.content_type in {
+            "POST", "GROUP_POST", "REEL", "VIDEO", "PHOTO", "STORY", "ALBUM"
+        }:
+            if result.content_type in {"POST", "GROUP_POST"} and not result.post_id:
+                ids = extract_content_identifiers(snapshot.html)
+                if ids:
+                    result.post_id = ids[0]
+                    result.signals.append("content ID recovered from HTML")
+            elif result.content_type == "REEL" and not result.reel_id:
+                ids = extract_content_identifiers(snapshot.html)
+                if ids:
+                    result.reel_id = ids[0]
+                    result.signals.append("reel ID recovered from HTML")
         result.title = (
             self.extract_content_title(
                 snapshot,

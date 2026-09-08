@@ -483,6 +483,20 @@ class URLParser:
         "page",
         "profile.php",
         "permalink.php",
+        "login.php",
+        "login",
+        "logout.php",
+        "checkpoint",
+        "recover",
+        "help",
+        "settings",
+        "privacy",
+        "security",
+        "home.php",
+        "ajax",
+        "plugins",
+        "dialog",
+        "oauth",
         "share",
         "share.php",
         "share/r",
@@ -621,7 +635,7 @@ class URLParser:
             )
             if idx + 1 < len(segments):
                 candidate = segments[idx + 1]
-                if is_numeric_id(candidate):
+                if is_content_id(candidate):
                     shape.post_id = candidate
             if shape.kind == "UNKNOWN":
                 shape.kind = "POST"
@@ -807,6 +821,20 @@ class URLParser:
             "page",
             "profile.php",
             "permalink.php",
+            "login.php",
+            "login",
+            "logout.php",
+            "checkpoint",
+            "recover",
+            "help",
+            "settings",
+            "privacy",
+            "security",
+            "home.php",
+            "ajax",
+            "plugins",
+            "dialog",
+            "oauth",
         }
         first = segments[0]
         if first.lower() in reserved:
@@ -4432,6 +4460,10 @@ def format_result(
             lines.append(
                 "│ Post ID   : "
                 f"<code>{tg_escape(result.post_id)}</code>"
+            )
+        elif result.content_type in {"POST", "GROUP_POST"}:
+            lines.append(
+                "│ Post ID   : ⚠️ Chưa tìm thấy public"
             )
         if result.reel_id:
             lines.append(

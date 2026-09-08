@@ -73,9 +73,9 @@ REQUEST_TIMEOUT = (5, 12)
 MAX_HTML_BYTES = 12 * 1024 * 1024
 MAX_INPUT_URLS = 8
 MAX_DISCOVERED_URLS = 100
-MAX_PROFILE_CHECKS = 5
+MAX_PROFILE_CHECKS = 8
 MAX_SHARE_PROBES = 8
-MAX_OBJECT_PROBES = 10
+MAX_OBJECT_PROBES = 24
 MAX_OBJECT_DEPTH = 2
 MAX_JSON_DEPTH = 12
 MAX_STRING_SCAN = 500_000
@@ -4191,6 +4191,11 @@ class FacebookResolver:
             return result
         original_shape = URLParser.parse(url)
         share_target_snapshot = None
+        # Keep every public response from PASS 1 available to mandatory PASS 2.
+        # This is critical for /share/<token>: the useful object identifier can
+        # appear in a redirect/canonical/embedded representation of a probe,
+        # not necessarily in the final generic landing page.
+        share_snapshots: List[PageSnapshot] = []
         if original_shape.wrapper:
             # /share/<opaque-token> is not itself an identity.  Resolve it
             # only through ordinary public HTTP redirects/metadata.  Probe
@@ -4237,6 +4242,10 @@ class FacebookResolver:
                         probe_url,
                         exc_info=True,
                     )
+
+            share_snapshots = [ps for _, ps in snapshots]
+
+            share_snapshots = [ps for _, ps in snapshots]
 
             def public_target_from_snapshot(ps):
                 candidates = []
@@ -4484,6 +4493,18 @@ class FacebookResolver:
                 snapshot,
             )
         )
+        # Never infer STORY/VIDEO/etc. from incidental links on a generic
+        # /share/<token> landing page. Only a resolved target or PASS-2 object
+        # evidence may establish the content type.
+        if original_shape.wrapper and shape.kind == "SHARE_WRAPPER":
+            content = ContentClassification()
+        # A bare /share/<token> has no content-type evidence merely because
+        # the generic Facebook landing page contains links/text mentioning
+        # stories, terms, videos, etc.  Do not leak that generic route into
+        # the final result.  Once PASS 2 resolves a real object, shape will be
+        # upgraded and the later reclassification below can describe it.
+        if original_shape.wrapper and shape.kind == "SHARE_WRAPPER":
+            content = ContentInfo()
         entity_classifier = (
             EntityClassifier()
         )
@@ -4580,6 +4601,110 @@ class FacebookResolver:
             key = (kind, ident, source)
             if key not in pass2_ids:
                 pass2_ids.append(key)
+
+        # PASS 2 ID harvesting is deliberately broader than PASS 1, but still
+        # evidence-based.  For a share wrapper, inspect every response's
+        # redirect/canonical URL and explicit opaque content IDs such as pfbid.
+        # Do NOT mine arbitrary numeric strings from generic landing HTML.
+        pass2_source_snapshots = [snapshot] + share_snapshots + phase2_snapshots
+        pass2_source_snapshots = [
+            ps for ps in pass2_source_snapshots if ps is not None
+        ]
+
+        def harvest_explicit_object_ids(ps: PageSnapshot):
+            urls = list(ps.redirect_chain)
+            for key in ("og:url", "profile:url", "canonical"):
+                value = ps.meta.get(key, "")
+                if value:
+                    urls.append(value)
+            for candidate_url in urls:
+                if not candidate_url or not looks_like_url(candidate_url):
+                    continue
+                if not is_facebook_host(urlparse(candidate_url).netloc):
+                    continue
+                cs = URLParser.parse(candidate_url)
+                for kind, attr in (
+                    ("post", "post_id"), ("story", "story_id"),
+                    ("reel", "reel_id"), ("video", "video_id"),
+                    ("photo", "photo_id"), ("album", "album_id"),
+                ):
+                    value = getattr(cs, attr, "")
+                    if value:
+                        add_pass2_id(kind, value, "redirect_or_canonical")
+            # Opaque IDs are useful precisely because they are not numeric.
+            # Restrict this extraction to Facebook's recognizable pfbid form;
+            # arbitrary alphanumeric tokens in a landing page are not objects.
+            for ident in re.findall(
+                r"\\bpfbid[A-Za-z0-9_-]{6,299}\\b",
+                ps.html or "",
+                re.I,
+            ):
+                add_pass2_id("post", ident, "explicit_pfbid_html")
+            for ident in re.findall(
+                r"\\bpfbid[A-Za-z0-9_-]{6,299}\\b",
+                ps.text or "",
+                re.I,
+            ):
+                add_pass2_id("post", ident, "explicit_pfbid_text")
+
+        for ps in pass2_source_snapshots:
+            harvest_explicit_object_ids(ps)
+
+        # A share wrapper itself carries an opaque share token.  It is NOT a
+        # content ID and is never fed into the UID scorer as one.  We do,
+        # however, record the token in debug so the operator can distinguish
+        # "no object exposed" from "object exposed but author hidden".
+        if original_shape.wrapper and original_shape.opaque_token:
+            result.debug.setdefault("pass2", {})["share_token"] = original_shape.opaque_token
+
+        # PASS 2 harvesting: inspect ALL public PASS-1 responses. Redirect and
+        # canonical URLs are explicit object evidence; pfbid is the only
+        # alphanumeric object form harvested from HTML. Arbitrary numbers or
+        # random tokens in generic landing pages are never treated as objects.
+        pass2_source_snapshots = [snapshot] + share_snapshots + phase2_snapshots
+        pass2_source_snapshots = [ps for ps in pass2_source_snapshots if ps is not None]
+
+        def harvest_explicit_object_ids(ps: PageSnapshot):
+            explicit_urls = list(ps.redirect_chain)
+            for key in ("og:url", "profile:url", "canonical"):
+                value = ps.meta.get(key, "")
+                if value:
+                    explicit_urls.append(value)
+
+            for candidate_url in explicit_urls:
+                if not candidate_url or not is_facebook_host(urlparse(candidate_url).netloc):
+                    continue
+                cs = URLParser.parse(candidate_url)
+                for kind, attr in (
+                    ("post", "post_id"), ("story", "story_id"),
+                    ("reel", "reel_id"), ("video", "video_id"),
+                    ("photo", "photo_id"), ("album", "album_id"),
+                ):
+                    value = getattr(cs, attr, "")
+                    if value:
+                        add_pass2_id(kind, value, "redirect_or_canonical")
+
+            # pfbid is an explicit Facebook object identifier form. Unlike a
+            # random alphanumeric string, it is safe to feed into object probes.
+            for ident in re.findall(
+                r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
+                ps.html or "",
+                re.I,
+            ):
+                add_pass2_id("post", ident, "explicit_pfbid_html")
+
+            for ident in re.findall(
+                r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
+                ps.text or "",
+                re.I,
+            ):
+                add_pass2_id("post", ident, "explicit_pfbid_text")
+
+        for ps in pass2_source_snapshots:
+            harvest_explicit_object_ids(ps)
+
+        if original_shape.wrapper and original_shape.opaque_token:
+            result.debug.setdefault("pass2", {})["share_token"] = original_shape.opaque_token
 
         # Highest-confidence IDs: URL route first.
         for kind, attr in (
@@ -4683,6 +4808,14 @@ class FacebookResolver:
             entity = entity_classifier.classify(
                 shape, collector, all_public_snapshots or [snapshot]
             )
+            # Reclassify content only after PASS 2 object probes have supplied
+            # real object evidence.  This prevents generic share-landings from
+            # being labeled STORY/VIDEO merely from incidental links.
+            content = content_classifier.classify(
+                shape,
+                collector,
+                phase2_snapshots[-1] if phase2_snapshots else snapshot,
+            )
             profile = extract_profile_info(
                 shape, snapshot, collector, entity
             )
@@ -4733,6 +4866,12 @@ class FacebookResolver:
                 "probe_urls": [],
                 "probe_count": 0,
                 "profile_count": len(profile_snapshots),
+                "source_snapshot_count": len(pass2_source_snapshots),
+                "reason": (
+                    "No explicit object ID in route, redirect/canonical URLs, "
+                    "or recognizable pfbid evidence. Share token is opaque and "
+                    "is not treated as a UID/content ID."
+                ),
             }
 
         # Final reclassification and verification always use pass2 snapshots.

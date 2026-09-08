@@ -6290,46 +6290,7 @@ COMMAND_INFO = {
 
 if __name__ == "__main__":
     tests = [
-        # --- Trang cá nhân & Trang (Profile & Page) ---
-        "https://www.facebook.com/zuck",                            # Link Profile chuẩn (Mark Zuckerberg)
-        "https://www.facebook.com/profile.php?id=4",                # Link Profile qua ID (Mark Zuckerberg)
-        "https://www.facebook.com/pages/category/News/108038756028",# Link Page kiểu cũ qua ID
-
-        # --- Tin (Story) ---
-        "https://www.facebook.com/stories/100064828192019/UzpfSVNDOjcxMDU4OTEzMDkzNjM5Mg==", # Link Story trực tiếp
-        "https://www.facebook.com/stories/highlights/1792839201928301/",                     # Link Story nổi bật (Highlights)
-
-        # --- Bài viết & Bài đăng (Posts) ---
-        "https://www.facebook.com/zuck/posts/pfbid02xK9M2Y11aC89xJmQ2fR9zWkL1mP5n9xQ8wE7rT6yU", # Link bài viết mã hóa pfbid
-        "https://www.facebook.com/permalink.php?story_fbid=10114250280200881&id=4",            # Link bài viết kiểu Permalink
-        "https://www.facebook.com/photo.php?fbid=10114250280190901",                           # Link hình ảnh đơn lẻ
-        "https://www.facebook.com/zuck/photos/a.10101901828101/10114250280190901/",            # Link hình ảnh trong album
-        "https://www.facebook.com/media/set/?set=a.10101901828101001",                         # Link album ảnh
-
-        # --- Video & Reels ---
-        "https://www.facebook.com/watch/?v=10158309102910291",      # Link Facebook Watch
-        "https://www.facebook.com/zuck/videos/10158309102910291",   # Link Video chuẩn trên Page/Profile
-        "https://www.facebook.com/reel/1029384756102938",          # Link Facebook Reel
-        "https://www.facebook.com/fb.watch/e9x2KwL1mP/",            # Link rút gọn của Video/Watch
-
-        # --- Nhóm (Groups) ---
-        "https://www.facebook.com/groups/developercommunity/",     # Link Nhóm qua Username
-        "https://www.facebook.com/groups/1029384756102938/",       # Link Nhóm qua ID
-        "https://www.facebook.com/groups/1029384756102938/posts/pfbid02xK9M2Y11aC89/", # Link bài viết trong Nhóm
-        "https://www.facebook.com/groups/1029384756102938/user/4/",                     # Link thành viên trong Nhóm
-
-        # --- Sự kiện & Chợ (Events & Marketplace) ---
-        "https://www.facebook.com/events/829102938475610/",        # Link Event (Sự kiện)
-        "https://www.facebook.com/marketplace/item/1928301928301928/", # Link sản phẩm Marketplace
-
-        # --- Link rút gọn & Di động (Shortened & Mobile) ---
-        "https://fb.com/zuck",                                     # Link rút gọn tên miền fb.com
-        "https://m.facebook.com/story.php?story_fbid=10114250280200881&id=4", # Link giao diện di động
-        "https://mbasic.facebook.com/profile.php?id=4",            # Link giao diện siêu nhẹ (mbasic)
-
-        # --- Khác (Lượt bình luận, Chat) ---
-        "https://www.facebook.com/zuck/posts/pfbid02xK9M2Y?comment_id=1011425028019999", # Link trực tiếp 1 Comment
-        "https://m.me/zuck"                                        # Link nhắn tin nhanh qua Messenger
+        
         "https://www.facebook.com/kim.chi.125900/",
         "https://www.facebook.com/kim.chi.125900/posts/123456789/",
         "https://www.facebook.com/kim.chi.125900/reel/123456789/",

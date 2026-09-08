@@ -34,7 +34,6 @@ Không bao giờ đoán UID khi evidence không đủ.
 """
 from __future__ import annotations
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import html as html_lib
 import json
 import logging
@@ -74,7 +73,8 @@ REQUEST_TIMEOUT = (5, 12)
 MAX_HTML_BYTES = 12 * 1024 * 1024
 MAX_INPUT_URLS = 8
 MAX_DISCOVERED_URLS = 100
-MAX_PROFILE_CHECKS = 3
+MAX_PROFILE_CHECKS = 5
+MAX_SHARE_PROBES = 8
 MAX_JSON_DEPTH = 12
 MAX_STRING_SCAN = 500_000
 MAX_EVIDENCE_PER_SOURCE = 80
@@ -461,76 +461,6 @@ class URLShape:
     wrapper: bool = False
     route_entity: str = ""
     route_confidence: float = 0.0
-
-
-AUTH_PATH_MARKERS = {
-    "login.php",
-    "login",
-    "logout.php",
-    "checkpoint",
-    "recover",
-    "registration",
-    "reg",
-    "privacy",
-    "security",
-    "save-device",
-    "device-based",
-}
-
-def is_facebook_auth_url(url: str) -> bool:
-    """Detect Facebook auth/system redirects without treating them as content."""
-    if not url:
-        return False
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False
-    if not is_facebook_host(parsed.netloc):
-        return False
-    parts = [
-        unquote(part).strip().lower()
-        for part in (parsed.path or "").split("/")
-        if part
-    ]
-    return bool(parts and any(part in AUTH_PATH_MARKERS for part in parts))
-
-
-def public_fallback_urls(url: str, shape: URLShape) -> List[str]:
-    """Build public HTTP variants; never authenticate or reuse cookies/tokens."""
-    normalized = normalize_facebook_url(url)
-    out = [normalized] if normalized else []
-    p = urlparse(normalized)
-
-    for host in ("mbasic.facebook.com", "m.facebook.com", "www.facebook.com"):
-        if host == normalize_host(p.netloc):
-            continue
-        out.append(
-            urlunparse((
-                "https",
-                host,
-                p.path or "/",
-                "",
-                p.query,
-                "",
-            ))
-        )
-
-    # Public embed pages may expose author/content metadata even when the
-    # ordinary post page redirects unauthenticated requests to login.
-    if shape.kind in {"POST", "GROUP_POST", "PHOTO", "REEL", "VIDEO"}:
-        encoded = quote(normalized, safe="")
-        if shape.kind in {"VIDEO", "REEL"}:
-            out.append(
-                "https://www.facebook.com/plugins/video.php"
-                f"?href={encoded}&show_text=true"
-            )
-        else:
-            out.append(
-                "https://www.facebook.com/plugins/post.php"
-                f"?href={encoded}&show_text=true"
-            )
-    return unique_keep_order(out)
-
 class URLParser:
     RESERVED = {
         "watch",
@@ -575,6 +505,20 @@ class URLParser:
         "share/v",
         "share/x",
         "share/b",
+        # Common Facebook-owned landing/system routes. These should not be
+        # mistaken for vanity USER profiles when a wrapper lands on them.
+        "about",
+        "meta",
+        "business",
+        "businesses",
+        "company",
+        "careers",
+        "news",
+        "community",
+        "developers",
+        "marketing",
+        "facebook",
+        "legal",
     }
     @classmethod
     def parse(
@@ -643,6 +587,9 @@ class URLParser:
             }:
                 if len(segments) >= 3:
                     shape.opaque_token = segments[2]
+            else:
+                # Newer Facebook share URLs commonly use /share/<token>/.
+                shape.opaque_token = segments[1]
             return shape
         if "groups" in lower:
             idx = lower.index("groups")
@@ -969,6 +916,18 @@ class FBHTMLParser(HTMLParser):
             href = data.get("href")
             if href:
                 self.links.append(href)
+        elif tag == "link":
+            # Keep canonical/app/profile links. Facebook may expose the
+            # resolved public object here even when the visible page is
+            # generic. This is metadata discovery only; no auth bypass.
+            rel = (data.get("rel") or "").lower()
+            href = data.get("href") or ""
+            if href and (
+                "canonical" in rel
+                or "alternate" in rel
+                or "shortlink" in rel
+            ):
+                self.links.append(href)
         elif tag == "img":
             src = (
                 data.get("src")
@@ -1060,6 +1019,11 @@ class PageSnapshot:
     json_objects: List[Any] = field(
         default_factory=list
     )
+    # URLs visited during an ordinary HTTP redirect chain.  This is useful
+    # for public share links whose final response may be a generic/auth page.
+    redirect_chain: List[str] = field(
+        default_factory=list
+    )
     error: str = ""
     limited: bool = False
 class HTTPFetcher:
@@ -1116,6 +1080,17 @@ class HTTPFetcher:
                         ).netloc
                     )
                     else response.url
+                )
+                snapshot.redirect_chain = unique_keep_order(
+                    [
+                        (
+                            normalize_facebook_url(h.url)
+                            if is_facebook_host(urlparse(h.url).netloc)
+                            else h.url
+                        )
+                        for h in response.history
+                    ]
+                    + [snapshot.final_url]
                 )
                 content_type = (
                     response.headers.get(
@@ -2286,6 +2261,50 @@ def scan_scripts(
                     key="profile_url",
                     weight=80,
                 )
+
+def scan_html_profile_links(
+    snapshot: PageSnapshot,
+    collector: EvidenceCollector,
+):
+    """Harvest explicit public profile URLs from raw HTML.
+
+    This is intentionally URL-based: a vanity name is only correlated to a
+    numeric UID after the profile URL itself is fetched and the profile
+    response exposes a matching numeric identity.
+    """
+    html = snapshot.html or ""
+    if not html:
+        return
+
+    # Facebook profile URLs may appear escaped inside bootstrap JSON/HTML.
+    pattern = re.compile(
+        r'https?(?:\\u002F|/){2}'
+        r'(?:www\\.|m\\.|mbasic\\.)?facebook\\.com'
+        r'(?:\\u002F|/)+'
+        r'([^"\'<>\s?&\\]+)',
+        re.I,
+    )
+    for match in pattern.finditer(html):
+        username = match.group(1)
+        username = username.replace("\\u002F", "/").split("/")[0]
+        username = html_lib.unescape(username)
+        if not username:
+            continue
+        parsed = URLParser.parse(
+            "https://www.facebook.com/" + username
+        )
+        if parsed.kind == "PROFILE" and parsed.username:
+            collector.add(
+                "https://www.facebook.com/" + quote(
+                    parsed.username,
+                    safe="@.*-",
+                ),
+                role="PROFILE_URL",
+                source="html:profile_link",
+                key="profile_url",
+                weight=78,
+            )
+
 def scan_html_identity(
     snapshot: PageSnapshot,
     collector: EvidenceCollector,
@@ -4134,29 +4153,6 @@ class FacebookResolver:
             result,
         )
         return result
-    @staticmethod
-    def _snapshot_richness(snapshot: PageSnapshot) -> int:
-        """Rank fetched pages by useful public HTML/metadata evidence."""
-        if not snapshot:
-            return 0
-        score = 0
-        if snapshot.ok:
-            score += 5
-        if snapshot.status == 200:
-            score += 5
-        score += min(len(snapshot.scripts), 40)
-        score += min(len(snapshot.json_objects), 20) * 3
-        score += min(len(snapshot.jsonld), 20) * 3
-        score += min(len(snapshot.links), 100) // 5
-        score += min(len(snapshot.html or ""), 200_000) // 20_000
-        if snapshot.meta.get("og:url"):
-            score += 8
-        if snapshot.meta.get("og:title"):
-            score += 4
-        if snapshot.text:
-            score += 2
-        return score
-
     def _resolve(
         self,
         url: str,
@@ -4182,105 +4178,227 @@ class FacebookResolver:
         final_shape = URLParser.parse(
             final_url
         )
+        if shape.kind == "UNKNOWN" and not shape.wrapper and any(
+            x.lower() in {"login.php", "logout.php", "checkpoint", "recover", "registration", "reg", "privacy", "security"}
+            for x in shape.segments
+        ):
+            result.status = "FETCH_LIMITED" if snapshot.limited or snapshot.error else "NOT_VERIFIED"
+            result.notes.append("Facebook authentication/system endpoint; không phải profile công khai.")
+            return result
         original_shape = URLParser.parse(url)
-        redirected_to_auth = is_facebook_auth_url(final_url)
-
-        # IMPORTANT: a Facebook login/checkpoint redirect is not the content
-        # URL and must not erase the original route/publisher context.
-        if redirected_to_auth:
-            result.signals.append(
-                "redirect → Facebook login/auth; giữ route gốc"
-            )
-            if shape.kind in {"UNKNOWN", "SHARE_WRAPPER"}:
-                shape = original_shape
-
-            # Try only public HTTP representations. No credentials, cookies,
-            # access tokens, or Graph authentication are introduced.
-            best_snapshot = snapshot
-            best_score = self._snapshot_richness(snapshot)
-            fallback_urls = [
-                x for x in public_fallback_urls(
-                    url,
-                    original_shape,
+        share_target_snapshot = None
+        if original_shape.wrapper:
+            # /share/<opaque-token> is not itself an identity.  Resolve it
+            # only through ordinary public HTTP redirects/metadata.  Probe
+            # Facebook's public host variants with the same exact path; this
+            # is discovery, not an authentication bypass.
+            probe_urls = []
+            parsed_input = urlparse(url)
+            exact_path = parsed_input.path or "/"
+            exact_query = parsed_input.query
+            for host in (
+                parsed_input.netloc,
+                "www.facebook.com",
+                "m.facebook.com",
+                "mbasic.facebook.com",
+            ):
+                if not host:
+                    continue
+                probe = urlunparse((
+                    "https",
+                    host,
+                    exact_path,
+                    "",
+                    exact_query,
+                    "",
+                ))
+                probe_urls.append(
+                    normalize_facebook_url(probe)
                 )
-                if x not in {url, final_url}
-            ]
+            probe_urls = unique_keep_order(probe_urls)[:MAX_SHARE_PROBES]
 
-            def _fetch_public_fallback(
-                fallback_url: str,
-            ) -> PageSnapshot:
-                with self.profile_sem:
-                    return self.fetcher.fetch(
-                        fallback_url,
+            snapshots = [(url, snapshot)]
+            for probe_url in probe_urls:
+                if probe_url == url:
+                    continue
+                try:
+                    ps = self.fetcher.fetch(
+                        probe_url,
                         referer=url,
                     )
+                    snapshots.append((probe_url, ps))
+                except Exception:
+                    LOGGER.debug(
+                        "share probe failed: %s",
+                        probe_url,
+                        exc_info=True,
+                    )
 
-            # Run the public variants in parallel so an auth redirect does
-            # not turn one resolver call into several serial timeout windows.
-            with ThreadPoolExecutor(
-                max_workers=min(3, max(1, len(fallback_urls)))
-            ) as pool:
-                futures = {
-                    pool.submit(
-                        _fetch_public_fallback,
-                        fallback_url,
-                    ): fallback_url
-                    for fallback_url in fallback_urls
-                }
-                for future in as_completed(futures):
+            def public_target_from_snapshot(ps):
+                candidates = []
+
+                # Redirect targets are the strongest discovery signal.
+                for candidate in ps.redirect_chain:
+                    if not candidate:
+                        continue
+                    parsed = URLParser.parse(candidate)
+                    if (
+                        parsed.kind in {
+                            "POST", "REEL", "VIDEO", "PHOTO",
+                            "STORY", "ALBUM", "GROUP_POST",
+                            "PROFILE",
+                        }
+                        and parsed.route_confidence >= 92
+                    ):
+                        candidates.append(
+                            (100.0, candidate, parsed)
+                        )
+
+                # og:url / profile:url are weaker than a redirect but still
+                # explicit public canonical metadata.
+                for key in ("og:url", "profile:url"):
+                    candidate = ps.meta.get(key, "")
+                    if not candidate or not is_facebook_host(
+                        urlparse(candidate).netloc
+                    ):
+                        continue
+                    parsed = URLParser.parse(candidate)
+                    if (
+                        parsed.kind in {
+                            "POST", "REEL", "VIDEO", "PHOTO",
+                            "STORY", "ALBUM", "GROUP_POST",
+                            "PROFILE",
+                        }
+                        and parsed.route_confidence >= 92
+                    ):
+                        candidates.append(
+                            (90.0, candidate, parsed)
+                        )
+
+                # Finally inspect canonical/identity links. Do not accept
+                # arbitrary numeric IDs from the landing document.
+                for href in ps.links[:MAX_DISCOVERED_URLS]:
+                    candidate = urljoin(
+                        ps.final_url or ps.url,
+                        href,
+                    )
+                    if not is_facebook_host(
+                        urlparse(candidate).netloc
+                    ):
+                        continue
+                    parsed = URLParser.parse(candidate)
+                    if (
+                        parsed.kind in {
+                            "POST", "REEL", "VIDEO", "PHOTO",
+                            "STORY", "ALBUM", "GROUP_POST",
+                            "PROFILE",
+                        }
+                        and parsed.route_confidence >= 92
+                    ):
+                        candidates.append(
+                            (70.0, candidate, parsed)
+                        )
+
+                if not candidates:
+                    return None
+                candidates.sort(
+                    key=lambda x: x[0],
+                    reverse=True,
+                )
+                return candidates[0]
+
+            best = None
+            for probe_url, ps in snapshots:
+                found = public_target_from_snapshot(ps)
+                if found is None:
+                    continue
+                score, target_url, target_shape = found
+                if best is None or score > best[0]:
+                    best = (
+                        score,
+                        target_url,
+                        target_shape,
+                        ps,
+                    )
+
+            if best is not None:
+                _, target_url, target_shape, source_snapshot = best
+                target_snapshot = source_snapshot
+
+                # If the source snapshot itself is not the actual target,
+                # fetch the explicit public target once for full evidence.
+                if normalize_facebook_url(target_url) != normalize_facebook_url(
+                    source_snapshot.final_url or source_snapshot.url
+                ):
                     try:
-                        fallback = future.result()
+                        target_snapshot = self.fetcher.fetch(
+                            target_url,
+                            referer=source_snapshot.final_url or url,
+                        )
                     except Exception:
                         LOGGER.debug(
-                            "Public fallback fetch failed",
+                            "share target fetch failed: %s",
+                            target_url,
                             exc_info=True,
                         )
-                        continue
-                    if is_facebook_auth_url(fallback.final_url):
-                        continue
-                    fallback_score = self._snapshot_richness(
-                        fallback
-                    )
-                    if fallback_score > best_score:
-                        best_snapshot = fallback
-                        best_score = fallback_score
 
-            if best_snapshot is not snapshot:
-                snapshot = best_snapshot
+                shape = target_shape
+                snapshot = target_snapshot
                 result.http_status = snapshot.status
-                final_url = snapshot.final_url or url
-                final_shape = URLParser.parse(final_url)
 
-        if shape.wrapper and not redirected_to_auth:
+                canonical = (
+                    snapshot.meta.get("og:url", "")
+                    or target_url
+                    or snapshot.final_url
+                )
+                if (
+                    canonical
+                    and is_facebook_host(
+                        urlparse(canonical).netloc
+                    )
+                ):
+                    canonical = normalize_facebook_url(canonical)
+
+                canonical_shape = URLParser.parse(canonical)
+                if canonical_shape.kind in {
+                    "POST", "REEL", "VIDEO", "PHOTO",
+                    "STORY", "ALBUM", "GROUP_POST",
+                    "PROFILE",
+                }:
+                    shape = canonical_shape
+                    result.canonical_url = canonical
+                    result.content_url = canonical
+                else:
+                    result.canonical_url = normalize_facebook_url(target_url)
+                    result.content_url = result.canonical_url
+
+                result.notes.append(
+                    "Share wrapper resolved via public redirect/canonical metadata."
+                )
+
+            if shape.kind == "SHARE_WRAPPER":
+                result.status = (
+                    "FETCH_LIMITED"
+                    if any(
+                        ps.limited or ps.error
+                        for _, ps in snapshots
+                    )
+                    else "NOT_VERIFIED"
+                )
+                result.notes.append(
+                    "Share token không expose public canonical content "
+                    "trong các response HTTP công khai; không suy diễn UID."
+                )
+                return result
+        else:
             shape = final_shape
-
-        if (
-            shape.kind
-            == "SHARE_WRAPPER"
-        ):
-            result.status = (
-                "FETCH_LIMITED"
-            )
-            result.notes.append(
-                "Share wrapper không expose "
-                "canonical content."
-            )
-
-        public_og_url = snapshot.meta.get(
-            "og:url",
-            "",
-        )
         canonical = (
-            public_og_url
-            if public_og_url
-            and not is_facebook_auth_url(
-                public_og_url
+            snapshot.meta.get(
+                "og:url",
+                "",
             )
-            else (
-                url
-                if redirected_to_auth
-                else final_url
-            )
+            or final_url
+            or url
         )
         if is_facebook_host(
             urlparse(
@@ -4297,8 +4415,8 @@ class FacebookResolver:
         )
         result.content_url = (
             canonical
-            if canonical and not is_facebook_auth_url(canonical)
-            else url
+            if canonical
+            else final_url
         )
         canonical_shape = (
             URLParser.parse(
@@ -4316,7 +4434,6 @@ class FacebookResolver:
             shape = canonical_shape
         # Preserve exact content identity from the original URL when a
         # redirect/og:url loses the more specific route.
-        original_shape = URLParser.parse(url)
         for attr in (
             "post_id", "reel_id", "video_id",
             "photo_id", "story_id", "album_id",
@@ -4346,6 +4463,10 @@ class FacebookResolver:
             collector,
         )
         scan_html_identity(
+            snapshot,
+            collector,
+        )
+        scan_html_profile_links(
             snapshot,
             collector,
         )
@@ -4414,6 +4535,10 @@ class FacebookResolver:
                 collector,
             )
             scan_html_identity(
+                ps,
+                collector,
+            )
+            scan_html_profile_links(
                 ps,
                 collector,
             )

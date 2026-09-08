@@ -6290,14 +6290,137 @@ COMMAND_INFO = {
 
 if __name__ == "__main__":
     tests = [
-        
+        # =========================
+        # USER / PROFILE
+        # =========================
+
         "https://www.facebook.com/kim.chi.125900/",
-        "https://www.facebook.com/kim.chi.125900/posts/123456789/",
-        "https://www.facebook.com/kim.chi.125900/reel/123456789/",
-        "https://www.facebook.com/groups/123456789/posts/987654321/",
-        "https://www.facebook.com/share/r/1H1EjsEW7J/",
+        "https://www.facebook.com/kim.chi.125900",
         "https://www.facebook.com/profile.php?id=61553239356646",
-        "https://www.facebook.com/stories/122099490590156326/UzpfSVNDOjEwODI2OTkxNDA5MzYwNjI="
+        "https://www.facebook.com/people/Nguyen-Van-Loi/61553239356646/",
+        "https://www.facebook.com/people/kim-chi/100012345678901/",
+
+        # =========================
+        # USER POSTS
+        # =========================
+
+        "https://www.facebook.com/kim.chi.125900/posts/123456789/",
+        "https://www.facebook.com/kim.chi.125900/posts/123456789",
+        "https://www.facebook.com/kim.chi.125900/posts/pfbid0AbCdEfGhIjKlMnOpQrStUvWxYz/",
+        "https://www.facebook.com/kim.chi.125900/posts/pfbid02ABCDEF123456789/",
+
+        # =========================
+        # REELS
+        # =========================
+
+        "https://www.facebook.com/kim.chi.125900/reel/123456789/",
+        "https://www.facebook.com/kim.chi.125900/reels/123456789/",
+        "https://www.facebook.com/reel/123456789/",
+        "https://www.facebook.com/reel/pfbid02ABCDEF123456789/",
+        "https://www.facebook.com/kim.chi.125900/videos/123456789/",
+
+        # =========================
+        # VIDEO
+        # =========================
+
+        "https://www.facebook.com/kim.chi.125900/videos/123456789/",
+        "https://www.facebook.com/watch/?v=123456789",
+        "https://www.facebook.com/watch?v=123456789",
+        "https://www.facebook.com/video.php?v=123456789",
+        "https://www.facebook.com/video.php?id=123456789",
+
+        # =========================
+        # PHOTO
+        # =========================
+
+        "https://www.facebook.com/photo.php?fbid=123456789",
+        "https://www.facebook.com/photo.php?fbid=123456789&id=61553239356646",
+        "https://www.facebook.com/kim.chi.125900/photos/a.123456789/987654321/",
+        "https://www.facebook.com/photo/?fbid=123456789",
+
+        # =========================
+        # GROUP
+        # =========================
+
+        "https://www.facebook.com/groups/123456789/",
+        "https://www.facebook.com/groups/123456789/posts/987654321/",
+        "https://www.facebook.com/groups/123456789/posts/pfbid02ABCDEF123456789/",
+        "https://www.facebook.com/groups/testgroup/posts/987654321/",
+        "https://www.facebook.com/groups/testgroup/",
+        "https://www.facebook.com/groups/123456789/permalink/987654321/",
+
+        # =========================
+        # PAGE
+        # =========================
+
+        "https://www.facebook.com/testpage/",
+        "https://www.facebook.com/testpage/posts/123456789/",
+        "https://www.facebook.com/testpage/videos/123456789/",
+        "https://www.facebook.com/testpage/reels/123456789/",
+        "https://www.facebook.com/pages/Test-Page/123456789/",
+        "https://www.facebook.com/pages/category/test/Test-Page-123456789/",
+
+        # =========================
+        # STORY
+        # =========================
+
+        "https://www.facebook.com/stories/122099490590156326/UzpfSVNDOjEwODI2OTkxNDA5MzYwNjI=",
+        "https://www.facebook.com/stories/123456789/",
+        "https://www.facebook.com/stories/123456789/ABCDEF123456/",
+        "https://www.facebook.com/story.php?story_fbid=123456789&id=61553239356646",
+        "https://www.facebook.com/story.php?story_fbid=123456789&id=123456789",
+
+        # =========================
+        # SHARE
+        # =========================
+
+        "https://www.facebook.com/share/r/1H1EjsEW7J/",
+        "https://www.facebook.com/share/p/1CCtt6rTp4/",
+        "https://www.facebook.com/share/v/1AbCdEfGhI/",
+        "https://www.facebook.com/share/s/1AbCdEfGhI/",
+        "https://www.facebook.com/share/19M9rhA5SB/",
+        "https://www.facebook.com/share/1AbCdEfGhI/",
+
+        # =========================
+        # PERMALINK
+        # =========================
+
+        "https://www.facebook.com/permalink.php?story_fbid=123456789&id=61553239356646",
+        "https://www.facebook.com/permalink.php?story_fbid=123456789&id=123456789",
+        "https://www.facebook.com/permalink/123456789/",
+
+        # =========================
+        # USERNAME + CONTENT
+        # =========================
+
+        "https://www.facebook.com/kim.chi.125900/posts/123456789?__cft__[0]=abc",
+        "https://www.facebook.com/kim.chi.125900/reel/123456789?mibextid=abc",
+        "https://www.facebook.com/kim.chi.125900/videos/123456789?mibextid=abc",
+
+        # =========================
+        # QUERY PARAMETER VARIANTS
+        # =========================
+
+        "https://www.facebook.com/profile.php? id=61553239356646".replace(" ", ""),
+        "https://www.facebook.com/photo.php?id=61553239356646&fbid=123456789",
+        "https://www.facebook.com/video.php?id=61553239356646&v=123456789",
+
+        # =========================
+        # MOBILE / M.FACEBOOK
+        # =========================
+
+        "https://m.facebook.com/kim.chi.125900/",
+        "https://m.facebook.com/kim.chi.125900/posts/123456789/",
+        "https://m.facebook.com/profile.php?id=61553239356646",
+        "https://m.facebook.com/groups/123456789/posts/987654321/",
+
+        # =========================
+        # WWW / FB VARIANTS
+        # =========================
+
+        "https://facebook.com/kim.chi.125900/",
+        "https://facebook.com/kim.chi.125900/posts/123456789/",
+        "https://facebook.com/groups/123456789/posts/987654321/",
     ]
     for test in tests:
         shape = URLParser.parse(

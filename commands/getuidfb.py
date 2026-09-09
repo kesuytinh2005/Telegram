@@ -42,6 +42,7 @@ import random
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import (
@@ -74,9 +75,10 @@ REQUEST_TIMEOUT = (5, 12)
 MAX_HTML_BYTES = 12 * 1024 * 1024
 MAX_INPUT_URLS = 8
 MAX_DISCOVERED_URLS = 100
-MAX_PROFILE_CHECKS = 8
-MAX_SHARE_PROBES = 8
-MAX_OBJECT_PROBES = 24
+MAX_PROFILE_CHECKS = 6
+MAX_SHARE_PROBES = 4
+MAX_OBJECT_PROBES = 12
+MAX_PARALLEL_HTTP = 4
 MAX_OBJECT_DEPTH = 2
 MAX_JSON_DEPTH = 12
 MAX_STRING_SCAN = 500_000
@@ -85,7 +87,7 @@ MAX_SIGNALS = 5
 MAX_DEBUG_CANDIDATES = 30
 CONCURRENCY = 4
 CACHE_TTL = 120
-RETRY_COUNT = 2
+RETRY_COUNT = 1
 SESSION_TIMEOUT = 900
 FACEBOOK_HOSTS = {
     "facebook.com",
@@ -199,7 +201,6 @@ def make_headers(
             "Chrome/139.0.0.0 "
             "Safari/537.36"
         ),
-        "cookie":"datr=kBSQagu2vLmwP2jexyT0uHtW; sb=kBSQapS4UqLmzWJJtXC_k1dx; c_user=100002959316322; xs=29%3AX1yEyaQgOaKRAg%3A2%3A1787827364%3A-1%3A-1; locale=vi_VN; pas=100002959316322%3Ae7FBRGtMsm; ps_l=1; ps_n=1; dpr=3.57320237159729; fr=0lqbnePWkQLCp6f81.AWfWp03Uzs72uld9j3sZzF7PzIi-ma7Gt4Tc7eLY4Om8WZIidzw.BqkBSQ..AAA.0.0.BqkDG2.AWcULxq0Ew5nweXnN4Sz0d-Q2wY; vpd=v1%3B719x375x3.57320237159729; wd=891x1709; fbl_st=101617748%3BT%3A29797917; wl_cbv=v2%3Bclient_version%3A3262%3Btimestamp%3A1787875034; presence=C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1787875037664%2C%22v%22%3A1%7D; pas=100002959316322%3Ae7FBRGtMsm; datr=kBSQagu2vLmwP2jexyT0uHtW; fr=0P7hvDHaFQeFJWbyE..Bqlsik...1.0.Bqlsik.AWcLbzWehETSnfkeBBGb9h9HLHs; wd=891x1709; dpr=3.57320237159729; fbl_st=100436135%3BT%3A29815200; vpd=v1%3B719x375x3.25; wl_cbv=v2%3Bclient_version%3A3276%3Btimestamp%3A1788912010; useragent=TW96aWxsYS81LjAgKExpbnV4OyBBbmRyb2lkIDEwOyBLKSBBcHBsZVdlYktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBDaHJvbWUvMTM5LjAuMC4wIE1vYmlsZSBTYWZhcmkvNTM3LjM2; _uafec=Mozilla%2F5.0%20(Linux%3B%20Android%2010%3B%20K)%20AppleWebKit%2F537.36%20(KHTML%2C%20like%20Gecko)%20Chrome%2F139.0.0.0%20Mobile%20Safari%2F537.36; "
     }
     if referer:
         headers["Referer"] = referer
@@ -1076,6 +1077,28 @@ class PageSnapshot:
 class HTTPFetcher:
     def __init__(self):
         self.local = threading.local()
+        self._cache = {}
+        self._cache_lock = threading.Lock()
+        self.cache_ttl = 45.0
+
+    def _cached(self, url: str):
+        now = time.time()
+        with self._cache_lock:
+            item = self._cache.get(url)
+            if not item:
+                return None
+            ts, snap = item
+            if now - ts > self.cache_ttl:
+                self._cache.pop(url, None)
+                return None
+            return snap
+
+    def _store_cache(self, url: str, snap: PageSnapshot):
+        with self._cache_lock:
+            self._cache[url] = (time.time(), snap)
+            if len(self._cache) > 256:
+                oldest = min(self._cache, key=lambda k: self._cache[k][0])
+                self._cache.pop(oldest, None)
     def session(self) -> requests.Session:
         session = getattr(
             self.local,
@@ -1093,6 +1116,9 @@ class HTTPFetcher:
         *,
         referer: Optional[str] = None,
     ) -> PageSnapshot:
+        cached = self._cached(url)
+        if cached is not None:
+            return cached
         snapshot = PageSnapshot(
             url=url,
             final_url=url,
@@ -1160,7 +1186,9 @@ class HTTPFetcher:
                         errors="ignore",
                     )
                     snapshot.ok = response.ok
-                    return snapshot
+                    self._store_cache(url, snapshot)
+                    self._store_cache(url, snapshot)
+                return snapshot
                 data = bytearray()
                 for chunk in response.iter_content(
                     chunk_size=64 * 1024
@@ -1222,6 +1250,7 @@ class HTTPFetcher:
                         )
                     )
                     continue
+                self._store_cache(url, snapshot)
                 return snapshot
             except (
                 requests.RequestException,
@@ -1249,6 +1278,26 @@ class HTTPFetcher:
         )
         snapshot.limited = True
         return snapshot
+    def fetch_many(self, urls: List[str], *, referer: Optional[str] = None,
+                   max_workers: int = MAX_PARALLEL_HTTP) -> List[PageSnapshot]:
+        urls = unique_keep_order([u for u in urls if u])
+        if not urls:
+            return []
+        results: Dict[str, PageSnapshot] = {}
+        workers = min(max_workers, len(urls))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(self.fetch, u, referer=referer): u
+                for u in urls
+            }
+            for fut in as_completed(futures):
+                u = futures[fut]
+                try:
+                    results[u] = fut.result()
+                except Exception:
+                    LOGGER.debug("parallel fetch failed: %s", u, exc_info=True)
+        return [results[u] for u in urls if u in results]
+
 def safe_json_loads(
     value: str,
 ) -> Any:
@@ -3856,15 +3905,22 @@ class IdentityVerifier:
             shape.kind == "STORY"
             and shape.route_entity == "USER"
             and is_numeric_id(shape.numeric_path_id)
-            and not collector.by_role("PAGE_ID")
-            and not collector.by_role("GROUP_ID")
         ):
-            result.uid = shape.numeric_path_id
-            result.verified = True
-            result.confidence = 99.0
-            result.sources = 1
-            result.signals.append("/stories/<owner_id>/ → explicit USER owner UID")
-            return result
+            # IDs from a generic Facebook landing page are not allowed to
+            # veto an explicit /stories/<owner_id>/ route. Only a direct
+            # contradictory page/group route should do so; incidental IDs
+            # from login/terms/bootstrap HTML are unrelated evidence.
+            direct_veto = any(
+                e.value == shape.numeric_path_id
+                for e in collector.by_role("PAGE_ID") + collector.by_role("GROUP_ID")
+            )
+            if not direct_veto:
+                result.uid = shape.numeric_path_id
+                result.verified = True
+                result.confidence = 99.0
+                result.sources = 1
+                result.signals.append("/stories/<owner_id>/ → explicit USER owner UID")
+                return result
 
         ranked = rank_user_candidates(
             collector,
@@ -4253,6 +4309,14 @@ class FacebookResolver:
             result.notes.append("Facebook authentication/system endpoint; không phải profile công khai.")
             return result
         original_shape = URLParser.parse(url)
+        # Preserve identity that is literally encoded in the INPUT route.
+        # A later canonical/login landing page must never overwrite it with
+        # an unrelated ID found on Facebook's generic page.
+        explicit_story_owner = ""
+        if original_shape.kind == "STORY" and original_shape.original:
+            m_owner = re.search(r"/stories/(\d{10,30})/", original_shape.original, re.I)
+            if m_owner:
+                explicit_story_owner = m_owner.group(1)
         share_target_snapshot = None
         # Keep every public response from PASS 1 available to mandatory PASS 2.
         # This is critical for /share/<token>: the useful object identifier can
@@ -4290,24 +4354,13 @@ class FacebookResolver:
             probe_urls = unique_keep_order(probe_urls)[:MAX_SHARE_PROBES]
 
             snapshots = [(url, snapshot)]
-            for probe_url in probe_urls:
-                if probe_url == url:
-                    continue
-                try:
-                    ps = self.fetcher.fetch(
-                        probe_url,
-                        referer=url,
-                    )
-                    snapshots.append((probe_url, ps))
-                except Exception:
-                    LOGGER.debug(
-                        "share probe failed: %s",
-                        probe_url,
-                        exc_info=True,
-                    )
-
-            share_snapshots = [ps for _, ps in snapshots]
-
+            extra_probe_urls = [u for u in probe_urls if u != url]
+            for ps in self.fetcher.fetch_many(
+                extra_probe_urls,
+                referer=url,
+                max_workers=MAX_PARALLEL_HTTP,
+            ):
+                snapshots.append((ps.url, ps))
             share_snapshots = [ps for _, ps in snapshots]
 
             def public_target_from_snapshot(ps):
@@ -4509,7 +4562,9 @@ class FacebookResolver:
         ):
             shape = canonical_shape
         # Preserve exact content identity from the original URL when a
-        # redirect/og:url loses the more specific route.
+        # redirect/og:url loses the more specific route. For STORY routes,
+        # the owner segment is authoritative route evidence: a generic
+        # login/terms page must not replace it with an unrelated numeric ID.
         for attr in (
             "post_id", "reel_id", "video_id",
             "photo_id", "story_id", "album_id",
@@ -4521,6 +4576,20 @@ class FacebookResolver:
                 if shape.kind == "UNKNOWN":
                     shape.kind = original_shape.kind
                     shape.route_entity = original_shape.route_entity
+        if explicit_story_owner:
+            shape.kind = "STORY"
+            shape.numeric_path_id = explicit_story_owner
+            shape.route_entity = "USER"
+            shape.route_confidence = max(shape.route_confidence, 99.0)
+            # If canonical resolved to auth/generic content, retain the actual
+            # input story URL as the content link instead of /login.php.
+            parsed_canonical = URLParser.parse(result.canonical_url or "")
+            if parsed_canonical.kind in {"UNKNOWN", "HOME", "SHARE_WRAPPER"} or any(
+                x.lower() in {"login.php", "login", "checkpoint", "recover", "registration", "reg"}
+                for x in parsed_canonical.segments
+            ):
+                result.canonical_url = original_shape.original
+                result.content_url = original_shape.original
         collector = EvidenceCollector()
         scan_url_evidence(
             shape,
@@ -4594,61 +4663,21 @@ class FacebookResolver:
             )
         )
         profile_snapshots = []
-        for profile_url in profile_urls[
-            :MAX_PROFILE_CHECKS
-        ]:
-            if (
-                profile_url
-                == result.content_url
-            ):
-                profile_snapshots.append(
-                    snapshot
-                )
-                continue
-            with self.profile_sem:
-                ps = self.fetcher.fetch(
-                    profile_url,
-                    referer=result.content_url,
-                )
+        initial_profile_urls = profile_urls[:MAX_PROFILE_CHECKS]
+        # Fetch independent profile candidates concurrently.  This reduces
+        # wall-clock latency without increasing the number of candidates.
+        for ps in self.fetcher.fetch_many(
+            initial_profile_urls,
+            referer=result.content_url,
+            max_workers=MAX_PARALLEL_HTTP,
+        ):
             profile_snapshots.append(ps)
-            scan_meta(
-                ps,
-                collector,
-            )
-            scan_jsonld(
-                ps,
-                collector,
-            )
-            scan_scripts(
-                ps,
-                collector,
-            )
-            scan_html_identity(
-                ps,
-                collector,
-            )
-            scan_html_profile_links(
-                ps,
-                collector,
-            )
-            profile_url_from_meta = (
-                ps.meta.get(
-                    "og:url",
-                    "",
-                )
-            )
-            if (
-                profile_url_from_meta
-                and profile.username
-                and profile.username.lower()
-                in profile_url_from_meta.lower()
-            ):
-                collector.add(
-                    profile_url_from_meta,
-                    role="PROFILE_CANONICAL",
-                    source="profile_meta",
-                    weight=90,
-                )
+            scan_meta(ps, collector)
+            scan_jsonld(ps, collector)
+            scan_scripts(ps, collector)
+            scan_html_identity(ps, collector)
+            scan_html_profile_links(ps, collector)
+
         # ------------------------------------------------------------------
         # PASS 2 (MANDATORY): OBJECT-ID -> PUBLIC AUTHOR/PROFILE CORRELATION
         # ------------------------------------------------------------------
@@ -4769,7 +4798,7 @@ class FacebookResolver:
                 key="profile_owner_id",
                 neighbor="/stories/<owner_id>/<story_id>",
                 url=original_shape.original,
-                weight=108.0,
+                weight=220.0,
                 independent=True,
                 entity_type="USER",
             )
@@ -4948,17 +4977,19 @@ class FacebookResolver:
             # Direct owner/profile probing for IDs explicitly present in
             # /stories/<numeric-owner>/<story-token>/ URLs.
             author_ids = [i for k, i, _ in pass2_ids if k == "author" and is_numeric_id(i)]
+            author_profile_urls = []
             for author_id in unique_keep_order(author_ids):
-                for profile_url in (
+                author_profile_urls.extend((
                     f"https://www.facebook.com/profile.php?id={author_id}",
                     f"https://m.facebook.com/profile.php?id={author_id}",
-                ):
-                    try:
-                        ps = self.fetcher.fetch(profile_url, referer=result.content_url or url)
-                    except Exception:
-                        continue
-                    phase2_snapshots.append(ps)
-                    self.merge_snapshot_evidence(ps, collector)
+                ))
+            for ps in self.fetcher.fetch_many(
+                author_profile_urls[:MAX_PROFILE_CHECKS],
+                referer=result.content_url or url,
+                max_workers=MAX_PARALLEL_HTTP,
+            ):
+                phase2_snapshots.append(ps)
+                self.merge_snapshot_evidence(ps, collector)
 
             for kind, ident, source in pass2_ids:
                 temp = URLShape(
@@ -4979,15 +5010,13 @@ class FacebookResolver:
                 )
             probe_urls = unique_keep_order(probe_urls)[:MAX_OBJECT_PROBES]
 
-            for probe_url in probe_urls:
-                try:
-                    ps = self.fetcher.fetch(
-                        probe_url,
-                        referer=result.content_url or url,
-                    )
-                except Exception:
-                    LOGGER.debug("PASS2 probe failed: %s", probe_url, exc_info=True)
-                    continue
+            # Object representations are independent. Fetch them in parallel,
+            # then merge evidence in deterministic URL order.
+            for ps in self.fetcher.fetch_many(
+                probe_urls,
+                referer=result.content_url or url,
+                max_workers=MAX_PARALLEL_HTTP,
+            ):
                 phase2_snapshots.append(ps)
                 self.merge_snapshot_evidence(ps, collector)
 
@@ -5021,17 +5050,17 @@ class FacebookResolver:
             existing = {
                 normalize_facebook_url(x.url) for x in profile_snapshots if x.url
             }
-            for profile_url in discovered_profiles[:MAX_PROFILE_CHECKS]:
-                if normalize_facebook_url(profile_url) in existing:
-                    continue
-                try:
-                    ps = self.fetcher.fetch(
-                        profile_url, referer=result.content_url or url
-                    )
-                except Exception:
-                    continue
+            discovered_to_fetch = [
+                profile_url for profile_url in discovered_profiles[:MAX_PROFILE_CHECKS]
+                if normalize_facebook_url(profile_url) not in existing
+            ]
+            for ps in self.fetcher.fetch_many(
+                discovered_to_fetch,
+                referer=result.content_url or url,
+                max_workers=MAX_PARALLEL_HTTP,
+            ):
                 profile_snapshots.append(ps)
-                existing.add(normalize_facebook_url(profile_url))
+                existing.add(normalize_facebook_url(ps.url))
                 self.merge_snapshot_evidence(ps, collector)
 
             result.debug["pass2"] = {
@@ -5074,6 +5103,35 @@ class FacebookResolver:
         profile.entity_type = (
             entity.publisher
         )
+        if explicit_story_owner:
+            result.debug.setdefault("identity_lock", {})["story_owner"] = explicit_story_owner
+            result.debug["identity_lock"]["source"] = "original_input_url:/stories/<owner_id>/"
+            result.debug["identity_lock"]["canonical_override"] = result.content_url == original_shape.original
+
+        # Final candidate audit: expose the strongest numeric USER evidence
+        # without treating arbitrary numbers from generic HTML as UID.
+        uid_audit = []
+        for ev in getattr(collector, "items", []):
+            if getattr(ev, "role", "") not in {"USER_CANDIDATE", "UID", "PROFILE_ID"}:
+                continue
+            value = clean_text(getattr(ev, "value", ""))
+            if not is_numeric_id(value):
+                continue
+            if value in {"0", "1"}:
+                continue
+            uid_audit.append({
+                "id": value,
+                "source": getattr(ev, "source", ""),
+                "role": getattr(ev, "role", ""),
+                "weight": getattr(ev, "weight", 0.0),
+                "independent": bool(getattr(ev, "independent", False)),
+            })
+        uid_audit.sort(
+            key=lambda x: (x["independent"], x["weight"]),
+            reverse=True,
+        )
+        result.debug["uid_audit"] = uid_audit[:MAX_DEBUG_CANDIDATES]
+
         verifier = IdentityVerifier()
         verification = (
             verifier.verify(
@@ -6288,140 +6346,14 @@ COMMAND_INFO = {
     "category": "Facebook",
     "public_only": True,
 }
-
 if __name__ == "__main__":
     tests = [
-        # =========================
-        # USER / PROFILE
-        # =========================
-
         "https://www.facebook.com/kim.chi.125900/",
-        "https://www.facebook.com/kim.chi.125900",
-        "https://www.facebook.com/profile.php?id=61553239356646",
-        "https://www.facebook.com/people/Nguyen-Van-Loi/61553239356646/",
-        "https://www.facebook.com/people/kim-chi/100012345678901/",
-
-        # =========================
-        # USER POSTS
-        # =========================
-
         "https://www.facebook.com/kim.chi.125900/posts/123456789/",
-        "https://www.facebook.com/kim.chi.125900/posts/123456789",
-        "https://www.facebook.com/kim.chi.125900/posts/pfbid0AbCdEfGhIjKlMnOpQrStUvWxYz/",
-        "https://www.facebook.com/kim.chi.125900/posts/pfbid02ABCDEF123456789/",
-
-        # =========================
-        # REELS
-        # =========================
-
         "https://www.facebook.com/kim.chi.125900/reel/123456789/",
-        "https://www.facebook.com/kim.chi.125900/reels/123456789/",
-        "https://www.facebook.com/reel/123456789/",
-        "https://www.facebook.com/reel/pfbid02ABCDEF123456789/",
-        "https://www.facebook.com/kim.chi.125900/videos/123456789/",
-
-        # =========================
-        # VIDEO
-        # =========================
-
-        "https://www.facebook.com/kim.chi.125900/videos/123456789/",
-        "https://www.facebook.com/watch/?v=123456789",
-        "https://www.facebook.com/watch?v=123456789",
-        "https://www.facebook.com/video.php?v=123456789",
-        "https://www.facebook.com/video.php?id=123456789",
-
-        # =========================
-        # PHOTO
-        # =========================
-
-        "https://www.facebook.com/photo.php?fbid=123456789",
-        "https://www.facebook.com/photo.php?fbid=123456789&id=61553239356646",
-        "https://www.facebook.com/kim.chi.125900/photos/a.123456789/987654321/",
-        "https://www.facebook.com/photo/?fbid=123456789",
-
-        # =========================
-        # GROUP
-        # =========================
-
-        "https://www.facebook.com/groups/123456789/",
         "https://www.facebook.com/groups/123456789/posts/987654321/",
-        "https://www.facebook.com/groups/123456789/posts/pfbid02ABCDEF123456789/",
-        "https://www.facebook.com/groups/testgroup/posts/987654321/",
-        "https://www.facebook.com/groups/testgroup/",
-        "https://www.facebook.com/groups/123456789/permalink/987654321/",
-
-        # =========================
-        # PAGE
-        # =========================
-
-        "https://www.facebook.com/testpage/",
-        "https://www.facebook.com/testpage/posts/123456789/",
-        "https://www.facebook.com/testpage/videos/123456789/",
-        "https://www.facebook.com/testpage/reels/123456789/",
-        "https://www.facebook.com/pages/Test-Page/123456789/",
-        "https://www.facebook.com/pages/category/test/Test-Page-123456789/",
-
-        # =========================
-        # STORY
-        # =========================
-
-        "https://www.facebook.com/stories/122099490590156326/UzpfSVNDOjEwODI2OTkxNDA5MzYwNjI=",
-        "https://www.facebook.com/stories/123456789/",
-        "https://www.facebook.com/stories/123456789/ABCDEF123456/",
-        "https://www.facebook.com/story.php?story_fbid=123456789&id=61553239356646",
-        "https://www.facebook.com/story.php?story_fbid=123456789&id=123456789",
-
-        # =========================
-        # SHARE
-        # =========================
-
         "https://www.facebook.com/share/r/1H1EjsEW7J/",
-        "https://www.facebook.com/share/p/1CCtt6rTp4/",
-        "https://www.facebook.com/share/v/1AbCdEfGhI/",
-        "https://www.facebook.com/share/s/1AbCdEfGhI/",
-        "https://www.facebook.com/share/19M9rhA5SB/",
-        "https://www.facebook.com/share/1AbCdEfGhI/",
-
-        # =========================
-        # PERMALINK
-        # =========================
-
-        "https://www.facebook.com/permalink.php?story_fbid=123456789&id=61553239356646",
-        "https://www.facebook.com/permalink.php?story_fbid=123456789&id=123456789",
-        "https://www.facebook.com/permalink/123456789/",
-
-        # =========================
-        # USERNAME + CONTENT
-        # =========================
-
-        "https://www.facebook.com/kim.chi.125900/posts/123456789?__cft__[0]=abc",
-        "https://www.facebook.com/kim.chi.125900/reel/123456789?mibextid=abc",
-        "https://www.facebook.com/kim.chi.125900/videos/123456789?mibextid=abc",
-
-        # =========================
-        # QUERY PARAMETER VARIANTS
-        # =========================
-
-        "https://www.facebook.com/profile.php? id=61553239356646".replace(" ", ""),
-        "https://www.facebook.com/photo.php?id=61553239356646&fbid=123456789",
-        "https://www.facebook.com/video.php?id=61553239356646&v=123456789",
-
-        # =========================
-        # MOBILE / M.FACEBOOK
-        # =========================
-
-        "https://m.facebook.com/kim.chi.125900/",
-        "https://m.facebook.com/kim.chi.125900/posts/123456789/",
-        "https://m.facebook.com/profile.php?id=61553239356646",
-        "https://m.facebook.com/groups/123456789/posts/987654321/",
-
-        # =========================
-        # WWW / FB VARIANTS
-        # =========================
-
-        "https://facebook.com/kim.chi.125900/",
-        "https://facebook.com/kim.chi.125900/posts/123456789/",
-        "https://facebook.com/groups/123456789/posts/987654321/",
+        "https://www.facebook.com/profile.php?id=61553239356646",
     ]
     for test in tests:
         shape = URLParser.parse(

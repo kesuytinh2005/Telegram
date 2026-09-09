@@ -171,24 +171,35 @@ def make_headers(
         else random.choice(USER_AGENTS[2:])
     )
     headers = {
-        'authority': 'www.facebook.com',
-		'accept': '*/*',
-		'accept-language': 'vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5',
-		'content-type': 'application/x-www-form-urlencoded',
-		'dnt': '1',
-		'origin': 'https://www.facebook.com',
-		'sec-ch-prefers-color-scheme': 'dark',
-		'sec-ch-ua': '"Chromium";v="117", "Not;A=Brand";v="8"',
-		'sec-ch-ua-full-version-list': '"Chromium";v="117.0.5938.157", "Not;A=Brand";v="8.0.0.0"',
-		'sec-ch-ua-mobile': '?0',
-		'sec-ch-ua-model': '""',
-		'sec-ch-ua-platform': '"Windows"',
-		'sec-ch-ua-platform-version': '"15.0.0"',
-		'sec-fetch-dest': 'empty',
-		'sec-fetch-mode': 'cors',
-		'sec-fetch-site': 'same-origin',
-		'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-		'x-fb-friendly-name': 'useCometConsentPromptEndOfFlowBatchedMutation',
+        "authority": "www.facebook.com",
+        "accept": (
+            "text/html,"
+            "application/xhtml+xml,"
+            "application/xml;q=0.9,"
+            "image/avif,"
+            "image/webp,"
+            "image/apng,"
+            "*/*;q=0.8"
+        ),
+        "accept-language": (
+            "vi-VN,vi;q=0.9,"
+            "en-US;q=0.8,en;q=0.7"
+        ),
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "upgrade-insecure-requests": "1",
+        "user-agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/139.0.0.0 "
+            "Safari/537.36"
+        ),
+        "cookie":"datr=kBSQagu2vLmwP2jexyT0uHtW; sb=kBSQapS4UqLmzWJJtXC_k1dx; c_user=100002959316322; xs=29%3AX1yEyaQgOaKRAg%3A2%3A1787827364%3A-1%3A-1; locale=vi_VN; pas=100002959316322%3Ae7FBRGtMsm; ps_l=1; ps_n=1; dpr=3.57320237159729; fr=0lqbnePWkQLCp6f81.AWfWp03Uzs72uld9j3sZzF7PzIi-ma7Gt4Tc7eLY4Om8WZIidzw.BqkBSQ..AAA.0.0.BqkDG2.AWcULxq0Ew5nweXnN4Sz0d-Q2wY; vpd=v1%3B719x375x3.57320237159729; wd=891x1709; fbl_st=101617748%3BT%3A29797917; wl_cbv=v2%3Bclient_version%3A3262%3Btimestamp%3A1787875034; presence=C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1787875037664%2C%22v%22%3A1%7D; pas=100002959316322%3Ae7FBRGtMsm; datr=kBSQagu2vLmwP2jexyT0uHtW; fr=0P7hvDHaFQeFJWbyE..Bqlsik...1.0.Bqlsik.AWcLbzWehETSnfkeBBGb9h9HLHs; wd=891x1709; dpr=3.57320237159729; fbl_st=100436135%3BT%3A29815200; vpd=v1%3B719x375x3.25; wl_cbv=v2%3Bclient_version%3A3276%3Btimestamp%3A1788912010; useragent=TW96aWxsYS81LjAgKExpbnV4OyBBbmRyb2lkIDEwOyBLKSBBcHBsZVdlYktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBDaHJvbWUvMTM5LjAuMC4wIE1vYmlsZSBTYWZhcmkvNTM3LjM2; _uafec=Mozilla%2F5.0%20(Linux%3B%20Android%2010%3B%20K)%20AppleWebKit%2F537.36%20(KHTML%2C%20like%20Gecko)%20Chrome%2F139.0.0.0%20Mobile%20Safari%2F537.36; "
     }
     if referer:
         headers["Referer"] = referer

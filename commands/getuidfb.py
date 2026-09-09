@@ -156,6 +156,39 @@ USER_AGENTS = [
         "Chrome/140.0.0.0 Safari/537.36"
     ),
 ]
+FACEBOOK_LOGIN_PATHS = {
+    "/login.php",
+    "/login/",
+    "/login",
+    "/checkpoint/",
+    "/checkpoint",
+    "/recover/",
+    "/recover",
+}
+def is_facebook_auth_wall(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower().rstrip("/")
+
+        if host not in {
+            "facebook.com",
+            "www.facebook.com",
+            "m.facebook.com",
+            "mbasic.facebook.com",
+        }:
+            return False
+
+        if path in FACEBOOK_LOGIN_PATHS:
+            return True
+
+        if "login" in path and path.endswith(".php"):
+            return True
+
+        return False
+
+    except Exception:
+        return False
 def make_headers(
     *,
     mobile: bool = False,
@@ -2372,7 +2405,9 @@ UID_STRONG_KEYS = {
     "uid", "user_id", "userid", "user_uid", "useruid", "profile_id", "profileid",
     "profile_uid", "profileuid", "profile_owner_id", "profileownerid",
     "profile_owner_uid", "profileowneruid", "profile.uid", "profile.id",
-    "profile_owner.id", "profile_owner.uid",
+    "profile_owner.id", "profile_owner.uid", "user.id", "person.id",
+    "id@username_route", "id@user", "profile.php?id",
+    "data-user-id", "data-profile-id", "data-profile-uid",
 }
 UID_PUBLISHER_KEYS = {
     "publisher_id", "publisherid", "publisher.id", "author_id", "authorid",
@@ -2746,7 +2781,11 @@ def scan_html_forensic_identity(
 
     # 5) username/profile URL + UID within a tight neighborhood. This is a
     # correlation signal rather than proof by itself.
-    usernames = set()
+    usernames = set(
+        clean_text(e.value).lstrip("@").strip()
+        for e in collector.by_role("USERNAME")
+        if e.value
+    )
     for m in re.finditer(
         r'(?:["\'](?:username|profile_name|profile_username)["\']|(?:username|profile_name|profile_username))'
         r'\s*[:=]\s*["\']([^"\'<>]{1,120})["\']',
@@ -2782,6 +2821,48 @@ def scan_html_forensic_identity(
                         neighbor=clean_text(window),
                         entity_type="USER",
                     )
+
+    # 6) Route username + nearby generic id. Public profile payloads often
+    # serialize the profile identifier as a generic `id` instead of user_id.
+    generic_id = re.compile(
+        r'(?:["\']id["\']|(?<![A-Za-z0-9_$])id(?![A-Za-z0-9_$]))'
+        r'\s*[:=]\s*["\']?(\d{5,30})["\']?',
+        re.I,
+    )
+    for username in list(usernames)[:40]:
+        if not username or len(username) < 2:
+            continue
+        for um in re.finditer(re.escape(username), html, re.I):
+            a = max(0, um.start() - 1400)
+            b = min(len(html), um.end() + 1400)
+            window = html[a:b]
+            low = window.lower()
+            if not any(marker in low for marker in (
+                "profile", "username", "user", "person", "owner",
+                "publisher", "author", "actor", "fbid",
+            )):
+                continue
+            for im in generic_id.finditer(window):
+                value = im.group(1)
+                if not is_numeric_id(value):
+                    continue
+                local = window[max(0, im.start()-500):min(len(window), im.end()+700)]
+                local_low = local.lower()
+                if any(x in local_low for x in (
+                    "post_id", "story_fbid", "media_fbid", "video_id",
+                    "reel_id", "photo_id", "comment_id", "feedback_id",
+                    "reaction_id", "page_id", "group_id", "event_id",
+                )):
+                    continue
+                collector.add(
+                    value,
+                    role="USER_CANDIDATE",
+                    source="html:username_route_correlation",
+                    key="id@username_route",
+                    weight=128,
+                    neighbor=clean_text(local),
+                    entity_type="USER",
+                )
 
     # 6) Explicit USER typename/entity_type near a generic id. This catches
     # bootstrap payloads where the only numeric field is simply `id`.
@@ -3491,6 +3572,8 @@ def rank_user_candidates(
             "uid",
             "user_uid",
             "useruid",
+            "user.id",
+            "person.id",
             "profile_owner_uid",
             "profileowneruid",
         }:
@@ -4254,11 +4337,19 @@ class IdentityVerifier:
                     "profileid",
                     "profile.uid",
                     "profile.id",
+                    "user.id",
+                    "person.id",
                     "profile_uid",
                     "profileuid",
                     "profile_owner_id",
                     "profileownerid",
                     "uid",
+                    "id@username_route",
+                    "id@user",
+                    "profile.php?id",
+                    "data-user-id",
+                    "data-profile-id",
+                    "data-profile-uid",
                 }
             )
             has_publisher_field = bool(
@@ -4295,6 +4386,11 @@ class IdentityVerifier:
                 for e in evidence
                 if username
             )
+            if any(
+                normalize_key(e.key) == "id@username_route"
+                for e in evidence
+            ):
+                has_username_signal = True
             if not (
                 has_strong_user_field
                 or has_publisher_field
@@ -4327,6 +4423,8 @@ class IdentityVerifier:
                     "profileid",
                     "profile.uid",
                     "profile.id",
+                    "user.id",
+                    "person.id",
                     "publisher_id",
                     "publisherid",
                     "publisher.id",
@@ -4340,6 +4438,12 @@ class IdentityVerifier:
                     "fromid",
                     "from.id",
                     "id",
+                    "id@username_route",
+                    "id@user",
+                    "profile.php?id",
+                    "data-user-id",
+                    "data-profile-id",
+                    "data-profile-uid",
                 }
             )
             if not strong_identity:
@@ -4919,6 +5023,35 @@ class FacebookResolver:
                     source="profile_meta",
                     weight=90,
                 )
+        # Public-only fallback: try mobile/basic profile HTML when the normal
+        # profile representation yielded no USER candidate.
+        if (
+            shape.kind == "PROFILE"
+            and shape.username
+            and not collector.by_role("USER_CANDIDATE")
+        ):
+            seen_profile_urls = {x.url for x in profile_snapshots}
+            for host in ("m.facebook.com", "mbasic.facebook.com"):
+                if len(profile_snapshots) >= MAX_PROFILE_CHECKS:
+                    break
+                alt_url = (
+                    "https://" + host + "/"
+                    + quote(shape.username, safe="@.*-")
+                )
+                if alt_url in seen_profile_urls:
+                    continue
+                with self.profile_sem:
+                    aps = self.fetcher.fetch(
+                        alt_url,
+                        referer=url,
+                    )
+                profile_snapshots.append(aps)
+                seen_profile_urls.add(alt_url)
+                scan_meta(aps, collector)
+                scan_jsonld(aps, collector)
+                scan_scripts(aps, collector)
+                scan_html_forensic_identity(aps, collector)
+
         entity = (
             entity_classifier.classify(
                 shape,

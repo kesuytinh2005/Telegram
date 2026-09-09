@@ -3922,25 +3922,6 @@ class IdentityVerifier:
                 result.signals.append("/stories/<owner_id>/ → explicit USER owner UID")
                 return result
 
-        # Final hard-lock: if the original URL explicitly carries a Story
-        # owner ID, return that exact ID rather than a numeric candidate
-        # harvested from canonical/login/generic HTML.
-        if explicit_story_owner and is_numeric_id(explicit_story_owner):
-            contradictory = any(
-                e.value == explicit_story_owner
-                for e in collector.by_role("PAGE_ID")
-                + collector.by_role("GROUP_ID")
-                + collector.by_role("EVENT_ID")
-            )
-            if not contradictory:
-                result.uid = explicit_story_owner
-                result.verified = True
-                result.confidence = 100.0
-                result.sources = 1
-                if "/stories/<owner_id>/ → explicit USER owner UID" not in result.signals:
-                    result.signals.append("/stories/<owner_id>/ → exact input owner UID")
-                return result
-
         ranked = rank_user_candidates(
             collector,
             username=(
@@ -4635,31 +4616,6 @@ class FacebookResolver:
             snapshot,
             collector,
         )
-        # HARD IDENTITY LOCK for an explicit Story owner encoded in the
-        # original input URL.  Canonical/login pages may contain unrelated
-        # numeric IDs; those must never replace the owner from
-        # /stories/<owner_id>/.
-        if explicit_story_owner and is_numeric_id(explicit_story_owner):
-            shape.kind = "STORY"
-            shape.route_entity = "USER"
-            shape.numeric_path_id = explicit_story_owner
-            collector.add(
-                explicit_story_owner,
-                role="USER_CANDIDATE",
-                source="original_input_hard_lock",
-                key="story_owner_id",
-                neighbor="/stories/<owner_id>/ exact input route",
-                url=original_shape.original,
-                weight=1000.0,
-                independent=True,
-                entity_type="USER",
-            )
-            result.debug.setdefault("identity_lock", {}).update({
-                "uid": explicit_story_owner,
-                "source": "original_input_url",
-                "rule": "/stories/<owner_id>/",
-            })
-
         content_classifier = (
             ContentClassifier()
         )

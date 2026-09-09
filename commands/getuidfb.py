@@ -1,5 +1,5 @@
 """
-FACEBOOK FORENSIC RESOLVER V61
+FACEBOOK FORENSIC RESOLVER V60
 Telegram / Telethon module
 PUBLIC HTTP ONLY
 NO:
@@ -34,7 +34,6 @@ Không bao giờ đoán UID khi evidence không đủ.
 """
 from __future__ import annotations
 import asyncio
-import base64
 import html as html_lib
 import json
 import logging
@@ -42,7 +41,6 @@ import random
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import (
@@ -75,19 +73,15 @@ REQUEST_TIMEOUT = (5, 12)
 MAX_HTML_BYTES = 12 * 1024 * 1024
 MAX_INPUT_URLS = 8
 MAX_DISCOVERED_URLS = 100
-MAX_PROFILE_CHECKS = 6
-MAX_SHARE_PROBES = 4
-MAX_OBJECT_PROBES = 12
-MAX_PARALLEL_HTTP = 4
-MAX_OBJECT_DEPTH = 2
+MAX_PROFILE_CHECKS = 5
+MAX_SHARE_PROBES = 8
 MAX_JSON_DEPTH = 12
 MAX_STRING_SCAN = 500_000
 MAX_EVIDENCE_PER_SOURCE = 80
 MAX_SIGNALS = 5
-MAX_DEBUG_CANDIDATES = 30
 CONCURRENCY = 4
 CACHE_TTL = 120
-RETRY_COUNT = 1
+RETRY_COUNT = 2
 SESSION_TIMEOUT = 900
 FACEBOOK_HOSTS = {
     "facebook.com",
@@ -261,28 +255,6 @@ def is_content_id(value: Any) -> bool:
         is_numeric_id(value)
         or is_opaque_content_id(value)
     )
-def decode_facebook_story_token(value: str) -> List[str]:
-    """Extract safe numeric identifiers from a Facebook story token.
-
-    This is not UID guessing: it only decodes an explicitly supplied story
-    token and returns numeric values actually encoded in it.
-    """
-    out: List[str] = []
-    value = unquote(clean_text(value))
-    candidates = [value]
-    try:
-        padded = value + ("=" * (-len(value) % 4))
-        raw = base64.b64decode(padded, validate=False).decode("utf-8", "ignore")
-        candidates.extend([raw, unquote(raw)])
-    except Exception:
-        pass
-    for text in candidates:
-        for n in re.findall(r"(?<!\d)(\d{10,30})(?!\d)", text):
-            if n not in out:
-                out.append(n)
-    return out
-
-
 def unique_keep_order(
     items: Iterable[str],
 ) -> List[str]:
@@ -775,33 +747,13 @@ class URLParser:
             "story.php" in p.path.lower()
             or "stories" in lower
         ):
-            # Facebook story URLs can carry TWO important identifiers:
-            #   /stories/<owner_numeric_id>/<opaque_story_token>/
-            # The first numeric segment is the public owner/profile UID
-            # candidate; the second segment may be a base64-ish story object
-            # token.  Do not throw either away.
-            idx = lower.index("stories") if "stories" in lower else -1
-            if idx >= 0 and idx + 1 < len(segments):
-                owner_candidate = segments[idx + 1]
-                if is_numeric_id(owner_candidate):
-                    shape.numeric_path_id = owner_candidate
-                    shape.route_entity = "USER"
-                    shape.route_confidence = max(shape.route_confidence, 97)
-                if idx + 2 < len(segments):
-                    story_token = segments[idx + 2]
-                    if is_content_id(story_token):
-                        shape.story_id = story_token
-                    else:
-                        # Preserve opaque story tokens such as
-                        # UzpfSVNDOjEwODI2OTkxNDA5MzYwNjI= for PASS 2.
-                        shape.opaque_token = story_token
             for key in (
                 "story_fbid",
                 "fbid",
             ):
                 if key in shape.query:
                     candidate = shape.query[key][0]
-                    if is_content_id(candidate):
+                    if is_numeric_id(candidate):
                         shape.story_id = candidate
                         break
             shape.kind = "STORY"
@@ -1077,28 +1029,6 @@ class PageSnapshot:
 class HTTPFetcher:
     def __init__(self):
         self.local = threading.local()
-        self._cache = {}
-        self._cache_lock = threading.Lock()
-        self.cache_ttl = 45.0
-
-    def _cached(self, url: str):
-        now = time.time()
-        with self._cache_lock:
-            item = self._cache.get(url)
-            if not item:
-                return None
-            ts, snap = item
-            if now - ts > self.cache_ttl:
-                self._cache.pop(url, None)
-                return None
-            return snap
-
-    def _store_cache(self, url: str, snap: PageSnapshot):
-        with self._cache_lock:
-            self._cache[url] = (time.time(), snap)
-            if len(self._cache) > 256:
-                oldest = min(self._cache, key=lambda k: self._cache[k][0])
-                self._cache.pop(oldest, None)
     def session(self) -> requests.Session:
         session = getattr(
             self.local,
@@ -1116,9 +1046,6 @@ class HTTPFetcher:
         *,
         referer: Optional[str] = None,
     ) -> PageSnapshot:
-        cached = self._cached(url)
-        if cached is not None:
-            return cached
         snapshot = PageSnapshot(
             url=url,
             final_url=url,
@@ -1186,9 +1113,7 @@ class HTTPFetcher:
                         errors="ignore",
                     )
                     snapshot.ok = response.ok
-                    self._store_cache(url, snapshot)
-                    self._store_cache(url, snapshot)
-                return snapshot
+                    return snapshot
                 data = bytearray()
                 for chunk in response.iter_content(
                     chunk_size=64 * 1024
@@ -1250,7 +1175,6 @@ class HTTPFetcher:
                         )
                     )
                     continue
-                self._store_cache(url, snapshot)
                 return snapshot
             except (
                 requests.RequestException,
@@ -1278,26 +1202,6 @@ class HTTPFetcher:
         )
         snapshot.limited = True
         return snapshot
-    def fetch_many(self, urls: List[str], *, referer: Optional[str] = None,
-                   max_workers: int = MAX_PARALLEL_HTTP) -> List[PageSnapshot]:
-        urls = unique_keep_order([u for u in urls if u])
-        if not urls:
-            return []
-        results: Dict[str, PageSnapshot] = {}
-        workers = min(max_workers, len(urls))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(self.fetch, u, referer=referer): u
-                for u in urls
-            }
-            for fut in as_completed(futures):
-                u = futures[fut]
-                try:
-                    results[u] = fut.result()
-                except Exception:
-                    LOGGER.debug("parallel fetch failed: %s", u, exc_info=True)
-        return [results[u] for u in urls if u in results]
-
 def safe_json_loads(
     value: str,
 ) -> Any:
@@ -3002,9 +2906,7 @@ class EntityClassifier:
         if (
             shape.kind
             in EntityClassifier.CONTENT_KINDS
-            and (shape.username or (shape.kind == "STORY" and shape.numeric_path_id))
-            and shape.route_entity != "PAGE"
-            and shape.route_entity != "GROUP"
+            and shape.username
         ):
             return "USER"
         return "UNKNOWN"
@@ -3891,37 +3793,13 @@ class IdentityVerifier:
                 "ALBUM",
             }
             and not shape.username
-            and not (shape.kind == "STORY" and shape.numeric_path_id and shape.route_entity == "USER")
         ):
             result.reason = (
-                "Content URL không có publisher username "
-                "hoặc explicit story owner để correlation."
+                "Content URL không có "
+                "publisher username "
+                "để correlation."
             )
             return result
-        # Explicit /stories/<owner_id>/<token> route: the owner ID is a
-        # first-class public identity signal. Only use it when the route is
-        # classified as USER and no page/group veto exists.
-        if (
-            shape.kind == "STORY"
-            and shape.route_entity == "USER"
-            and is_numeric_id(shape.numeric_path_id)
-        ):
-            # IDs from a generic Facebook landing page are not allowed to
-            # veto an explicit /stories/<owner_id>/ route. Only a direct
-            # contradictory page/group route should do so; incidental IDs
-            # from login/terms/bootstrap HTML are unrelated evidence.
-            direct_veto = any(
-                e.value == shape.numeric_path_id
-                for e in collector.by_role("PAGE_ID") + collector.by_role("GROUP_ID")
-            )
-            if not direct_veto:
-                result.uid = shape.numeric_path_id
-                result.verified = True
-                result.confidence = 99.0
-                result.sources = 1
-                result.signals.append("/stories/<owner_id>/ → explicit USER owner UID")
-                return result
-
         ranked = rank_user_candidates(
             collector,
             username=(
@@ -4178,7 +4056,6 @@ class ResolveResult:
     status: str = "NOT_VERIFIED"
     elapsed: float = 0.0
     http_status: int = 0
-    debug: Dict[str, Any] = field(default_factory=dict)
 class ResultCache:
     def __init__(
         self,
@@ -4309,20 +4186,7 @@ class FacebookResolver:
             result.notes.append("Facebook authentication/system endpoint; không phải profile công khai.")
             return result
         original_shape = URLParser.parse(url)
-        # Preserve identity that is literally encoded in the INPUT route.
-        # A later canonical/login landing page must never overwrite it with
-        # an unrelated ID found on Facebook's generic page.
-        explicit_story_owner = ""
-        if original_shape.kind == "STORY" and original_shape.original:
-            m_owner = re.search(r"/stories/(\d{10,30})/", original_shape.original, re.I)
-            if m_owner:
-                explicit_story_owner = m_owner.group(1)
         share_target_snapshot = None
-        # Keep every public response from PASS 1 available to mandatory PASS 2.
-        # This is critical for /share/<token>: the useful object identifier can
-        # appear in a redirect/canonical/embedded representation of a probe,
-        # not necessarily in the final generic landing page.
-        share_snapshots: List[PageSnapshot] = []
         if original_shape.wrapper:
             # /share/<opaque-token> is not itself an identity.  Resolve it
             # only through ordinary public HTTP redirects/metadata.  Probe
@@ -4354,14 +4218,21 @@ class FacebookResolver:
             probe_urls = unique_keep_order(probe_urls)[:MAX_SHARE_PROBES]
 
             snapshots = [(url, snapshot)]
-            extra_probe_urls = [u for u in probe_urls if u != url]
-            for ps in self.fetcher.fetch_many(
-                extra_probe_urls,
-                referer=url,
-                max_workers=MAX_PARALLEL_HTTP,
-            ):
-                snapshots.append((ps.url, ps))
-            share_snapshots = [ps for _, ps in snapshots]
+            for probe_url in probe_urls:
+                if probe_url == url:
+                    continue
+                try:
+                    ps = self.fetcher.fetch(
+                        probe_url,
+                        referer=url,
+                    )
+                    snapshots.append((probe_url, ps))
+                except Exception:
+                    LOGGER.debug(
+                        "share probe failed: %s",
+                        probe_url,
+                        exc_info=True,
+                    )
 
             def public_target_from_snapshot(ps):
                 candidates = []
@@ -4502,23 +4373,19 @@ class FacebookResolver:
                 )
 
             if shape.kind == "SHARE_WRAPPER":
-                # PASS 1 failed to resolve the wrapper. Do NOT return yet:
-                # fixed6 always enters PASS 2 and looks for an explicit object
-                # identifier exposed by the responses themselves.
-                result.notes.append(
-                    "PASS 1: share wrapper chưa resolve được canonical target; chuyển bắt buộc sang PASS 2."
+                result.status = (
+                    "FETCH_LIMITED"
+                    if any(
+                        ps.limited or ps.error
+                        for _, ps in snapshots
+                    )
+                    else "NOT_VERIFIED"
                 )
-                # Keep the best observed snapshot for evidence scanning, but
-                # never treat generic landing-page links as the target.
-                best_snapshot = max(
-                    snapshots,
-                    key=lambda pair: (
-                        0 if pair[1].limited or pair[1].error else 1,
-                        len(pair[1].html or ""),
-                    ),
-                )[1]
-                snapshot = best_snapshot
-                result.http_status = snapshot.status
+                result.notes.append(
+                    "Share token không expose public canonical content "
+                    "trong các response HTTP công khai; không suy diễn UID."
+                )
+                return result
         else:
             shape = final_shape
         canonical = (
@@ -4562,13 +4429,10 @@ class FacebookResolver:
         ):
             shape = canonical_shape
         # Preserve exact content identity from the original URL when a
-        # redirect/og:url loses the more specific route. For STORY routes,
-        # the owner segment is authoritative route evidence: a generic
-        # login/terms page must not replace it with an unrelated numeric ID.
+        # redirect/og:url loses the more specific route.
         for attr in (
             "post_id", "reel_id", "video_id",
             "photo_id", "story_id", "album_id",
-            "numeric_path_id", "opaque_token", "username",
         ):
             original_value = getattr(original_shape, attr, "")
             if original_value and not getattr(shape, attr, ""):
@@ -4576,20 +4440,6 @@ class FacebookResolver:
                 if shape.kind == "UNKNOWN":
                     shape.kind = original_shape.kind
                     shape.route_entity = original_shape.route_entity
-        if explicit_story_owner:
-            shape.kind = "STORY"
-            shape.numeric_path_id = explicit_story_owner
-            shape.route_entity = "USER"
-            shape.route_confidence = max(shape.route_confidence, 99.0)
-            # If canonical resolved to auth/generic content, retain the actual
-            # input story URL as the content link instead of /login.php.
-            parsed_canonical = URLParser.parse(result.canonical_url or "")
-            if parsed_canonical.kind in {"UNKNOWN", "HOME", "SHARE_WRAPPER"} or any(
-                x.lower() in {"login.php", "login", "checkpoint", "recover", "registration", "reg"}
-                for x in parsed_canonical.segments
-            ):
-                result.canonical_url = original_shape.original
-                result.content_url = original_shape.original
         collector = EvidenceCollector()
         scan_url_evidence(
             shape,
@@ -4626,18 +4476,6 @@ class FacebookResolver:
                 snapshot,
             )
         )
-        # Never infer STORY/VIDEO/etc. from incidental links on a generic
-        # /share/<token> landing page. Only a resolved target or PASS-2 object
-        # evidence may establish the content type.
-        if original_shape.wrapper and shape.kind == "SHARE_WRAPPER":
-            content = ContentClassification()
-        # A bare /share/<token> has no content-type evidence merely because
-        # the generic Facebook landing page contains links/text mentioning
-        # stories, terms, videos, etc.  Do not leak that generic route into
-        # the final result.  Once PASS 2 resolves a real object, shape will be
-        # upgraded and the later reclassification below can describe it.
-        if original_shape.wrapper and shape.kind == "SHARE_WRAPPER":
-            content = ContentClassification()
         entity_classifier = (
             EntityClassifier()
         )
@@ -4663,435 +4501,61 @@ class FacebookResolver:
             )
         )
         profile_snapshots = []
-        initial_profile_urls = profile_urls[:MAX_PROFILE_CHECKS]
-        # Fetch independent profile candidates concurrently.  This reduces
-        # wall-clock latency without increasing the number of candidates.
-        for ps in self.fetcher.fetch_many(
-            initial_profile_urls,
-            referer=result.content_url,
-            max_workers=MAX_PARALLEL_HTTP,
-        ):
+        for profile_url in profile_urls[
+            :MAX_PROFILE_CHECKS
+        ]:
+            if (
+                profile_url
+                == result.content_url
+            ):
+                profile_snapshots.append(
+                    snapshot
+                )
+                continue
+            with self.profile_sem:
+                ps = self.fetcher.fetch(
+                    profile_url,
+                    referer=result.content_url,
+                )
             profile_snapshots.append(ps)
-            scan_meta(ps, collector)
-            scan_jsonld(ps, collector)
-            scan_scripts(ps, collector)
-            scan_html_identity(ps, collector)
-            scan_html_profile_links(ps, collector)
-
-        # ------------------------------------------------------------------
-        # PASS 2 (MANDATORY): OBJECT-ID -> PUBLIC AUTHOR/PROFILE CORRELATION
-        # ------------------------------------------------------------------
-        # fixed6 deliberately executes this phase after every unsuccessful
-        # first-pass resolution. It may have no usable object ID (e.g. a bare
-        # opaque share token); in that case it records why it cannot continue.
-        phase2_snapshots: List[PageSnapshot] = []
-        pass2_ids: List[Tuple[str, str, str]] = []
-
-        def add_pass2_id(kind: str, ident: str, source: str):
-            ident = clean_text(ident)
-            if not is_content_id(ident):
-                return
-            key = (kind, ident, source)
-            if key not in pass2_ids:
-                pass2_ids.append(key)
-
-        # IMPORTANT: PASS 2 also inspects the ORIGINAL INPUT URL.
-        # A share permalink can be accompanied by a resolved /stories/... URL
-        # containing the owner UID and an opaque story token.  The original
-        # URL is stronger evidence than generic landing-page HTML.
-        original_input_urls = [original_shape.original, url]
-        for original_input_url in original_input_urls:
-            try:
-                os = URLParser.parse(original_input_url)
-            except Exception:
-                continue
-            if os.numeric_path_id and os.route_entity == "USER":
-                add_pass2_id("author", os.numeric_path_id, "original_story_owner")
-            if os.story_id:
-                add_pass2_id("story", os.story_id, "original_url_story_id")
-            if os.opaque_token:
-                for decoded_id in decode_facebook_story_token(os.opaque_token):
-                    add_pass2_id("story", decoded_id, "decoded_story_token")
-                result.debug.setdefault("pass2", {}).setdefault("opaque_tokens", []).append(
-                    truncate(os.opaque_token, 120)
-                )
-
-        # PASS 2 also follows an explicitly supplied share_url query parameter.
-        # Facebook story/shared URLs commonly contain:
-        #   share_url=https://www.facebook.com/share/<token>/
-        # This is a user-provided/public URL reference, not an auth bypass.
-        def harvest_nested_public_urls(seed_url: str):
-            seen_local = set()
-            queue = [seed_url]
-            while queue and len(seen_local) < 12:
-                current = queue.pop(0)
-                if not current or current in seen_local:
-                    continue
-                seen_local.add(current)
-                try:
-                    parsed_current = urlparse(current)
-                    qs = parse_qs(parsed_current.query, keep_blank_values=True)
-                except Exception:
-                    continue
-                for key in ("share_url", "url", "target", "redirect_uri"):
-                    for value in qs.get(key, []):
-                        value = unquote(value)
-                        if is_facebook_host(urlparse(value).netloc):
-                            try:
-                                nested_shape = URLParser.parse(value)
-                            except Exception:
-                                continue
-                            if nested_shape.story_id:
-                                add_pass2_id("story", nested_shape.story_id, "nested_share_url")
-                            if nested_shape.post_id:
-                                add_pass2_id("post", nested_shape.post_id, "nested_share_url")
-                            if nested_shape.reel_id:
-                                add_pass2_id("reel", nested_shape.reel_id, "nested_share_url")
-                            if nested_shape.video_id:
-                                add_pass2_id("video", nested_shape.video_id, "nested_share_url")
-                            if nested_shape.photo_id:
-                                add_pass2_id("photo", nested_shape.photo_id, "nested_share_url")
-                            if nested_shape.album_id:
-                                add_pass2_id("album", nested_shape.album_id, "nested_share_url")
-                            if nested_shape.numeric_path_id and nested_shape.route_entity == "USER":
-                                add_pass2_id("author", nested_shape.numeric_path_id, "nested_story_owner")
-                            queue.append(value)
-                # The current URL itself may be a story route.
-                try:
-                    cs = URLParser.parse(current)
-                    if cs.numeric_path_id and cs.route_entity == "USER":
-                        add_pass2_id("author", cs.numeric_path_id, "story_owner_route")
-                    if cs.story_id:
-                        add_pass2_id("story", cs.story_id, "story_route")
-                    if cs.opaque_token:
-                        for decoded_id in decode_facebook_story_token(cs.opaque_token):
-                            add_pass2_id("story", decoded_id, "nested_decoded_story_token")
-                except Exception:
-                    pass
-
-        harvest_nested_public_urls(url)
-
-        # The caller may have supplied a canonical/forwarded URL in the query.
-        # Inspect the original raw URL too, before normalize_facebook_url strips
-        # tracking parameters such as share_url.
-        harvest_nested_public_urls(original_shape.original)
-
-        # Explicit story-owner evidence: /stories/<numeric-owner>/<story-token>/
-        # carries a public owner identifier in the route. Treat it as USER
-        # identity evidence, while still allowing later page/group evidence to
-        # veto it.
-        story_owner = getattr(original_shape, "numeric_path_id", "")
-        # URL-level fallback: /stories/<numeric-owner>/<opaque-token>/ is an
-        # explicit owner route even when URLParser cannot classify route_entity
-        # because Facebook changed the route grammar. Never depend on the
-        # classifier to recover an ID that is literally present in the URL.
-        if not story_owner and original_shape.original:
-            _m = re.search(r"/stories/(\d{10,30})/", original_shape.original, re.I)
-            if _m:
-                story_owner = _m.group(1)
-                result.debug.setdefault("pass2", {})["explicit_story_owner_regex"] = story_owner
-        if story_owner and is_numeric_id(story_owner):
-            collector.add(
-                story_owner,
-                role="USER_CANDIDATE",
-                source="original_story_owner_route",
-                key="profile_owner_id",
-                neighbor="/stories/<owner_id>/<story_id>",
-                url=original_shape.original,
-                weight=220.0,
-                independent=True,
-                entity_type="USER",
-            )
-            result.debug.setdefault("pass2", {})["explicit_story_owner"] = story_owner
-
-        # PASS 2 ID harvesting is deliberately broader than PASS 1, but still
-        # evidence-based.  For a share wrapper, inspect every response's
-        # redirect/canonical URL and explicit opaque content IDs such as pfbid.
-        # Do NOT mine arbitrary numeric strings from generic landing HTML.
-        pass2_source_snapshots = [snapshot] + share_snapshots + phase2_snapshots
-        pass2_source_snapshots = [
-            ps for ps in pass2_source_snapshots if ps is not None
-        ]
-
-        def harvest_explicit_object_ids(ps: PageSnapshot):
-            urls = list(ps.redirect_chain)
-            for key in ("og:url", "profile:url", "canonical"):
-                value = ps.meta.get(key, "")
-                if value:
-                    urls.append(value)
-            for candidate_url in urls:
-                if not candidate_url or not looks_like_url(candidate_url):
-                    continue
-                if not is_facebook_host(urlparse(candidate_url).netloc):
-                    continue
-                cs = URLParser.parse(candidate_url)
-                for kind, attr in (
-                    ("post", "post_id"), ("story", "story_id"),
-                    ("reel", "reel_id"), ("video", "video_id"),
-                    ("photo", "photo_id"), ("album", "album_id"),
-                ):
-                    value = getattr(cs, attr, "")
-                    if value:
-                        add_pass2_id(kind, value, "redirect_or_canonical")
-            # Opaque IDs are useful precisely because they are not numeric.
-            # Restrict this extraction to Facebook's recognizable pfbid form;
-            # arbitrary alphanumeric tokens in a landing page are not objects.
-            for ident in re.findall(
-                r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
-                ps.html or "",
-                re.I,
-            ):
-                add_pass2_id("post", ident, "explicit_pfbid_html")
-            for ident in re.findall(
-                r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
-                ps.text or "",
-                re.I,
-            ):
-                add_pass2_id("post", ident, "explicit_pfbid_text")
-
-        for ps in pass2_source_snapshots:
-            harvest_explicit_object_ids(ps)
-
-        # A share wrapper itself carries an opaque share token.  It is NOT a
-        # content ID and is never fed into the UID scorer as one.  We do,
-        # however, record the token in debug so the operator can distinguish
-        # "no object exposed" from "object exposed but author hidden".
-        if original_shape.wrapper and original_shape.opaque_token:
-            result.debug.setdefault("pass2", {})["share_token"] = original_shape.opaque_token
-
-        # PASS 2 harvesting: inspect ALL public PASS-1 responses. Redirect and
-        # canonical URLs are explicit object evidence; pfbid is the only
-        # alphanumeric object form harvested from HTML. Arbitrary numbers or
-        # random tokens in generic landing pages are never treated as objects.
-        pass2_source_snapshots = [snapshot] + share_snapshots + phase2_snapshots
-        pass2_source_snapshots = [ps for ps in pass2_source_snapshots if ps is not None]
-
-        def harvest_explicit_object_ids(ps: PageSnapshot):
-            explicit_urls = list(ps.redirect_chain)
-            for key in ("og:url", "profile:url", "canonical"):
-                value = ps.meta.get(key, "")
-                if value:
-                    explicit_urls.append(value)
-
-            for candidate_url in explicit_urls:
-                if not candidate_url or not is_facebook_host(urlparse(candidate_url).netloc):
-                    continue
-                cs = URLParser.parse(candidate_url)
-                for kind, attr in (
-                    ("post", "post_id"), ("story", "story_id"),
-                    ("reel", "reel_id"), ("video", "video_id"),
-                    ("photo", "photo_id"), ("album", "album_id"),
-                ):
-                    value = getattr(cs, attr, "")
-                    if value:
-                        add_pass2_id(kind, value, "redirect_or_canonical")
-
-            # pfbid is an explicit Facebook object identifier form. Unlike a
-            # random alphanumeric string, it is safe to feed into object probes.
-            for ident in re.findall(
-                r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
-                ps.html or "",
-                re.I,
-            ):
-                add_pass2_id("post", ident, "explicit_pfbid_html")
-
-            for ident in re.findall(
-                r"\bpfbid[A-Za-z0-9_-]{6,299}\b",
-                ps.text or "",
-                re.I,
-            ):
-                add_pass2_id("post", ident, "explicit_pfbid_text")
-
-        for ps in pass2_source_snapshots:
-            harvest_explicit_object_ids(ps)
-
-        if original_shape.wrapper and original_shape.opaque_token:
-            result.debug.setdefault("pass2", {})["share_token"] = original_shape.opaque_token
-
-        # Highest-confidence IDs: URL route first.
-        for kind, attr in (
-            ("post", "post_id"), ("story", "story_id"),
-            ("reel", "reel_id"), ("video", "video_id"),
-            ("photo", "photo_id"), ("album", "album_id"),
-        ):
-            value = getattr(shape, attr, "")
-            if value:
-                add_pass2_id(kind, value, "url_route")
-
-        # Then only object IDs actually classified by the evidence engine.
-        # Generic raw numeric strings are intentionally excluded.
-        for ev in collector.items:
-            if ev.role not in {"OBJECT_ID", "POST_ID", "STORY_ID", "VIDEO_ID", "REEL_ID", "PHOTO_ID", "ALBUM_ID"}:
-                continue
-            if not is_content_id(ev.value):
-                continue
-            key = normalize_key(ev.key)
-            if "story" in key:
-                kind = "story"
-            elif "reel" in key:
-                kind = "reel"
-            elif "video" in key:
-                kind = "video"
-            elif "photo" in key or "media" in key:
-                kind = "photo"
-            elif "album" in key:
-                kind = "album"
-            else:
-                kind = "post"
-            add_pass2_id(kind, ev.value, ev.source)
-
-        # Content IDs can be present in explicit canonical metadata. Parse the
-        # URL itself, but never mine arbitrary numbers from generic HTML.
-        explicit_urls = [
-            snapshot.final_url,
-            snapshot.meta.get("og:url", ""),
-            snapshot.meta.get("profile:url", ""),
-        ]
-        for candidate_url in explicit_urls:
-            if not candidate_url or not is_facebook_host(urlparse(candidate_url).netloc):
-                continue
-            cs = URLParser.parse(candidate_url)
-            for kind, attr in (
-                ("post", "post_id"), ("story", "story_id"),
-                ("reel", "reel_id"), ("video", "video_id"),
-                ("photo", "photo_id"), ("album", "album_id"),
-            ):
-                value = getattr(cs, attr, "")
-                if value:
-                    add_pass2_id(kind, value, "explicit_metadata_url")
-
-        if pass2_ids:
-            result.notes.append(
-                f"PASS 2: found {len(pass2_ids)} explicit content-ID candidate(s)."
-            )
-            for kind, ident, source in pass2_ids[:MAX_DEBUG_CANDIDATES]:
-                result.notes.append(
-                    f"PASS2 candidate: {kind}={truncate(ident, 80)} source={source}"
-                )
-
-            # Probe representations using the observed shape, plus a shape
-            # cloned from each explicit ID where appropriate.
-            probe_urls = self.build_object_probe_urls(
-                shape, result.content_url or snapshot.final_url or url
-            )
-            # Direct owner/profile probing for IDs explicitly present in
-            # /stories/<numeric-owner>/<story-token>/ URLs.
-            author_ids = [i for k, i, _ in pass2_ids if k == "author" and is_numeric_id(i)]
-            author_profile_urls = []
-            for author_id in unique_keep_order(author_ids):
-                author_profile_urls.extend((
-                    f"https://www.facebook.com/profile.php?id={author_id}",
-                    f"https://m.facebook.com/profile.php?id={author_id}",
-                ))
-            for ps in self.fetcher.fetch_many(
-                author_profile_urls[:MAX_PROFILE_CHECKS],
-                referer=result.content_url or url,
-                max_workers=MAX_PARALLEL_HTTP,
-            ):
-                phase2_snapshots.append(ps)
-                self.merge_snapshot_evidence(ps, collector)
-
-            for kind, ident, source in pass2_ids:
-                temp = URLShape(
-                    original=result.content_url or url,
-                    normalized=result.content_url or url,
-                    host="www.facebook.com",
-                    path="/",
-                    kind=kind.upper(),
-                    username=shape.username,
-                    route_entity=shape.route_entity,
-                )
-                setattr(temp, {
-                    "post":"post_id", "story":"story_id", "reel":"reel_id",
-                    "video":"video_id", "photo":"photo_id", "album":"album_id",
-                }[kind], ident)
-                probe_urls.extend(
-                    self.build_object_probe_urls(temp, result.content_url or url)
-                )
-            probe_urls = unique_keep_order(probe_urls)[:MAX_OBJECT_PROBES]
-
-            # Object representations are independent. Fetch them in parallel,
-            # then merge evidence in deterministic URL order.
-            for ps in self.fetcher.fetch_many(
-                probe_urls,
-                referer=result.content_url or url,
-                max_workers=MAX_PARALLEL_HTTP,
-            ):
-                phase2_snapshots.append(ps)
-                self.merge_snapshot_evidence(ps, collector)
-
-            # Re-run classification against ALL evidence, including pass2.
-            all_public_snapshots = profile_snapshots + phase2_snapshots
-            entity = entity_classifier.classify(
-                shape, collector, all_public_snapshots or [snapshot]
-            )
-            # Reclassify content only after PASS 2 object probes have supplied
-            # real object evidence.  This prevents generic share-landings from
-            # being labeled STORY/VIDEO merely from incidental links.
-            content = content_classifier.classify(
-                shape,
+            scan_meta(
+                ps,
                 collector,
-                phase2_snapshots[-1] if phase2_snapshots else snapshot,
             )
-            profile = extract_profile_info(
-                shape, snapshot, collector, entity
+            scan_jsonld(
+                ps,
+                collector,
             )
-
-            # Discover and fetch profiles from every useful pass2 snapshot.
-            discovered_profiles: List[str] = []
-            for ps in phase2_snapshots:
-                discovered_profiles.extend(
-                    self.extract_profile_urls(shape, ps, profile, entity)
+            scan_scripts(
+                ps,
+                collector,
+            )
+            scan_html_identity(
+                ps,
+                collector,
+            )
+            scan_html_profile_links(
+                ps,
+                collector,
+            )
+            profile_url_from_meta = (
+                ps.meta.get(
+                    "og:url",
+                    "",
                 )
-            discovered_profiles.extend(
-                self.extract_profile_urls(shape, snapshot, profile, entity)
             )
-            discovered_profiles = unique_keep_order(discovered_profiles)
-            existing = {
-                normalize_facebook_url(x.url) for x in profile_snapshots if x.url
-            }
-            discovered_to_fetch = [
-                profile_url for profile_url in discovered_profiles[:MAX_PROFILE_CHECKS]
-                if normalize_facebook_url(profile_url) not in existing
-            ]
-            for ps in self.fetcher.fetch_many(
-                discovered_to_fetch,
-                referer=result.content_url or url,
-                max_workers=MAX_PARALLEL_HTTP,
+            if (
+                profile_url_from_meta
+                and profile.username
+                and profile.username.lower()
+                in profile_url_from_meta.lower()
             ):
-                profile_snapshots.append(ps)
-                existing.add(normalize_facebook_url(ps.url))
-                self.merge_snapshot_evidence(ps, collector)
-
-            result.debug["pass2"] = {
-                "executed": True,
-                "content_id_candidates": [
-                    {"kind": k, "id": truncate(i, 120), "source": src}
-                    for k, i, src in pass2_ids[:MAX_DEBUG_CANDIDATES]
-                ],
-                "probe_urls": probe_urls[:MAX_DEBUG_CANDIDATES],
-                "probe_count": len(phase2_snapshots),
-                "profile_count": len(profile_snapshots),
-            }
-        else:
-            result.notes.append(
-                "PASS 2: executed nhưng không tìm thấy content ID công khai đủ tin cậy; không thể request object cụ thể."
-            )
-            result.debug["pass2"] = {
-                "executed": True,
-                "content_id_candidates": [],
-                "probe_urls": [],
-                "probe_count": 0,
-                "profile_count": len(profile_snapshots),
-                "source_snapshot_count": len(pass2_source_snapshots),
-                "reason": (
-                    "No explicit object ID in input route, nested share_url, "
-                    "redirect/canonical URLs, or recognizable pfbid evidence. "
-                    "Opaque share tokens are not treated as UID guesses."
-                ),
-            }
-
-        # Final reclassification and verification always use pass2 snapshots.
+                collector.add(
+                    profile_url_from_meta,
+                    role="PROFILE_CANONICAL",
+                    source="profile_meta",
+                    weight=90,
+                )
         entity = (
             entity_classifier.classify(
                 shape,
@@ -5103,41 +4567,12 @@ class FacebookResolver:
         profile.entity_type = (
             entity.publisher
         )
-        if explicit_story_owner:
-            result.debug.setdefault("identity_lock", {})["story_owner"] = explicit_story_owner
-            result.debug["identity_lock"]["source"] = "original_input_url:/stories/<owner_id>/"
-            result.debug["identity_lock"]["canonical_override"] = result.content_url == original_shape.original
-
-        # Final candidate audit: expose the strongest numeric USER evidence
-        # without treating arbitrary numbers from generic HTML as UID.
-        uid_audit = []
-        for ev in getattr(collector, "items", []):
-            if getattr(ev, "role", "") not in {"USER_CANDIDATE", "UID", "PROFILE_ID"}:
-                continue
-            value = clean_text(getattr(ev, "value", ""))
-            if not is_numeric_id(value):
-                continue
-            if value in {"0", "1"}:
-                continue
-            uid_audit.append({
-                "id": value,
-                "source": getattr(ev, "source", ""),
-                "role": getattr(ev, "role", ""),
-                "weight": getattr(ev, "weight", 0.0),
-                "independent": bool(getattr(ev, "independent", False)),
-            })
-        uid_audit.sort(
-            key=lambda x: (x["independent"], x["weight"]),
-            reverse=True,
-        )
-        result.debug["uid_audit"] = uid_audit[:MAX_DEBUG_CANDIDATES]
-
         verifier = IdentityVerifier()
         verification = (
             verifier.verify(
                 shape=shape,
                 snapshot=snapshot,
-                profile_snapshots=(profile_snapshots + phase2_snapshots),
+                profile_snapshots=profile_snapshots,
                 collector=collector,
                 classification=entity,
                 profile=profile,
@@ -5213,32 +4648,6 @@ class FacebookResolver:
         result.evidence_sources = (
             verification.sources
         )
-        # Candidate-chain debug: expose scoring/evidence provenance without
-        # exposing cookies, headers, tokens, or private data.
-        try:
-            ranked_debug = rank_user_candidates(
-                collector,
-                username=(profile.username or shape.username),
-                shape=shape,
-            )[:MAX_DEBUG_CANDIDATES]
-            result.debug["uid_candidates"] = [
-                {"uid": uid, "base_score": round(float(score), 2)}
-                for uid, score in ranked_debug
-            ]
-            result.debug.setdefault("candidate_chain", {})["story_owner_from_input"] = getattr(original_shape, "numeric_path_id", "")
-            result.debug.setdefault("candidate_chain", {})["nested_share_urls"] = [
-                v for v in original_shape.query.get("share_url", [])[:10]
-            ]
-            result.debug["pass1"] = {
-                "input": url,
-                "initial_kind": original_shape.kind,
-                "canonical": result.canonical_url,
-                "content": result.content_url,
-                "publisher": entity.publisher,
-                "verification_confidence": round(float(verification.confidence), 2),
-            }
-        except Exception:
-            LOGGER.debug("debug scoring failed", exc_info=True)
         result.signals = (
             unique_keep_order(
                 content.signals
@@ -5306,82 +4715,6 @@ class FacebookResolver:
                 result.name
             )
         return result
-    def build_object_probe_urls(self, shape: URLShape, base_url: str) -> List[str]:
-        """Build public HTTP representations from an already observed content ID.
-
-        This is a bounded second-pass resolver.  It never invents a UID from an
-        object ID; it simply asks Facebook's public HTML endpoints whether the
-        object exposes an author/profile identity.
-        """
-        host = "www.facebook.com"
-        username = clean_text(shape.username).lstrip("@")
-        urls: List[str] = []
-        def add(u: str):
-            if u and is_facebook_host(urlparse(u).netloc):
-                urls.append(normalize_facebook_url(u))
-
-        ids = []
-        if shape.post_id: ids.append(("post", shape.post_id))
-        if shape.story_id: ids.append(("story", shape.story_id))
-        if shape.reel_id: ids.append(("reel", shape.reel_id))
-        if shape.video_id: ids.append(("video", shape.video_id))
-        if shape.photo_id: ids.append(("photo", shape.photo_id))
-        if shape.album_id: ids.append(("album", shape.album_id))
-
-        for kind, ident in ids:
-            ident = clean_text(ident)
-            if not is_content_id(ident):
-                continue
-            if kind == "post":
-                if username:
-                    add(f"https://{host}/{quote(username, safe='@.*-')}/posts/{quote(ident, safe='')}")
-                add(f"https://{host}/{quote(ident, safe='')}")
-                add(f"https://{host}/permalink.php?story_fbid={quote(ident, safe='')}")
-            elif kind == "story":
-                add(f"https://{host}/story.php?story_fbid={quote(ident, safe='')}")
-                if username:
-                    add(f"https://{host}/{quote(username, safe='@.*-')}/posts/{quote(ident, safe='')}")
-            elif kind == "reel":
-                add(f"https://{host}/reel/{quote(ident, safe='')}")
-                add(f"https://{host}/{quote(ident, safe='')}")
-            elif kind == "video":
-                add(f"https://{host}/watch/?v={quote(ident, safe='')}")
-                add(f"https://{host}/videos/{quote(ident, safe='')}")
-                add(f"https://{host}/{quote(ident, safe='')}")
-            elif kind == "photo":
-                add(f"https://{host}/photo/?fbid={quote(ident, safe='')}")
-                add(f"https://{host}/{quote(ident, safe='')}")
-            elif kind == "album":
-                add(f"https://{host}/media/set/?set={quote(ident, safe='')}")
-                add(f"https://{host}/{quote(ident, safe='')}")
-
-        # A bare numeric/opaque object identifier can sometimes resolve to a
-        # public object/profile page.  It is deliberately fetched as an object,
-        # never interpreted as a USER UID without explicit user evidence.
-        for ident in extract_content_identifiers(base_url):
-            if is_content_id(ident):
-                add(f"https://{host}/{quote(ident, safe='')}")
-        # Repeat the same object representations on mobile/public hosts.
-        # This is still ordinary public HTTP and gives Facebook different
-        # rendering paths that may expose metadata absent from www.
-        base_urls = list(urls)
-        for u in base_urls:
-            pu = urlparse(u)
-            if pu.netloc == "www.facebook.com":
-                for host2 in ("m.facebook.com", "mbasic.facebook.com"):
-                    urls.append(urlunparse((
-                        pu.scheme, host2, pu.path, pu.params, pu.query, pu.fragment
-                    )))
-        return unique_keep_order(urls)[:MAX_OBJECT_PROBES]
-
-    @staticmethod
-    def merge_snapshot_evidence(snapshot: PageSnapshot, collector: EvidenceCollector):
-        scan_meta(snapshot, collector)
-        scan_jsonld(snapshot, collector)
-        scan_scripts(snapshot, collector)
-        scan_html_identity(snapshot, collector)
-        scan_html_profile_links(snapshot, collector)
-
     def extract_profile_urls(
         self,
         shape: URLShape,
@@ -6354,7 +5687,6 @@ if __name__ == "__main__":
         "https://www.facebook.com/groups/123456789/posts/987654321/",
         "https://www.facebook.com/share/r/1H1EjsEW7J/",
         "https://www.facebook.com/profile.php?id=61553239356646",
-        "https://www.facebook.com/stories/101540198959382/UzpfSVNDOjEyODMwNjUyODcxNzg5MjI=/"
     ]
     for test in tests:
         shape = URLParser.parse(

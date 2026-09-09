@@ -1632,11 +1632,17 @@ class JSONEvidenceScanner:
             # object. Accept it only when the same object has a username/profile
             # identity signal, and let page/group/event semantics block it.
             generic_id = local_strings.get("id", "")
+            declared_type = clean_text(
+                local_strings.get("__typename", "")
+                or local_strings.get("entity_type", "")
+                or local_strings.get("type", "")
+            ).lower()
             if (
                 is_numeric_id(generic_id)
                 and not local_entity
                 and (
-                    local_strings.get("username")
+                    declared_type in {"user", "person"}
+                    or local_strings.get("username")
                     or local_strings.get("profile_url")
                     or local_strings.get("profile_uri")
                 )
@@ -1917,6 +1923,7 @@ def scan_scripts(
     ):
         if not script:
             continue
+        script = _normalize_embedded_text(script)
         source = f"script:{index}"
         identity_patterns = {
             # Strong direct USER identity fields.
@@ -1980,6 +1987,8 @@ def scan_scripts(
             "legacyID": 92,
         }
         for key, weight in identity_patterns.items():
+            if _uid_negative_key(key):
+                continue
             escaped = re.escape(key)
             # Accept JSON, JS object literals and GraphQL-like key/value
             # forms.  The key itself is semantic, so this is much safer than
@@ -2173,6 +2182,28 @@ def scan_scripts(
                 weight=115,
                 neighbor=context,
             )
+        # Generic id is accepted only when the surrounding object explicitly
+        # declares itself as a USER. This catches __typename/type/entity_type
+        # payloads while preventing arbitrary content IDs from becoming UIDs.
+        user_typed = re.compile(
+            r"\{[^{}]{0,6000}?(?:__typename|entity_type|entityType|type)\s*[:=]\s*[\"\']?(?:User|USER)[\"\']?"
+            r"[^{}]{0,6000}?(?:[\"\']id[\"\']|(?<![A-Za-z0-9_$])id(?![A-Za-z0-9_$]))"
+            r"\s*[:=]\s*[\"\']?(\d{5,30})[\"\']?[^{}]{0,6000}\}",
+            re.I | re.S,
+        )
+        for match in user_typed.finditer(script):
+            value = match.group(1)
+            if not is_numeric_id(value):
+                continue
+            context = clean_text(match.group(0))
+            low = context.lower()
+            if any(x in low for x in ("post_id", "comment_id", "group_id", "page_id", "event_id")):
+                continue
+            collector.add(
+                value, role="USER_CANDIDATE", source=source, key="id",
+                weight=132, neighbor=context[:2200], entity_type="USER",
+            )
+
         semantic_objects = (
             "user",
             "profile",
@@ -2272,7 +2303,7 @@ def scan_html_profile_links(
     numeric UID after the profile URL itself is fetched and the profile
     response exposes a matching numeric identity.
     """
-    html = snapshot.html or ""
+    html = _normalize_embedded_text(snapshot.html or "")
     if not html:
         return
 
@@ -2304,6 +2335,36 @@ def scan_html_profile_links(
                 key="profile_url",
                 weight=78,
             )
+
+UID_NEGATIVE_KEYS = {
+    "post_id", "postid", "comment_id", "commentid", "feedback_id", "feedbackid",
+    "reaction_id", "reactionid", "story_fbid", "media_fbid", "video_id", "videoid",
+    "reel_id", "reelid", "photo_id", "photoid", "album_id", "albumid",
+    "group_id", "groupid", "page_id", "pageid", "event_id", "eventid",
+    "ad_id", "adid", "tracking_id", "trackingid", "session_id", "sessionid",
+    "thread_id", "threadid", "timestamp", "created_time", "updated_time",
+}
+UID_STRONG_KEYS = {
+    "uid", "user_id", "userid", "user_uid", "useruid", "profile_id", "profileid",
+    "profile_uid", "profileuid", "profile_owner_id", "profileownerid",
+    "profile_owner_uid", "profileowneruid", "profile.uid", "profile.id",
+    "profile_owner.id", "profile_owner.uid",
+}
+UID_PUBLISHER_KEYS = {
+    "publisher_id", "publisherid", "publisher.id", "author_id", "authorid",
+    "author.id", "owner_id", "ownerid", "owner.id", "from_id", "fromid", "from.id",
+}
+
+def _normalize_embedded_text(text: str) -> str:
+    if not text:
+        return ""
+    out = html_lib.unescape(text)
+    out = out.replace('\\"', '"').replace("\\'", "'").replace('\\/', '/')
+    return out
+
+def _uid_negative_key(key: str) -> bool:
+    return normalize_key(key) in {normalize_key(x) for x in UID_NEGATIVE_KEYS}
+
 
 def scan_html_identity(
     snapshot: PageSnapshot,
@@ -3170,8 +3231,10 @@ def rank_user_candidates(
             "uid",
             "user_uid",
             "useruid",
+            "profile_owner_uid",
+            "profileowneruid",
         }:
-            score += 58
+            score += 68
         if keys & {
             "profile_id",
             "profileid",
@@ -3182,8 +3245,9 @@ def rank_user_candidates(
             "profile_owner_id",
             "profileownerid",
             "profile_owner.uid",
+            "profile_owner.id",
         }:
-            score += 58
+            score += 68
         if keys & {
             "publisher_id",
             "publisherid",
@@ -3303,6 +3367,16 @@ def rank_user_candidates(
         )
         if only_weak_identity:
             score -= 30
+        # A USER route already identifies the publisher namespace. If the
+        # candidate is backed by a strong profile field, prefer it over weak
+        # actor/creator candidates from the same page.
+        if route_entity == "USER":
+            if keys & UID_STRONG_KEYS:
+                score += 22
+            if keys & UID_PUBLISHER_KEYS:
+                score += 14
+            if wanted and any(wanted in clean_text(e.neighbor).lower() for e in evidences):
+                score += 12
         if score > 0:
             ranked.append(
                 (

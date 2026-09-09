@@ -2548,6 +2548,242 @@ def scan_html_identity(
                         entity_type="USER",
                     )
 
+
+def scan_html_forensic_identity(
+    snapshot: PageSnapshot,
+    collector: EvidenceCollector,
+):
+    """Second-pass forensic UID extraction for raw public Facebook HTML.
+
+    This pass is intentionally independent from the normal JSON/script scanner.
+    It looks for identity-bearing HTML attributes, profile routes, link targets,
+    bootstrap variables and compact semantic objects.  It never promotes a
+    naked numeric ``id`` to a USER UID.
+    """
+    html = _normalize_embedded_text(snapshot.html or "")
+    if not html:
+        return
+
+    # 1) HTML data-* identity attributes.
+    data_patterns = {
+        "data-user-id": 138,
+        "data-userid": 138,
+        "data-profile-id": 140,
+        "data-profileid": 140,
+        "data-profile-uid": 140,
+        "data-profile-uid": 140,
+        "data-profile-owner-id": 136,
+        "data-owner-id": 122,
+        "data-author-id": 124,
+        "data-publisher-id": 126,
+        "data-from-id": 120,
+        "data-actor-id": 108,
+        "data-creator-id": 106,
+    }
+    for attr, weight in data_patterns.items():
+        pat = re.compile(
+            rf'\b{re.escape(attr)}\s*=\s*["\']?(\d{{5,30}})["\']?',
+            re.I,
+        )
+        for m in pat.finditer(html):
+            value = m.group(1)
+            if not is_numeric_id(value):
+                continue
+            a = max(0, m.start() - 500)
+            b = min(len(html), m.end() + 700)
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source="html:data_attribute",
+                key=attr,
+                weight=weight,
+                neighbor=clean_text(html[a:b]),
+                entity_type="USER" if "user" in attr or "profile" in attr else "UNKNOWN",
+            )
+
+    # 2) Profile/person URL forms embedded in href/src/data attributes.
+    route_patterns = [
+        (r'(?:/|https?://[^\s"\'<>]+/)profile\.php\?[^"\'<>#]*?\bid=(\d{5,30})', "profile.php?id", 142),
+        (r'(?:fb://profile/)(\d{5,30})', "fb://profile", 142),
+        (r'/people/[^/"\'<>]{1,180}/(\d{5,30})(?:[/?#"\'<>]|$)', "people/<name>/<id>", 134),
+    ]
+    for pattern, key, weight in route_patterns:
+        for m in re.finditer(pattern, html, re.I):
+            value = m.group(1)
+            if not is_numeric_id(value):
+                continue
+            a = max(0, m.start() - 700)
+            b = min(len(html), m.end() + 900)
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source="html:profile_route_forensic",
+                key=key,
+                weight=weight,
+                neighbor=clean_text(html[a:b]),
+                entity_type="USER",
+            )
+
+    # 3) Explicit identity key/value pairs, including unquoted HTML/JS keys.
+    identity_keys = {
+        "uid": 132,
+        "user_id": 134,
+        "userid": 134,
+        "userId": 134,
+        "userID": 134,
+        "user_uid": 134,
+        "profile_id": 136,
+        "profileId": 136,
+        "profileID": 136,
+        "profile_uid": 138,
+        "profileUid": 138,
+        "profile_owner_id": 136,
+        "profileOwnerId": 136,
+        "profile_owner_uid": 138,
+        "profileOwnerUid": 138,
+        "publisher_id": 126,
+        "publisherId": 126,
+        "author_id": 124,
+        "authorId": 124,
+        "owner_id": 120,
+        "ownerId": 120,
+        "from_id": 120,
+        "fromId": 120,
+        "actor_id": 108,
+        "actorId": 108,
+        "creator_id": 106,
+        "creatorId": 106,
+        "legacy_id": 112,
+        "legacyId": 112,
+    }
+    for key, weight in identity_keys.items():
+        if _uid_negative_key(key):
+            continue
+        pat = re.compile(
+            rf'(?:["\']{re.escape(key)}["\']|(?<![A-Za-z0-9_$]){re.escape(key)}(?![A-Za-z0-9_$]))'
+            rf'\s*[:=]\s*["\']?(\d{{5,30}})["\']?',
+            re.I,
+        )
+        for m in pat.finditer(html):
+            value = m.group(1)
+            if not is_numeric_id(value):
+                continue
+            a = max(0, m.start() - 650)
+            b = min(len(html), m.end() + 850)
+            context = clean_text(html[a:b])
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source="html:forensic_key",
+                key=key,
+                weight=weight,
+                neighbor=context,
+                entity_type="USER_CANDIDATE",
+            )
+
+    # 4) Semantic object forms. Keep the object window small enough to avoid
+    # attaching an unrelated ID to a nearby user.
+    semantic_specs = {
+        "profile_owner": (138, "USER"),
+        "profileOwner": (138, "USER"),
+        "profile": (132, "USER"),
+        "user": (132, "USER"),
+        "person": (126, "USER"),
+        "author": (122, "UNKNOWN"),
+        "publisher": (124, "UNKNOWN"),
+        "owner": (118, "UNKNOWN"),
+        "from": (116, "UNKNOWN"),
+        "actor": (108, "UNKNOWN"),
+        "creator": (104, "UNKNOWN"),
+    }
+    for semantic, (weight, entity_type) in semantic_specs.items():
+        pat = re.compile(
+            rf'(?:["\']{re.escape(semantic)}["\']|(?<![A-Za-z0-9_$]){re.escape(semantic)}(?![A-Za-z0-9_$]))'
+            rf'\s*[:=]\s*\{{[^{{}}]{{0,1800}}?'
+            rf'(?:["\'](?:id|uid|user_id|profile_id)["\']|(?:id|uid|user_id|profile_id))'
+            rf'\s*[:=]\s*["\']?(\d{{5,30}})["\']?',
+            re.I | re.S,
+        )
+        for m in pat.finditer(html):
+            value = m.group(1)
+            if not is_numeric_id(value):
+                continue
+            a = max(0, m.start() - 500)
+            b = min(len(html), m.end() + 900)
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source="html:semantic_object",
+                key=f"{semantic}.id",
+                weight=weight,
+                neighbor=clean_text(html[a:b]),
+                entity_type=entity_type,
+            )
+
+    # 5) username/profile URL + UID within a tight neighborhood. This is a
+    # correlation signal rather than proof by itself.
+    usernames = set()
+    for m in re.finditer(
+        r'(?:["\'](?:username|profile_name|profile_username)["\']|(?:username|profile_name|profile_username))'
+        r'\s*[:=]\s*["\']([^"\'<>]{1,120})["\']',
+        html,
+        re.I,
+    ):
+        u = clean_text(m.group(1)).lstrip("@").strip()
+        if u and not generic_name(u):
+            usernames.add(u)
+    shape_username = clean_text(getattr(snapshot, "meta", {}).get("profile:username", "")).lstrip("@")
+    if shape_username:
+        usernames.add(shape_username)
+
+    for username in list(usernames)[:30]:
+        for um in re.finditer(re.escape(username), html, re.I):
+            a = max(0, um.start() - 1000)
+            b = min(len(html), um.end() + 1000)
+            window = html[a:b]
+            for im in re.finditer(
+                r'(?:user(?:_id|Id|ID)|profile(?:_owner)?(?:_id|Id|ID)|profile_uid|uid|author_id|publisher_id|owner_id|from_id)'
+                r'\s*[:=]\s*["\']?(\d{5,30})["\']?',
+                window,
+                re.I,
+            ):
+                value = im.group(1)
+                if is_numeric_id(value):
+                    collector.add(
+                        value,
+                        role="USER_CANDIDATE",
+                        source="html:forensic_username_correlation",
+                        key="username+identity",
+                        weight=132,
+                        neighbor=clean_text(window),
+                        entity_type="USER",
+                    )
+
+    # 6) Explicit USER typename/entity_type near a generic id. This catches
+    # bootstrap payloads where the only numeric field is simply `id`.
+    user_object = re.compile(
+        r'(?:(?:__typename|entity_type|entityType|type)\s*[:=]\s*["\']?(?:User|Person)["\']?'
+        r'[^{}]{0,1800}?\bid\s*[:=]\s*["\']?(\d{5,30})["\']?)'
+        r'|(?:\bid\s*[:=\s]+["\']?(\d{5,30})["\']?[^{}]{0,1800}?'
+        r'(?:__typename|entity_type|entityType|type)\s*[:=]\s*["\']?(?:User|Person)["\']?)',
+        re.I | re.S,
+    )
+    for m in user_object.finditer(html):
+        value = m.group(1) or m.group(2)
+        if not is_numeric_id(value):
+            continue
+        a = max(0, m.start() - 400)
+        b = min(len(html), m.end() + 700)
+        collector.add(
+            value,
+            role="USER_CANDIDATE",
+            source="html:typed_user_object",
+            key="id@User",
+            weight=136,
+            neighbor=clean_text(html[a:b]),
+            entity_type="USER",
+        )
+
 class IdentityCorrelation:
     IDENTITY_KEYS = {
         "user",
@@ -4533,6 +4769,10 @@ class FacebookResolver:
             collector,
         )
         scan_html_identity(
+            snapshot,
+            collector,
+        )
+        scan_html_forensic_identity(
             snapshot,
             collector,
         )

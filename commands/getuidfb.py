@@ -2864,6 +2864,100 @@ def scan_html_forensic_identity(
                     entity_type="USER",
                 )
 
+
+    # 6) DEEP USERNAME-ANCHORED ID FORENSICS.
+    # Facebook frequently moves the profile UID between attributes, links,
+    # bootstrap blobs and compact HTML.  When the route already identifies a
+    # USER username, inspect a larger local neighborhood, but only promote IDs
+    # that have a USER/profile semantic marker or a profile.php?id link.
+    deep_key_re = re.compile(
+        r'(?:["\']?(?:entity_id|entityID|entityId|profile_id|profileID|profileId|'
+        r'user_id|userID|userId|actor_id|actorID|actorId|owner_id|ownerID|ownerId|'
+        r'author_id|authorID|authorId|publisher_id|publisherID|publisherId|'
+        r'uid|user_uid|profile_uid)["\']?)'
+        r'\s*[:=]\s*["\']?(\d{5,30})["\']?',
+        re.I,
+    )
+    data_id_re = re.compile(
+        r'(?:data-[a-z0-9_-]*(?:user|profile|actor|owner|author|publisher|entity)[a-z0-9_-]*|'
+        r'data-(?:id|fbid))\s*=\s*["\'](\d{5,30})["\']',
+        re.I,
+    )
+    profile_href_re = re.compile(
+        r'(?:profile\.php\?[^"\'<>]*?\bid=(\d{5,30})|'
+        r'/profile\.php\?[^"\'<>]*?\bid=(\d{5,30}))',
+        re.I,
+    )
+    for username in list(usernames)[:60]:
+        if not username or len(username) < 2:
+            continue
+        for um in re.finditer(re.escape(username), html, re.I):
+            a = max(0, um.start() - 3000)
+            b = min(len(html), um.end() + 3000)
+            window = html[a:b]
+            low = window.lower()
+            # Require profile/person semantics. This prevents random post IDs
+            # elsewhere in a huge HTML document from becoming a UID.
+            markers = (
+                "profile", "user", "person", "entity", "username",
+                "actor", "owner", "author", "publisher", "profile.php",
+            )
+            if not any(x in low for x in markers):
+                continue
+            hits = []
+            for rx, key in (
+                (deep_key_re, "deep_identity_key"),
+                (data_id_re, "data-profile-user-id"),
+                (profile_href_re, "profile.php?id"),
+            ):
+                for im in rx.finditer(window):
+                    value = next((g for g in im.groups() if g), "")
+                    if value and is_numeric_id(value):
+                        hits.append((value, key, im.start(), im.end()))
+            for value, key, start, end in hits:
+                local = window[max(0, start-900):min(len(window), end+1200)]
+                local_low = local.lower()
+                if any(x in local_low for x in (
+                    "post_id", "story_fbid", "media_fbid", "video_id",
+                    "reel_id", "photo_id", "comment_id", "feedback_id",
+                    "reaction_id", "group_id", "page_id", "event_id",
+                )) and key != "profile.php?id":
+                    continue
+                collector.add(
+                    value,
+                    role="USER_CANDIDATE",
+                    source="html:deep_username_forensics",
+                    key=key,
+                    weight=148 if key in {"profile.php?id", "data-profile-user-id"} else 142,
+                    neighbor=clean_text(local),
+                    entity_type="USER",
+                )
+
+    # 7) HTML data-* / embedded attributes can expose the UID without a JSON
+    # object. Scan globally for explicit profile/user/entity attributes.
+    for m in re.finditer(
+        r'<[^>]{0,300}?((?:data-(?:user|profile|actor|owner|author|publisher|entity)-id)|'
+        r'(?:data-(?:user|profile|actor|owner|author|publisher|entity)-uid)|'
+        r'(?:data-(?:userid|profileid|entityid|fbid)))\s*=\s*["\'](\d{5,30})["\']',
+        html,
+        re.I | re.S,
+    ):
+        key = m.group(1)
+        value = m.group(2)
+        if not is_numeric_id(value):
+            continue
+        tag = clean_text(m.group(0))
+        if username := next((u for u in usernames if re.search(re.escape(u), tag, re.I)), ""):
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source="html:data_attribute",
+                key="data-user-id",
+                weight=146,
+                neighbor=tag,
+                entity_type="USER",
+            )
+
     # 6) Explicit USER typename/entity_type near a generic id. This catches
     # bootstrap payloads where the only numeric field is simply `id`.
     user_object = re.compile(
@@ -3589,6 +3683,9 @@ def rank_user_candidates(
             "profileownerid",
             "profile_owner.uid",
             "profile_owner.id",
+            "deep_identity_key",
+            "data-profile-user-id",
+            "profile.php?id",
         }:
             score += 68
         if keys & {

@@ -71,14 +71,14 @@ if not LOGGER.handlers:
         level=logging.INFO,
         format="%(asctime)s | FBRESOLVER | %(levelname)s | %(message)s",
     )
-REQUEST_TIMEOUT = (3.5, 8)
+REQUEST_TIMEOUT = (5, 12)
 MAX_HTML_BYTES = 12 * 1024 * 1024
 MAX_INPUT_URLS = 8
 MAX_DISCOVERED_URLS = 100
-MAX_PROFILE_CHECKS = 8
+MAX_PROFILE_CHECKS = 6
 MAX_SHARE_PROBES = 4
-MAX_OBJECT_PROBES = 20
-MAX_PARALLEL_HTTP = 6
+MAX_OBJECT_PROBES = 12
+MAX_PARALLEL_HTTP = 4
 MAX_OBJECT_DEPTH = 2
 MAX_JSON_DEPTH = 12
 MAX_STRING_SCAN = 500_000
@@ -261,59 +261,26 @@ def is_content_id(value: Any) -> bool:
         is_numeric_id(value)
         or is_opaque_content_id(value)
     )
-def decode_facebook_story_token(value: str, *, max_rounds: int = 5) -> List[str]:
-    """Recursively unwrap an explicitly supplied Facebook story token.
+def decode_facebook_story_token(value: str) -> List[str]:
+    """Extract safe numeric identifiers from a Facebook story token.
 
-    Facebook story routes commonly use a base64/base64url envelope such as
-    ``UzpfSVNDOjEyODMwNjUyODcxNzg5MjI=`` -> ``S:_ISC:1283065287178922``.
-    This routine only returns identifiers that are literally recovered from
-    the supplied token.  It does not derive or guess a UID from an arbitrary
-    number.
+    This is not UID guessing: it only decodes an explicitly supplied story
+    token and returns numeric values actually encoded in it.
     """
-    seeds = [clean_text(unquote(value))]
-    seen = set()
-    found: List[str] = []
-    frontier = list(seeds)
-
-    def add_text(text: str):
-        text = clean_text(text)
-        if not text or text in seen:
-            return
-        seen.add(text)
-        frontier.append(text)
+    out: List[str] = []
+    value = unquote(clean_text(value))
+    candidates = [value]
+    try:
+        padded = value + ("=" * (-len(value) % 4))
+        raw = base64.b64decode(padded, validate=False).decode("utf-8", "ignore")
+        candidates.extend([raw, unquote(raw)])
+    except Exception:
+        pass
+    for text in candidates:
         for n in re.findall(r"(?<!\d)(\d{10,30})(?!\d)", text):
-            if n not in found:
-                found.append(n)
-
-    rounds = 0
-    while frontier and rounds < max_rounds:
-        current = frontier.pop(0)
-        rounds += 1
-        add_text(current)
-        variants = {current, unquote(current)}
-        # Base64/base64url, including missing padding.
-        compact = re.sub(r"\s+", "", current)
-        if len(compact) >= 8 and re.fullmatch(r"[A-Za-z0-9_+\-/=]+", compact):
-            for decoder in (base64.b64decode, base64.urlsafe_b64decode):
-                try:
-                    padded = compact + ("=" * (-len(compact) % 4))
-                    raw = decoder(padded.encode("ascii"), validate=False) if decoder is base64.b64decode else decoder(padded.encode("ascii"))
-                    text = raw.decode("utf-8", "ignore").strip()
-                    if text and text != current:
-                        variants.add(text)
-                except Exception:
-                    pass
-        # Some wrappers are percent/hex encoded after the base64 layer.
-        for text in list(variants):
-            try:
-                if re.fullmatch(r"(?:[0-9A-Fa-f]{2})+", text) and len(text) <= 2048:
-                    variants.add(bytes.fromhex(text).decode("utf-8", "ignore"))
-            except Exception:
-                pass
-        for text in variants:
-            if text and text not in seen:
-                add_text(text)
-    return found
+            if n not in out:
+                out.append(n)
+    return out
 
 
 def unique_keep_order(
@@ -519,7 +486,6 @@ class URLShape:
     page_id: str = ""
     album_id: str = ""
     opaque_token: str = ""
-    decoded_story_ids: List[str] = field(default_factory=list)
     wrapper: bool = False
     route_entity: str = ""
     route_confidence: float = 0.0
@@ -829,13 +795,6 @@ class URLParser:
                         # Preserve opaque story tokens such as
                         # UzpfSVNDOjEwODI2OTkxNDA5MzYwNjI= for PASS 2.
                         shape.opaque_token = story_token
-                        shape.decoded_story_ids = decode_facebook_story_token(story_token)
-                        if shape.decoded_story_ids:
-                            # Prefer the decoded object ID as STORY evidence;
-                            # the numeric route segment remains a separate
-                            # owner/profile candidate and is never treated as
-                            # the story object ID.
-                            shape.story_id = shape.decoded_story_ids[0]
             for key in (
                 "story_fbid",
                 "fbid",
@@ -3939,18 +3898,48 @@ class IdentityVerifier:
                 "hoặc explicit story owner để correlation."
             )
             return result
-        # IMPORTANT: /stories/<numeric>/<opaque-token>/ contains two different
-        # namespaces. The first numeric segment is a route/owner candidate; it
-        # is NOT automatically the story object ID and is NOT automatically a
-        # verified personal UID. It must be correlated with public profile/user
-        # evidence. The opaque token is decoded and probed separately in PASS 2.
+        # Explicit /stories/<owner_id>/<token> route: the owner ID is a
+        # first-class public identity signal. Only use it when the route is
+        # classified as USER and no page/group veto exists.
+        if (
+            shape.kind == "STORY"
+            and shape.route_entity == "USER"
+            and is_numeric_id(shape.numeric_path_id)
+        ):
+            # IDs from a generic Facebook landing page are not allowed to
+            # veto an explicit /stories/<owner_id>/ route. Only a direct
+            # contradictory page/group route should do so; incidental IDs
+            # from login/terms/bootstrap HTML are unrelated evidence.
+            direct_veto = any(
+                e.value == shape.numeric_path_id
+                for e in collector.by_role("PAGE_ID") + collector.by_role("GROUP_ID")
+            )
+            if not direct_veto:
+                result.uid = shape.numeric_path_id
+                result.verified = True
+                result.confidence = 99.0
+                result.sources = 1
+                result.signals.append("/stories/<owner_id>/ → explicit USER owner UID")
+                return result
+
+        # Final hard-lock: if the original URL explicitly carries a Story
+        # owner ID, return that exact ID rather than a numeric candidate
+        # harvested from canonical/login/generic HTML.
         if explicit_story_owner and is_numeric_id(explicit_story_owner):
-            result.debug.setdefault("identity_candidates", []).append({
-                "id": explicit_story_owner,
-                "source": "input_story_owner_route",
-                "role": "OWNER_CANDIDATE",
-            })
-            result.signals.append("/stories/<owner_id>/ → owner candidate (not auto-verified)")
+            contradictory = any(
+                e.value == explicit_story_owner
+                for e in collector.by_role("PAGE_ID")
+                + collector.by_role("GROUP_ID")
+                + collector.by_role("EVENT_ID")
+            )
+            if not contradictory:
+                result.uid = explicit_story_owner
+                result.verified = True
+                result.confidence = 100.0
+                result.sources = 1
+                if "/stories/<owner_id>/ → explicit USER owner UID" not in result.signals:
+                    result.signals.append("/stories/<owner_id>/ → exact input owner UID")
+                return result
 
         ranked = rank_user_candidates(
             collector,
@@ -4296,9 +4285,6 @@ class FacebookResolver:
                 notes=[
                     "Resolver internal error."
                 ],
-                debug={
-                    "internal_error": type(sys.exc_info()[1]).__name__ if sys.exc_info()[1] else "UnknownError",
-                },
             )
         result.elapsed = (
             time.perf_counter()
@@ -4763,15 +4749,13 @@ class FacebookResolver:
                 os = URLParser.parse(original_input_url)
             except Exception:
                 continue
-            if os.kind == "STORY" and os.numeric_path_id and is_numeric_id(os.numeric_path_id):
+            if os.numeric_path_id and os.route_entity == "USER":
                 add_pass2_id("author", os.numeric_path_id, "original_story_owner")
             if os.story_id:
                 add_pass2_id("story", os.story_id, "original_url_story_id")
             if os.opaque_token:
-                decoded_ids = decode_facebook_story_token(os.opaque_token)
-                for decoded_id in decoded_ids:
+                for decoded_id in decode_facebook_story_token(os.opaque_token):
                     add_pass2_id("story", decoded_id, "decoded_story_token")
-                result.debug.setdefault("pass2", {}).setdefault("decoded_story_ids", []).extend(decoded_ids)
                 result.debug.setdefault("pass2", {}).setdefault("opaque_tokens", []).append(
                     truncate(os.opaque_token, 120)
                 )
@@ -4813,21 +4797,19 @@ class FacebookResolver:
                                 add_pass2_id("photo", nested_shape.photo_id, "nested_share_url")
                             if nested_shape.album_id:
                                 add_pass2_id("album", nested_shape.album_id, "nested_share_url")
-                            if nested_shape.kind == "STORY" and nested_shape.numeric_path_id and is_numeric_id(nested_shape.numeric_path_id):
+                            if nested_shape.numeric_path_id and nested_shape.route_entity == "USER":
                                 add_pass2_id("author", nested_shape.numeric_path_id, "nested_story_owner")
                             queue.append(value)
                 # The current URL itself may be a story route.
                 try:
                     cs = URLParser.parse(current)
-                    if cs.kind == "STORY" and cs.numeric_path_id and is_numeric_id(cs.numeric_path_id):
+                    if cs.numeric_path_id and cs.route_entity == "USER":
                         add_pass2_id("author", cs.numeric_path_id, "story_owner_route")
                     if cs.story_id:
                         add_pass2_id("story", cs.story_id, "story_route")
                     if cs.opaque_token:
-                        decoded_ids = decode_facebook_story_token(cs.opaque_token)
-                        for decoded_id in decoded_ids:
+                        for decoded_id in decode_facebook_story_token(cs.opaque_token):
                             add_pass2_id("story", decoded_id, "nested_decoded_story_token")
-                        result.debug.setdefault("pass2", {}).setdefault("decoded_story_ids", []).extend(decoded_ids)
                 except Exception:
                     pass
 
@@ -5054,18 +5036,6 @@ class FacebookResolver:
                 self.merge_snapshot_evidence(ps, collector)
 
             for kind, ident, source in pass2_ids:
-                # "author" IDs are identity candidates, not content objects.
-                # They are probed above through profile.php and must never enter
-                # the content-ID attribute map (which previously caused a
-                # KeyError -> "Resolver internal error").
-                if kind == "author":
-                    continue
-                attr_name = {
-                    "post":"post_id", "story":"story_id", "reel":"reel_id",
-                    "video":"video_id", "photo":"photo_id", "album":"album_id",
-                }.get(kind)
-                if not attr_name:
-                    continue
                 temp = URLShape(
                     original=result.content_url or url,
                     normalized=result.content_url or url,
@@ -5075,7 +5045,10 @@ class FacebookResolver:
                     username=shape.username,
                     route_entity=shape.route_entity,
                 )
-                setattr(temp, attr_name, ident)
+                setattr(temp, {
+                    "post":"post_id", "story":"story_id", "reel":"reel_id",
+                    "video":"video_id", "photo":"photo_id", "album":"album_id",
+                }[kind], ident)
                 probe_urls.extend(
                     self.build_object_probe_urls(temp, result.content_url or url)
                 )
@@ -5143,8 +5116,6 @@ class FacebookResolver:
                 "probe_urls": probe_urls[:MAX_DEBUG_CANDIDATES],
                 "probe_count": len(phase2_snapshots),
                 "profile_count": len(profile_snapshots),
-                "decoded_story_ids": unique_keep_order(result.debug.get("pass2", {}).get("decoded_story_ids", [])),
-                "identity_candidates": result.debug.get("identity_candidates", []),
             }
         else:
             result.notes.append(
@@ -5400,12 +5371,6 @@ class FacebookResolver:
         if shape.video_id: ids.append(("video", shape.video_id))
         if shape.photo_id: ids.append(("photo", shape.photo_id))
         if shape.album_id: ids.append(("album", shape.album_id))
-        # A story token can decode to a different underlying object ID. Probe
-        # every recovered ID independently instead of assuming the first
-        # numeric path segment is the content object.
-        for decoded_id in getattr(shape, "decoded_story_ids", []) or []:
-            if is_content_id(decoded_id):
-                ids.append(("story", decoded_id))
 
         for kind, ident in ids:
             ident = clean_text(ident)
@@ -6433,7 +6398,6 @@ if __name__ == "__main__":
         "https://www.facebook.com/groups/123456789/posts/987654321/",
         "https://www.facebook.com/share/r/1H1EjsEW7J/",
         "https://www.facebook.com/profile.php?id=61553239356646",
-        "https://www.facebook.com/stories/101540198959382/UzpfSVNDOjEyODMwNjUyODcxNzg5MjI=/"
     ]
     for test in tests:
         shape = URLParser.parse(

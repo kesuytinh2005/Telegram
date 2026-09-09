@@ -6433,6 +6433,7 @@ if __name__ == "__main__":
         "https://www.facebook.com/groups/123456789/posts/987654321/",
         "https://www.facebook.com/share/r/1H1EjsEW7J/",
         "https://www.facebook.com/profile.php?id=61553239356646",
+        "https://www.facebook.com/stories/101540198959382/UzpfSVNDOjEyODMwNjUyODcxNzg5MjI=/
     ]
     for test in tests:
         shape = URLParser.parse(

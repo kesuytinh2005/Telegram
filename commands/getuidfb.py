@@ -187,14 +187,7 @@ def make_headers(
         "sec-fetch-mode": "navigate",
         "sec-fetch-site": "none",
         "upgrade-insecure-requests": "1",
-        "user-agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/139.0.0.0 "
-            "Safari/537.36"
-        ),
+        "user-agent": ua,
     }
     if referer:
         headers["Referer"] = referer
@@ -747,6 +740,7 @@ class URLParser:
             "story.php" in p.path.lower()
             or "stories" in lower
         ):
+            # Story content ID and publisher/owner ID are separate.
             for key in (
                 "story_fbid",
                 "fbid",
@@ -756,6 +750,36 @@ class URLParser:
                     if is_numeric_id(candidate):
                         shape.story_id = candidate
                         break
+
+            # Classic: /story.php?story_fbid=STORY_ID&id=USER_ID
+            # `id` is the story publisher/owner, not the story itself.
+            if "id" in shape.query:
+                owner_id = shape.query["id"][0]
+                if is_numeric_id(owner_id):
+                    shape.numeric_path_id = owner_id
+                    shape.route_entity = "USER"
+
+            # Newer: /stories/<USER_ID>/<STORY_ID>/ or
+            #        /stories/<USERNAME>/<STORY_ID>/
+            if "stories" in lower:
+                idx = lower.index("stories")
+                tail = segments[idx + 1:]
+                if tail:
+                    first = tail[0]
+                    if is_numeric_id(first):
+                        shape.numeric_path_id = first
+                        shape.route_entity = "USER"
+                    elif (
+                        first.lower() not in cls.RESERVED
+                        and not shape.username
+                    ):
+                        shape.username = first
+                        shape.route_entity = "USER"
+                    if len(tail) >= 2:
+                        second = tail[1]
+                        if is_content_id(second) and not shape.story_id:
+                            shape.story_id = second
+
             shape.kind = "STORY"
             shape.route_confidence = max(
                 shape.route_confidence,
@@ -4075,6 +4099,27 @@ class IdentityVerifier:
                 "Không trả UID cá nhân."
             )
             return result
+        # STORY route can directly identify the publisher even when the
+        # story response itself redirects to login.
+        if (
+            shape.kind == "STORY"
+            and shape.route_entity == "USER"
+            and shape.numeric_path_id
+            and is_numeric_id(shape.numeric_path_id)
+        ):
+            result.uid = shape.numeric_path_id
+            result.verified = True
+            result.confidence = 99.0
+            result.sources = 1
+            result.signals.append(
+                "story route → explicit USER publisher UID"
+            )
+            if shape.story_id:
+                result.signals.append(
+                    "story_fbid/fbid → separate STORY content ID"
+                )
+            return result
+
         if (
             shape.kind == "PROFILE"
             and shape.numeric_path_id
@@ -4845,6 +4890,10 @@ class FacebookResolver:
                 collector,
             )
             scan_html_identity(
+                ps,
+                collector,
+            )
+            scan_html_forensic_identity(
                 ps,
                 collector,
             )

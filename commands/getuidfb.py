@@ -4296,6 +4296,9 @@ class FacebookResolver:
                 notes=[
                     "Resolver internal error."
                 ],
+                debug={
+                    "internal_error": type(sys.exc_info()[1]).__name__ if sys.exc_info()[1] else "UnknownError",
+                },
             )
         result.elapsed = (
             time.perf_counter()
@@ -5051,6 +5054,18 @@ class FacebookResolver:
                 self.merge_snapshot_evidence(ps, collector)
 
             for kind, ident, source in pass2_ids:
+                # "author" IDs are identity candidates, not content objects.
+                # They are probed above through profile.php and must never enter
+                # the content-ID attribute map (which previously caused a
+                # KeyError -> "Resolver internal error").
+                if kind == "author":
+                    continue
+                attr_name = {
+                    "post":"post_id", "story":"story_id", "reel":"reel_id",
+                    "video":"video_id", "photo":"photo_id", "album":"album_id",
+                }.get(kind)
+                if not attr_name:
+                    continue
                 temp = URLShape(
                     original=result.content_url or url,
                     normalized=result.content_url or url,
@@ -5060,10 +5075,7 @@ class FacebookResolver:
                     username=shape.username,
                     route_entity=shape.route_entity,
                 )
-                setattr(temp, {
-                    "post":"post_id", "story":"story_id", "reel":"reel_id",
-                    "video":"video_id", "photo":"photo_id", "album":"album_id",
-                }[kind], ident)
+                setattr(temp, attr_name, ident)
                 probe_urls.extend(
                     self.build_object_probe_urls(temp, result.content_url or url)
                 )

@@ -2660,6 +2660,68 @@ def scan_html_forensic_identity(
                 entity_type="USER" if "user" in attr or "profile" in attr else "UNKNOWN",
             )
 
+    # 1.5) App-link / deep-link metadata. Older and mobile Facebook
+    # responses frequently expose the exact profile object through fb://profile,
+    # al:ios:url, al:android:url or referrer_profile_id even when normal JSON
+    # identity keys are absent.
+    app_link_patterns = [
+        (r'fb://profile(?:/|\?id=)(\d{5,30})', "fb://profile", 152),
+        (r'(?:al:(?:ios|android|web):url|canonical|og:url)[^>]{0,500}?fb://profile(?:/|\?id=)(\d{5,30})', "app-link:fb-profile", 154),
+        (r'(?:referrer_profile_id|referrerProfileId|referrer_profile|profile_id|profileId)["\'&=:\s]+(\d{5,30})', "referrer_profile_id", 150),
+        (r'(?:profile\.php\?[^"\'<>#]{0,300}?[?&]id=|[?&]profile_id=)(\d{5,30})', "profile-url-id", 150),
+    ]
+    for pattern, key, weight in app_link_patterns:
+        try:
+            rx = re.compile(pattern, re.I | re.S)
+        except re.error:
+            continue
+        for m in rx.finditer(html):
+            value = next((g for g in m.groups() if g), "")
+            if not value or not is_numeric_id(value):
+                continue
+            a = max(0, m.start() - 900)
+            b = min(len(html), m.end() + 1400)
+            local = clean_text(html[a:b])
+            low = local.lower()
+            # Never use content/entity IDs merely because they occur nearby.
+            if key not in {"profile-url-id", "fb://profile", "app-link:fb-profile"} and any(x in low for x in (
+                "post_id", "story_fbid", "media_fbid", "video_id", "reel_id",
+                "photo_id", "comment_id", "feedback_id", "reaction_id",
+                "group_id", "page_id", "event_id",
+            )):
+                continue
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source="html:app_link_identity",
+                key=key,
+                weight=weight,
+                neighbor=local,
+                entity_type="USER",
+            )
+
+    # 1.6) Generic profile identity in links/images. A common public-page
+    # fallback is an image/photo URL carrying referrer_profile_id.
+    for m in re.finditer(
+        r'(?:href|src|data-[a-z0-9_-]+)\s*=\s*["\'][^"\']{0,500}?'
+        r'(?:referrer_profile_id|profile_id|profileId)=(\d{5,30})[^"\']*["\']',
+        html,
+        re.I | re.S,
+    ):
+        value = m.group(1)
+        if not is_numeric_id(value):
+            continue
+        local = clean_text(html[max(0, m.start()-500):min(len(html), m.end()+900)])
+        collector.add(
+            value,
+            role="USER_CANDIDATE",
+            source="html:profile_link_identity",
+            key="referrer_profile_id",
+            weight=148,
+            neighbor=local,
+            entity_type="USER",
+        )
+
     # 2) Profile/person URL forms embedded in href/src/data attributes.
     route_patterns = [
         (r'(?:/|https?://[^\s"\'<>]+/)profile\.php\?[^"\'<>#]*?\bid=(\d{5,30})', "profile.php?id", 142),

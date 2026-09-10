@@ -3186,6 +3186,65 @@ def scan_profile_uid_correlation(
             entity_type="USER",
         )
 
+    # LAST-RESORT PROFILE DOCUMENT CORRELATION.
+    # Some current Facebook public responses expose a profile bootstrap object
+    # as simply {"id":"..."} and omit user_id/profile_id entirely.  On a
+    # document whose final URL is the requested vanity profile, a generic id
+    # can be accepted only when it is repeated or surrounded by explicit
+    # profile/user semantics.  This is deliberately restricted to PROFILE
+    # documents and never runs for POST/REEL/PAGE/GROUP routes.
+    profile_path = urlparse(snapshot.final_url or snapshot.url).path.lower().strip("/")
+    profile_doc = profile_path == wanted.lower() or profile_path.startswith(wanted.lower() + "/")
+    canonical = clean_text(snapshot.meta.get("og:url", "")).lower()
+    canonical_matches = ("/" + wanted.lower()) in canonical
+    if profile_doc or canonical_matches:
+        generic_id_re = re.compile(
+            r'(?:(?:["\']id["\'])|(?<![A-Za-z0-9_$])id(?![A-Za-z0-9_$]))'
+            r'\s*[:=]\s*["\']?(\d{5,30})["\']?',
+            re.I,
+        )
+        counts = {}
+        windows = {}
+        for m in generic_id_re.finditer(html):
+            value = m.group(1)
+            if not is_numeric_id(value):
+                continue
+            around = clean_text(
+                html[max(0, m.start() - 900):min(len(html), m.end() + 900)]
+            )
+            low = around.lower()
+            if any(
+                marker in low
+                for marker in (
+                    "post_id", "comment_id", "media_fbid", "story_fbid",
+                    "video_id", "reel_id", "photo_id", "album_id",
+                    "group_id", "page_id", "event_id", "feedback_id",
+                )
+            ):
+                continue
+            semantic = any(
+                marker in low
+                for marker in (
+                    "profile", "user", "person", "publisher",
+                    "author", "owner", "actor", "fb://profile/",
+                )
+            )
+            counts[value] = counts.get(value, 0) + 1
+            if semantic:
+                windows[value] = around[:2400]
+        for value, count in counts.items():
+            if count < 2 and value not in windows:
+                continue
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source=source,
+                key="profile_document_id",
+                weight=134 if count >= 2 else 126,
+                neighbor=windows.get(value, "profile document: " + wanted),
+                entity_type="USER",
+            )
+
 class IdentityCorrelation:
     IDENTITY_KEYS = {
         "user",
@@ -4648,6 +4707,7 @@ class IdentityVerifier:
                     "id@profile_username",
                     "profile_username_explicit_id",
                     "profile.php?id@username",
+                    "profile_document_id",
                     "id@user",
                     "profile.php?id",
                     "data-user-id",
@@ -4745,6 +4805,7 @@ class IdentityVerifier:
                     "id@profile_username",
                     "profile_username_explicit_id",
                     "profile.php?id@username",
+                    "profile_document_id",
                     "id@user",
                     "profile.php?id",
                     "data-user-id",
@@ -5133,9 +5194,14 @@ class FacebookResolver:
                     result.canonical_url = normalize_facebook_url(target_url)
                     result.content_url = result.canonical_url
 
-                result.notes.append(
-                    "Share wrapper resolved only from explicit public redirect/canonical metadata."
-                )
+                if shape.kind == "PROFILE" and shape.route_entity == "USER":
+                    result.notes.append(
+                        "Share wrapper → public USER profile; tiếp tục quét identity evidence của profile."
+                    )
+                else:
+                    result.notes.append(
+                        "Share wrapper resolved from explicit public redirect/canonical metadata."
+                    )
 
             if shape.kind == "SHARE_WRAPPER":
                 result.status = (
@@ -5284,26 +5350,33 @@ class FacebookResolver:
             # the landing HTML, so MAX_PROFILE_CHECKS could be exhausted before
             # the resolver ever fetched the user's own profile.
             deep_profile_variants = []
-            for host in (
+            # Spread the first probes across Facebook's public renderers.
+            # The previous host-first ordering spent almost the whole profile
+            # budget on www.facebook.com before m/mbasic were tried.
+            suffixes = (
+                "",
+                "/about",
+                "/about_contact_and_basic_info",
+                "/posts",
+                "/photos",
+                "/videos",
+                "/reels",
+            )
+            hosts = (
                 "www.facebook.com",
                 "m.facebook.com",
                 "mbasic.facebook.com",
-            ):
-                for suffix in (
-                    "",
-                    "/about",
-                    "/posts",
-                    "/photos",
-                    "/videos",
-                    "/reels",
-                    "/about_contact_and_basic_info",
-                ):
+            )
+            for suffix in suffixes:
+                for host in hosts:
                     deep_profile_variants.append(
                         f"https://{host}/{encoded_username}{suffix}"
                     )
+            for host in hosts:
                 deep_profile_variants.extend([
                     f"https://{host}/{encoded_username}?sk=about",
                     f"https://{host}/{encoded_username}?sk=profile",
+                    f"https://{host}/{encoded_username}?locale=en_US",
                 ])
             # Own-profile probes first, discovered third-party profile links
             # only after them.
@@ -5531,10 +5604,25 @@ class FacebookResolver:
                 "NOT_VERIFIED"
             )
         if not result.verified:
-            result.notes.append(
-                verification.reason
-                or "UID withheld."
-            )
+            if (
+                original_shape.wrapper
+                and shape.kind == "PROFILE"
+                and shape.route_entity == "USER"
+                and profile.username
+            ):
+                result.notes.append(
+                    verification.reason
+                    or (
+                        "Đã xác định share → USER profile @"
+                        + profile.username
+                        + ", nhưng public HTTP response chưa cung cấp identity evidence đủ mạnh để xác minh numeric UID."
+                    )
+                )
+            else:
+                result.notes.append(
+                    verification.reason
+                    or "UID withheld."
+                )
         if generic_name(
             result.name
         ):

@@ -73,7 +73,7 @@ REQUEST_TIMEOUT = (5, 12)
 MAX_HTML_BYTES = 12 * 1024 * 1024
 MAX_INPUT_URLS = 8
 MAX_DISCOVERED_URLS = 100
-MAX_PROFILE_CHECKS = 5
+MAX_PROFILE_CHECKS = 12
 MAX_SHARE_PROBES = 8
 MAX_JSON_DEPTH = 12
 MAX_STRING_SCAN = 500_000
@@ -5122,10 +5122,44 @@ class FacebookResolver:
                 entity,
             )
         )
+
+        # Deep public-profile sweep.  A vanity profile can expose its numeric
+        # identity only on a different public representation (mobile/basic,
+        # about, photos, videos, posts, etc.).  Probe several representations
+        # and merge their evidence instead of trusting the first HTML response.
+        profile_username = clean_text(
+            profile.username or shape.username
+        ).lstrip("@").strip()
+        if shape.kind == "PROFILE" and profile_username:
+            encoded_username = quote(profile_username, safe="@.*-")
+            deep_profile_variants = []
+            for host in (
+                "www.facebook.com",
+                "m.facebook.com",
+                "mbasic.facebook.com",
+            ):
+                for suffix in (
+                    "",
+                    "/about",
+                    "/posts",
+                    "/photos",
+                    "/videos",
+                    "/reels",
+                ):
+                    deep_profile_variants.append(
+                        f"https://{host}/{encoded_username}{suffix}"
+                    )
+            profile_urls = unique_keep_order(
+                profile_urls + deep_profile_variants
+            )
+
         profile_snapshots = []
-        for profile_url in profile_urls[
-            :MAX_PROFILE_CHECKS
-        ]:
+        seen_profile_urls = set()
+        for profile_url in profile_urls[:MAX_PROFILE_CHECKS]:
+            normalized_profile_url = normalize_facebook_url(profile_url)
+            if normalized_profile_url in seen_profile_urls:
+                continue
+            seen_profile_urls.add(normalized_profile_url)
             if (
                 profile_url
                 == result.content_url
@@ -5182,34 +5216,9 @@ class FacebookResolver:
                     source="profile_meta",
                     weight=90,
                 )
-        # Public-only fallback: try mobile/basic profile HTML when the normal
-        # profile representation yielded no USER candidate.
-        if (
-            shape.kind == "PROFILE"
-            and shape.username
-            and not collector.by_role("USER_CANDIDATE")
-        ):
-            seen_profile_urls = {x.url for x in profile_snapshots}
-            for host in ("m.facebook.com", "mbasic.facebook.com"):
-                if len(profile_snapshots) >= MAX_PROFILE_CHECKS:
-                    break
-                alt_url = (
-                    "https://" + host + "/"
-                    + quote(shape.username, safe="@.*-")
-                )
-                if alt_url in seen_profile_urls:
-                    continue
-                with self.profile_sem:
-                    aps = self.fetcher.fetch(
-                        alt_url,
-                        referer=url,
-                    )
-                profile_snapshots.append(aps)
-                seen_profile_urls.add(alt_url)
-                scan_meta(aps, collector)
-                scan_jsonld(aps, collector)
-                scan_scripts(aps, collector)
-                scan_html_forensic_identity(aps, collector)
+        # No separate weak fallback is needed: the deep sweep above already
+        # covers mobile/basic/public profile representations and all of the
+        # important public profile tabs.
 
         entity = (
             entity_classifier.classify(

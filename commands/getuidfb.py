@@ -4611,6 +4611,100 @@ class IdentityVerifier:
                 "đủ điều kiện."
             )
             return result
+
+        # PROFILE/USER special path:
+        # A public profile document can expose the exact object through
+        # fb://profile/<ID> (or equivalent app-link metadata) without placing
+        # the username next to the ID.  The previous verifier required a
+        # username-neighbour correlation and could therefore throw away a
+        # perfectly good profile identity.  For a resolved PROFILE route, the
+        # fetched document itself is already the correlation anchor.
+        if shape.kind == "PROFILE" and shape.route_entity == "USER":
+            direct_profile_keys = {
+                "fb://profile",
+                "app-link:fb-profile",
+                "profile.php?id",
+                "profile-url-id",
+                "referrer_profile_id",
+                "profile_username_explicit_id",
+                "profile.php?id@username",
+                "profile_document_id",
+                "data-user-id",
+                "data-profile-id",
+                "data-profile-uid",
+                "user_id",
+                "userid",
+                "profile_id",
+                "profileid",
+                "profile_uid",
+                "profileuid",
+                "uid",
+            }
+            blocked_entity_ids = {
+                e.value
+                for role in ("OBJECT_ID", "PAGE_ID", "GROUP_ID", "EVENT_ID")
+                for e in collector.by_role(role)
+            }
+            direct = []
+            for candidate, base_score in ranked:
+                if candidate in blocked_entity_ids:
+                    continue
+                evs = [
+                    e for e in collector.by_role("USER_CANDIDATE")
+                    if e.value == candidate
+                ]
+                keys = {normalize_key(e.key) for e in evs}
+                if not (keys & {normalize_key(k) for k in direct_profile_keys}):
+                    continue
+                if any(e.entity_type in {"PAGE", "GROUP", "EVENT"} for e in evs):
+                    continue
+
+                # Require that the candidate actually occurred in one of the
+                # fetched profile documents, not only in the share wrapper.
+                occurred_in_profile = False
+                username_in_profile = False
+                for ps in profile_snapshots or [snapshot]:
+                    body = _normalize_embedded_text(ps.html or "")
+                    if not body:
+                        continue
+                    if re.search(rf"(?<!\d){re.escape(candidate)}(?!\d)", body):
+                        occurred_in_profile = True
+                        if username and username.lower() in body.lower():
+                            username_in_profile = True
+                        break
+                if not occurred_in_profile:
+                    continue
+
+                direct_score = max(96.0, min(99.5, float(base_score) + 25.0))
+                direct.append((candidate, direct_score, keys, username_in_profile))
+
+            if direct:
+                direct.sort(key=lambda x: x[1], reverse=True)
+                best = direct[0]
+                # If two independent direct profile IDs disagree, do not guess.
+                if len(direct) > 1 and direct[1][0] != best[0] and direct[1][1] >= best[1] - 3:
+                    result.reason = (
+                        "Profile public HTML chứa nhiều identity ID khác nhau; "
+                        "không đủ bằng chứng để chọn UID."
+                    )
+                    return result
+                candidate, direct_score, direct_keys, username_match = best
+                result.uid = candidate
+                result.verified = True
+                result.confidence = direct_score
+                result.sources = len(collector.sources_for(candidate))
+                if "fb://profile" in direct_keys or "app-link:fb-profile" in direct_keys:
+                    result.signals.append("public app-link → exact profile object UID")
+                elif "profile.php?id" in direct_keys or "profile-url-id" in direct_keys:
+                    result.signals.append("public profile URL → explicit USER UID")
+                else:
+                    result.signals.append("public profile identity field → USER UID")
+                if username_match:
+                    result.signals.append("profile HTML → username/UID correlation")
+                result.signals.append("profile route → USER publisher")
+                result.signals = unique_keep_order(result.signals)[:MAX_SIGNALS]
+                return result
+
         correlator = IdentityCorrelation()
         correlated = []
         username = (
@@ -5200,7 +5294,7 @@ class FacebookResolver:
                     )
                 else:
                     result.notes.append(
-                        "Share wrapper resolved from explicit public redirect/canonical metadata."
+                        "Share wrapper đã resolve tới public profile; UID sẽ chỉ VERIFIED nếu profile HTTP trả identity evidence."
                     )
 
             if shape.kind == "SHARE_WRAPPER":

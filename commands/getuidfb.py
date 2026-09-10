@@ -2406,7 +2406,7 @@ UID_STRONG_KEYS = {
     "profile_uid", "profileuid", "profile_owner_id", "profileownerid",
     "profile_owner_uid", "profileowneruid", "profile.uid", "profile.id",
     "profile_owner.id", "profile_owner.uid", "user.id", "person.id",
-    "id@username_route", "id@user", "profile.php?id",
+    "id@username_route", "id@profile_username", "profile_username_explicit_id", "profile.php?id@username", "id@user", "profile.php?id",
     "data-user-id", "data-profile-id", "data-profile-uid",
 }
 UID_PUBLISHER_KEYS = {
@@ -3042,6 +3042,147 @@ def scan_html_forensic_identity(
             key="id@User",
             weight=136,
             neighbor=clean_text(html[a:b]),
+            entity_type="USER",
+        )
+
+
+def scan_profile_uid_correlation(
+    snapshot: PageSnapshot,
+    collector: EvidenceCollector,
+    username: str,
+):
+    """Correlate a vanity USER route with a nearby numeric profile identity.
+
+    Facebook profile bootstrap payloads sometimes expose only a generic
+    ``id`` field.  We accept that generic id only when the SAME small HTML
+    window also contains the requested username plus explicit profile/user
+    semantics.  This prevents naked post/page/group ids from becoming a UID.
+    """
+    html = _normalize_embedded_text(snapshot.html or "")
+    wanted = clean_text(username).lstrip("@").strip()
+    if not html or not wanted:
+        return
+
+    source_id = urlparse(snapshot.final_url or snapshot.url).path or "/"
+    source = "html:profile_uid_correlation:" + source_id
+    user_re = re.compile(re.escape(wanted), re.I)
+
+    # Strong explicit profile identity forms.
+    explicit_patterns = [
+        r'(?:profile\.php\?[^"\'<>#]{0,500}?\bid=|fb://profile/)(\d{5,30})',
+        r'(?:["\'](?:user_id|userid|userId|userID|profile_id|profileid|profileId|profileID|profile_uid|profileUid|profileUID|profile_owner_id|profileOwnerId)["\']?\s*[:=]\s*["\']?)(\d{5,30})',
+    ]
+    for raw_pattern in explicit_patterns:
+        pattern = re.compile(raw_pattern, re.I)
+        for m in pattern.finditer(html):
+            value = m.group(1)
+            if not is_numeric_id(value):
+                continue
+            a = max(0, m.start() - 3500)
+            b = min(len(html), m.end() + 3500)
+            window = html[a:b]
+            low = window.lower()
+            if not user_re.search(window):
+                continue
+            if not any(
+                marker in low
+                for marker in (
+                    "profile",
+                    "user_id",
+                    "userid",
+                    "profile_id",
+                    "profile_uid",
+                    "profile_owner",
+                    "fb://profile/",
+                )
+            ):
+                continue
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source=source,
+                key="profile_username_explicit_id",
+                weight=150,
+                neighbor=clean_text(window[:2400]),
+                entity_type="USER",
+            )
+
+    # Generic `id` is accepted only with username + profile semantics in the
+    # same bounded window. This is the missing case in many modern bootstrap
+    # payloads where Facebook no longer labels the profile id as user_id.
+    positions = [m.start() for m in user_re.finditer(html)][:40]
+    for pos in positions:
+        a = max(0, pos - 5000)
+        b = min(len(html), pos + 5000)
+        window = html[a:b]
+        low = window.lower()
+        if not any(
+            marker in low
+            for marker in (
+                "profile",
+                "user",
+                "person",
+                "fb://profile/",
+                "profile.php?id=",
+                "profile_id",
+                "user_id",
+                "profile_uid",
+            )
+        ):
+            continue
+        generic = re.compile(
+            r'(?:["\']id["\']|(?<![A-Za-z0-9_$])id(?![A-Za-z0-9_$]))'
+            r'\s*[:=]\s*["\']?(\d{5,30})["\']?',
+            re.I,
+        )
+        for m in generic.finditer(window):
+            value = m.group(1)
+            if not is_numeric_id(value):
+                continue
+            # Reject obvious content/entity semantics surrounding this id.
+            around = clean_text(window[max(0, m.start()-700):m.end()+700]).lower()
+            if any(
+                marker in around
+                for marker in (
+                    "post_id", "comment_id", "media_fbid", "story_fbid",
+                    "video_id", "reel_id", "photo_id", "album_id",
+                    "group_id", "page_id", "event_id",
+                )
+            ):
+                continue
+            collector.add(
+                value,
+                role="USER_CANDIDATE",
+                source=source,
+                key="id@profile_username",
+                weight=142,
+                neighbor=around[:2400],
+                entity_type="USER",
+            )
+
+    # Public HTML sometimes contains a profile link and a separate numeric id
+    # in the same anchor/container rather than in JSON.
+    profile_link_id = re.compile(
+        r'(?:href|data-href|data-url)\s*=\s*["\'][^"\']*'
+        r'(?:profile\.php\?[^"\']*?id=)(\d{5,30})',
+        re.I,
+    )
+    for m in profile_link_id.finditer(html):
+        value = m.group(1)
+        if not is_numeric_id(value):
+            continue
+        a = max(0, m.start() - 2500)
+        b = min(len(html), m.end() + 2500)
+        window = html[a:b]
+        if not user_re.search(window):
+            continue
+        collector.add(
+            value,
+            role="USER_CANDIDATE",
+            source=source,
+            key="profile.php?id@username",
+            weight=148,
+            neighbor=clean_text(window[:2200]),
             entity_type="USER",
         )
 
@@ -4504,6 +4645,9 @@ class IdentityVerifier:
                     "profileownerid",
                     "uid",
                     "id@username_route",
+                    "id@profile_username",
+                    "profile_username_explicit_id",
+                    "profile.php?id@username",
                     "id@user",
                     "profile.php?id",
                     "data-user-id",
@@ -4598,6 +4742,9 @@ class IdentityVerifier:
                     "from.id",
                     "id",
                     "id@username_route",
+                    "id@profile_username",
+                    "profile_username_explicit_id",
+                    "profile.php?id@username",
                     "id@user",
                     "profile.php?id",
                     "data-user-id",
@@ -5132,6 +5279,10 @@ class FacebookResolver:
         ).lstrip("@").strip()
         if shape.kind == "PROFILE" and profile_username:
             encoded_username = quote(profile_username, safe="@.*-")
+            # IMPORTANT: profile identity probes must run FIRST.  The previous
+            # implementation appended them after arbitrary profile links from
+            # the landing HTML, so MAX_PROFILE_CHECKS could be exhausted before
+            # the resolver ever fetched the user's own profile.
             deep_profile_variants = []
             for host in (
                 "www.facebook.com",
@@ -5145,12 +5296,19 @@ class FacebookResolver:
                     "/photos",
                     "/videos",
                     "/reels",
+                    "/about_contact_and_basic_info",
                 ):
                     deep_profile_variants.append(
                         f"https://{host}/{encoded_username}{suffix}"
                     )
+                deep_profile_variants.extend([
+                    f"https://{host}/{encoded_username}?sk=about",
+                    f"https://{host}/{encoded_username}?sk=profile",
+                ])
+            # Own-profile probes first, discovered third-party profile links
+            # only after them.
             profile_urls = unique_keep_order(
-                profile_urls + deep_profile_variants
+                deep_profile_variants + profile_urls
             )
 
         profile_snapshots = []
@@ -5194,6 +5352,12 @@ class FacebookResolver:
                 ps,
                 collector,
             )
+            if shape.kind == "PROFILE" and profile_username:
+                scan_profile_uid_correlation(
+                    ps,
+                    collector,
+                    profile_username,
+                )
             scan_html_profile_links(
                 ps,
                 collector,
@@ -5216,6 +5380,17 @@ class FacebookResolver:
                     source="profile_meta",
                     weight=90,
                 )
+        # Run the dedicated username↔generic-id correlation over EVERY profile
+        # snapshot, including the original target snapshot that may have been
+        # reused instead of fetched again.
+        if shape.kind == "PROFILE" and profile_username:
+            for ps in profile_snapshots:
+                scan_profile_uid_correlation(
+                    ps,
+                    collector,
+                    profile_username,
+                )
+
         # No separate weak fallback is needed: the deep sweep above already
         # covers mobile/basic/public profile representations and all of the
         # important public profile tabs.

@@ -6262,11 +6262,6 @@ def format_result(
                 "│ Story token: "
                 f"<code>{tg_escape(result.story_token)}</code>"
             )
-        if result.story_token_decoded:
-            lines.append(
-                "│ Decoded   : "
-                f"<code>{tg_escape(truncate(result.story_token_decoded, 180))}</code>"
-            )
         if result.album_id:
             lines.append(
                 "│ Album ID  : "
@@ -6427,60 +6422,118 @@ async def wait_for_next_facebook_url(
     bot,
     event,
     timeout: int = SESSION_TIMEOUT,
+    stop_event: Optional[asyncio.Event] = None,
 ):
     """
-    Telethon-compatible replacement for wait_for().
-    Không dùng:
-    bot.wait_for()
-    Vì TelegramClient của Telethon
-    không có API này.
+    Chờ URL Facebook tiếp theo của đúng user + chat.
+
+    Telethon không có bot.wait_for(), nên dùng temporary NewMessage
+    handler. stop_event cho phép /stop ngắt vòng lặp ngay lập tức.
     """
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     chat_id = event.chat_id
     sender_id = event.sender_id
-    session_key = (
-        int(chat_id or 0),
-        int(sender_id or 0),
-    )
+
     async def callback(new_event):
         try:
             if new_event.chat_id != chat_id:
                 return
             if new_event.sender_id != sender_id:
                 return
+
             text = (
                 new_event.raw_text
                 or ""
             ).strip()
+
             if not text:
                 return
+
+            # /stop được xử lý bởi handler /stop riêng. Không coi nó là URL.
+            if re.fullmatch(
+                r"/stop(?:@\w+)?",
+                text,
+                flags=re.I,
+            ):
+                return
+
             urls = extract_urls(text)
             if not urls:
                 return
+
             if not future.done():
-                future.set_result(
-                    urls
-                )
+                future.set_result(urls)
+
         except Exception:
             LOGGER.debug(
                 "follow-up callback error: %r",
                 new_event,
                 exc_info=True,
             )
+
     handler = events.NewMessage()
     bot.add_event_handler(
         callback,
         handler,
     )
+
+    wait_task = None
+    stop_task = None
+
     try:
-        return await asyncio.wait_for(
-            future,
-            timeout=timeout,
+        wait_task = asyncio.create_task(
+            asyncio.wait_for(
+                future,
+                timeout=timeout,
+            )
         )
-    except asyncio.TimeoutError:
+
+        tasks = [wait_task]
+
+        if stop_event is not None:
+            stop_task = asyncio.create_task(
+                stop_event.wait()
+            )
+            tasks.append(stop_task)
+
+        done, pending = await asyncio.wait(
+            tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if stop_task is not None and stop_task in done:
+            return None
+
+        if wait_task in done:
+            try:
+                return wait_task.result()
+            except asyncio.TimeoutError:
+                return []
+
         return []
+
     finally:
+        for task in (
+            wait_task,
+            stop_task,
+        ):
+            if task is not None and not task.done():
+                task.cancel()
+
+        for task in (
+            wait_task,
+            stop_task,
+        ):
+            if task is not None:
+                try:
+                    await task
+                except (
+                    asyncio.CancelledError,
+                    asyncio.TimeoutError,
+                ):
+                    pass
+
         try:
             bot.remove_event_handler(
                 callback,
@@ -6488,10 +6541,11 @@ async def wait_for_next_facebook_url(
             )
         except Exception:
             LOGGER.debug(
-                "Unable to remove temporary "
-                "Telethon handler",
+                "Unable to remove temporary Telethon handler",
                 exc_info=True,
             )
+
+
 def get_command_args(
     text: str,
 ) -> str:
@@ -6508,6 +6562,8 @@ def get_command_args(
         m.group(1)
         or ""
     ).strip()
+
+
 async def resolve_async(
     url: str,
 ) -> ResolveResult:
@@ -6515,12 +6571,15 @@ async def resolve_async(
         _resolver.resolve,
         url,
     )
+
+
 async def resolve_many(
     urls: List[str],
 ) -> List[ResolveResult]:
     semaphore = asyncio.Semaphore(
         CONCURRENCY
     )
+
     async def worker(
         url: str,
     ) -> ResolveResult:
@@ -6544,26 +6603,136 @@ async def resolve_many(
                         "kiểm tra URL."
                     ],
                 )
+
     tasks = [
         asyncio.create_task(
             worker(url)
         )
         for url in urls
     ]
+
     return await asyncio.gather(
         *tasks
     )
+
+
+_resolver = FacebookResolver()
+_pending_lock = asyncio.Lock()
+
+# Mỗi (chat_id, sender_id) có đúng 1 phiên getuidfb.
+# /stop chỉ dừng phiên của chính user đó, không ảnh hưởng user khác.
+_active_sessions: Dict[
+    Tuple[int, int],
+    Dict[str, Any],
+] = {}
+
+
+async def _cleanup_getuidfb_session(
+    session_key: Tuple[int, int],
+    task: Optional[asyncio.Task] = None,
+):
+    async with _pending_lock:
+        current = _active_sessions.get(
+            session_key
+        )
+        if not current:
+            return
+
+        current_task = current.get("task")
+
+        if (
+            task is None
+            or current_task is task
+            or current_task is None
+        ):
+            _active_sessions.pop(
+                session_key,
+                None,
+            )
+
+
 def register(
     bot,
     notify_bot=None,
 ):
     """
     Telethon command registration.
-    REQUIRED BY:
-    commands/__init__.py
-    Example:
-        module.register(bot, notify_bot)
+
+    /getuidfb
+        -> mở phiên tương tác
+        -> nhận URL
+        -> trả kết quả
+        -> tự động chờ URL tiếp theo
+
+    /getuidfb <url>
+        -> xử lý URL ngay
+        -> sau kết quả vẫn tiếp tục chờ URL tiếp theo
+
+    /stop
+        -> dừng vòng lặp getuidfb của đúng user trong đúng chat.
     """
+
+    @bot.on(
+        events.NewMessage(
+            pattern=r"^/stop(?:@\w+)?$"
+        )
+    )
+    async def getuidfb_stop_handler(
+        event,
+    ):
+        sender_id = (
+            event.sender_id
+            or 0
+        )
+        chat_id = (
+            event.chat_id
+            or sender_id
+        )
+        session_key = (
+            int(chat_id),
+            int(sender_id),
+        )
+
+        async with _pending_lock:
+            session = _active_sessions.get(
+                session_key
+            )
+            if not session:
+                return
+
+            session["stopped"] = True
+            stop_event = session.get(
+                "stop_event"
+            )
+            task = session.get(
+                "task"
+            )
+
+            if stop_event is not None:
+                stop_event.set()
+
+            if (
+                task is not None
+                and task is not asyncio.current_task()
+                and not task.done()
+            ):
+                task.cancel()
+
+        try:
+            await event.reply(
+                (
+                    "🛑 <b>GETUIDFB ĐÃ DỪNG</b>\n\n"
+                    "Vòng lặp của bạn đã được ngưng.\n"
+                    "Dùng <code>/getuidfb</code> để bắt đầu lại."
+                ),
+                parse_mode="html",
+            )
+        except Exception:
+            LOGGER.debug(
+                "Unable to send GETUIDFB stop message",
+                exc_info=True,
+            )
+
     @bot.on(
         events.NewMessage(
             pattern=r"^/getuidfb(?:@\w+)?(?:\s+.*)?$"
@@ -6585,34 +6754,82 @@ def register(
             int(chat_id),
             int(sender_id),
         )
+
+        current_task = asyncio.current_task()
+
+        # Mỗi user chỉ có 1 vòng lặp.
+        # Nếu user gửi /getuidfb lần nữa, phiên cũ bị thay thế.
+        old_task = None
+        async with _pending_lock:
+            old_session = _active_sessions.get(
+                session_key
+            )
+            if old_session:
+                old_session["stopped"] = True
+                old_stop_event = old_session.get(
+                    "stop_event"
+                )
+                if old_stop_event is not None:
+                    old_stop_event.set()
+                old_task = old_session.get(
+                    "task"
+                )
+
+            stop_event = asyncio.Event()
+
+            _active_sessions[
+                session_key
+            ] = {
+                "task": current_task,
+                "stop_event": stop_event,
+                "stopped": False,
+                "started": time.time(),
+            }
+
+        if (
+            old_task is not None
+            and old_task is not current_task
+            and not old_task.done()
+        ):
+            old_task.cancel()
+
         try:
             args = get_command_args(
                 event.raw_text
             )
-            if args:
-                urls = extract_urls(
-                    args
-                )
-            else:
-                async with _pending_lock:
-                    if (
-                        session_key
-                        in _pending_sessions
-                    ):
-                        return
-                    _pending_sessions[
-                        session_key
-                    ] = time.time()
-                prompt = None
-                try:
-                    prompt = await event.reply(
-                        (
-                            "🔎 <b>"
-                            "FACEBOOK FORENSIC "
-                            "RESOLVER V60"
-                            "</b>\n\n"
-                            "📩 Hãy gửi link "
-                            "Facebook cần kiểm tra."
+
+            first_urls = (
+                extract_urls(args)
+                if args
+                else []
+            )
+
+            first_round = True
+
+            while not stop_event.is_set():
+                urls = first_urls
+                first_urls = []
+
+                # Không có URL ngay sau /getuidfb -> yêu cầu URL.
+                if not urls:
+                    prompt_text = (
+                        "🔎 <b>FACEBOOK FORENSIC "
+                        "RESOLVER V60</b>\n\n"
+                        "📩 Gửi link Facebook cần kiểm tra."
+                        "\n\n"
+                        "🔁 Sau khi có kết quả, "
+                        "bạn có thể gửi link tiếp ngay."
+                        "\n"
+                        "🛑 Dùng <code>/stop</code> "
+                        "để dừng vòng lặp của riêng bạn."
+                    )
+
+                    if first_round:
+                        prompt_text = (
+                            "🔎 <b>FACEBOOK FORENSIC "
+                            "RESOLVER V60</b>\n\n"
+                            "📩 Hãy gửi link Facebook "
+                            "cần kiểm tra."
                             "\n\n"
                             "🔬 Resolver sẽ phân tích:"
                             "\n"
@@ -6630,212 +6847,279 @@ def register(
                             "\n"
                             "• Correlation và conflict"
                             "\n\n"
-                            "🛡 UID chỉ hiển thị khi "
-                            "đủ bằng chứng."
-                        ),
+                            "🔁 Có kết quả xong → "
+                            "gửi URL tiếp, không cần /getuidfb."
+                            "\n"
+                            "🛑 <code>/stop</code> để dừng."
+                        )
+
+                    prompt = await event.reply(
+                        prompt_text,
                         parse_mode="html",
                     )
-                    urls = (
-                        await wait_for_next_facebook_url(
-                            bot,
-                            event,
-                            SESSION_TIMEOUT,
-                        )
+
+                    urls = await wait_for_next_facebook_url(
+                        bot,
+                        event,
+                        SESSION_TIMEOUT,
+                        stop_event,
                     )
+
+                    if urls is None:
+                        # /stop
+                        return
+
                     if not urls:
                         if prompt:
                             try:
                                 await prompt.edit(
                                     (
-                                        "⌛ <b>"
-                                        "Hết thời gian chờ."
-                                        "</b>\n\n"
-                                        "Dùng lại:\n"
-                                        "<code>/getuidfb</code>"
+                                        "⌛ <b>Phiên "
+                                        "GETUIDFB hết thời gian chờ.</b>\n\n"
+                                        "Dùng <code>/getuidfb</code> "
+                                        "để bắt đầu lại."
                                     ),
                                     parse_mode="html",
                                 )
                             except Exception:
                                 pass
                         return
-                finally:
-                    async with _pending_lock:
-                        _pending_sessions.pop(
-                            session_key,
-                            None,
-                        )
-            if not urls:
-                await event.reply(
+
+                first_round = False
+
+                if stop_event.is_set():
+                    return
+
+                urls = unique_keep_order(
+                    [
+                        normalize_facebook_url(x)
+                        for x in urls
+                        if x
+                    ]
+                )
+
+                if not urls:
+                    continue
+
+                skipped = 0
+
+                if len(urls) > MAX_INPUT_URLS:
+                    skipped = (
+                        len(urls)
+                        - MAX_INPUT_URLS
+                    )
+                    urls = urls[
+                        :MAX_INPUT_URLS
+                    ]
+
+                processing = await event.reply(
                     (
-                        "⚠️ <b>"
-                        "Không tìm thấy link "
-                        "Facebook hợp lệ."
-                        "</b>\n\n"
-                        "Ví dụ:\n"
-                        "<code>"
-                        "/getuidfb "
-                        "https://www.facebook.com/..."
-                        "</code>"
+                        "🔬 <b>ĐANG PHÂN TÍCH "
+                        "FACEBOOK</b>\n\n"
+                        f"🔗 URL: <b>{len(urls)}</b>\n"
+                        "↪️ Redirect / canonical\n"
+                        "🧩 Route classification\n"
+                        "📄 HTML / Meta\n"
+                        "🧠 JSON / JSON-LD\n"
+                        "🎯 Identity correlation\n"
+                        "🛡 Strict UID verification"
                     ),
                     parse_mode="html",
                 )
-                return
-            urls = unique_keep_order(
-                [
-                    normalize_facebook_url(x)
-                    for x in urls
-                    if x
-                ]
-            )
-            skipped = 0
-            if len(urls) > MAX_INPUT_URLS:
-                skipped = (
-                    len(urls)
-                    - MAX_INPUT_URLS
-                )
-                urls = urls[
-                    :MAX_INPUT_URLS
-                ]
-            processing = await event.reply(
-                (
-                    "🔬 <b>"
-                    "ĐANG PHÂN TÍCH FACEBOOK"
-                    "</b>\n\n"
-                    f"🔗 URL: <b>{len(urls)}</b>\n"
-                    "↪️ Redirect / canonical\n"
-                    "🧩 Route classification\n"
-                    "📄 HTML / Meta\n"
-                    "🧠 JSON / JSON-LD\n"
-                    "🎯 Identity correlation\n"
-                    "🛡 Strict UID verification"
-                ),
-                parse_mode="html",
-            )
-            results = await resolve_many(
-                urls
-            )
-            blocks = []
-            for index, result in enumerate(
-                results,
-                start=1,
-            ):
+
                 try:
-                    block = format_result(
-                        index,
-                        result,
+                    results = await resolve_many(
+                        urls
                     )
-                except Exception:
-                    LOGGER.exception(
-                        "format_result failed"
-                    )
-                    block = (
-                        "╭──────────────────────────\n"
-                        f"│ 🔎 <b>"
-                        f"FACEBOOK RESOLVER #{index}"
-                        f"</b>\n"
-                        "├──────────────────────────\n"
-                        "│ ❌ Không thể định dạng kết quả.\n"
-                        "│ UID đã được bảo vệ, không suy đoán.\n"
-                        "╰──────────────────────────"
-                    )
-                blocks.append(block)
-            verified_count = sum(
-                1
-                for result in results
-                if result.verified
-            )
-            header = (
-                "🔎 <b>"
-                "FACEBOOK FORENSIC RESULT"
-                "</b>\n"
-                f"📊 Đã kiểm tra: "
-                f"<b>{len(results)}</b>\n"
-                f"✅ Verified: "
-                f"<b>{verified_count}</b>\n"
-                f"⏱ Tổng thời gian: "
-                f"<b>"
-                f"{time.perf_counter() - started:.2f}"
-                f"s</b>"
-            )
-            if skipped:
-                header += (
-                    "\n⚠️ Bỏ qua: "
-                    f"<b>{skipped}</b> "
-                    "URL vượt giới hạn."
+                except asyncio.CancelledError:
+                    raise
+
+                if stop_event.is_set():
+                    return
+
+                blocks = []
+
+                for index, result in enumerate(
+                    results,
+                    start=1,
+                ):
+                    try:
+                        block = format_result(
+                            index,
+                            result,
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "format_result failed"
+                        )
+                        block = (
+                            "╭──────────────────────────\n"
+                            f"│ 🔎 <b>FACEBOOK "
+                            f"RESOLVER #{index}</b>\n"
+                            "├──────────────────────────\n"
+                            "│ ❌ Không thể định dạng kết quả.\n"
+                            "│ UID đã được bảo vệ, không suy đoán.\n"
+                            "╰──────────────────────────"
+                        )
+
+                    blocks.append(block)
+
+                verified_count = sum(
+                    1
+                    for result in results
+                    if result.verified
                 )
-            final_text = (
-                header
-                + "\n\n"
-                + "\n\n".join(blocks)
-            )
-            if len(final_text) <= 3900:
-                await processing.edit(
-                    final_text,
-                    parse_mode="html",
+
+                header = (
+                    "🔎 <b>FACEBOOK FORENSIC RESULT</b>\n"
+                    f"📊 Đã kiểm tra: <b>{len(results)}</b>\n"
+                    f"✅ Verified: <b>{verified_count}</b>\n"
+                    f"⏱ Tổng thời gian: "
+                    f"<b>{time.perf_counter() - started:.2f}s</b>"
                 )
-            else:
-                chunks = []
-                current = header
-                for block in blocks:
-                    candidate = (
-                        current
-                        + "\n\n"
-                        + block
+
+                if skipped:
+                    header += (
+                        "\n⚠️ Bỏ qua: "
+                        f"<b>{skipped}</b> URL vượt giới hạn."
                     )
-                    if len(candidate) > 3900:
-                        if current.strip():
-                            chunks.append(
-                                current
-                            )
-                        current = block
-                    else:
-                        current = candidate
-                if current.strip():
-                    chunks.append(
-                        current
-                    )
-                if chunks:
+
+                final_text = (
+                    header
+                    + "\n\n"
+                    + "\n\n".join(blocks)
+                )
+
+                if len(final_text) <= 3900:
                     await processing.edit(
-                        chunks[0],
+                        final_text,
                         parse_mode="html",
                     )
-                    for chunk in chunks[1:]:
-                        await event.respond(
-                            chunk,
+                else:
+                    chunks = []
+                    current = header
+
+                    for block in blocks:
+                        candidate = (
+                            current
+                            + "\n\n"
+                            + block
+                        )
+
+                        if len(candidate) > 3900:
+                            if current.strip():
+                                chunks.append(
+                                    current
+                                )
+                            current = block
+                        else:
+                            current = candidate
+
+                    if current.strip():
+                        chunks.append(
+                            current
+                        )
+
+                    if chunks:
+                        await processing.edit(
+                            chunks[0],
                             parse_mode="html",
                         )
-            if notify_bot:
+
+                        for chunk in chunks[1:]:
+                            await event.respond(
+                                chunk,
+                                parse_mode="html",
+                            )
+
+                if notify_bot:
+                    try:
+                        await notify_bot(
+                            event,
+                            (
+                                "getuidfb | "
+                                f"{len(results)} URL | "
+                                f"{verified_count} verified"
+                            ),
+                        )
+                    except Exception:
+                        LOGGER.debug(
+                            "notify_bot failed",
+                            exc_info=True,
+                        )
+
+                if stop_event.is_set():
+                    return
+
+                # ====================================================
+                # ĐIỂM QUAN TRỌNG:
+                # Không return sau khi có kết quả.
+                # Quay lại while để nhận URL tiếp theo.
+                # ====================================================
+                await asyncio.sleep(0)
+
                 try:
-                    await notify_bot(
-                        event,
+                    await event.reply(
                         (
-                            "getuidfb | "
-                            f"{len(results)} URL | "
-                            f"{verified_count} verified"
+                            "🔁 <b>SẴN SÀNG URL TIẾP THEO</b>\n\n"
+                            "📩 Gửi link Facebook tiếp theo."
+                            "\n"
+                            "Không cần <code>/getuidfb</code> lại."
+                            "\n\n"
+                            "🛑 <code>/stop</code> để dừng vòng lặp."
                         ),
+                        parse_mode="html",
                     )
                 except Exception:
                     LOGGER.debug(
-                        "notify_bot failed",
+                        "Unable to send next-URL prompt",
                         exc_info=True,
                     )
+
+                next_urls = await wait_for_next_facebook_url(
+                    bot,
+                    event,
+                    SESSION_TIMEOUT,
+                    stop_event,
+                )
+
+                if next_urls is None:
+                    return
+
+                if not next_urls:
+                    try:
+                        await event.reply(
+                            (
+                                "⌛ <b>Phiên GETUIDFB hết "
+                                "thời gian chờ.</b>\n\n"
+                                "Dùng <code>/getuidfb</code> "
+                                "để bắt đầu lại."
+                            ),
+                            parse_mode="html",
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                first_urls = next_urls
+
+        except asyncio.CancelledError:
+            LOGGER.info(
+                "GETUIDFB session stopped: %s",
+                session_key,
+            )
+            return
+
         except Exception as exc:
             LOGGER.exception(
                 "GETUIDFB HANDLER ERROR"
             )
-            async with _pending_lock:
-                _pending_sessions.pop(
-                    session_key,
-                    None,
-                )
+
             try:
                 await event.reply(
                     (
-                        "❌ <b>"
-                        "FACEBOOK RESOLVER"
-                        "</b>\n\n"
-                        "Đã xảy ra lỗi khi xử lý "
-                        "yêu cầu.\n\n"
+                        "❌ <b>FACEBOOK RESOLVER</b>\n\n"
+                        "Đã xảy ra lỗi khi xử lý yêu cầu.\n\n"
                         "🛡 Resolver không suy đoán UID "
                         "khi dữ liệu chưa đủ.\n\n"
                         "<code>"
@@ -6851,9 +7135,16 @@ def register(
                 )
             except Exception:
                 LOGGER.exception(
-                    "Unable to send "
-                    "GETUIDFB error"
+                    "Unable to send GETUIDFB error"
                 )
+
+        finally:
+            await _cleanup_getuidfb_session(
+                session_key,
+                current_task,
+            )
+
+
 COMMAND_INFO = {
     "command": "getuidfb",
     "description": (

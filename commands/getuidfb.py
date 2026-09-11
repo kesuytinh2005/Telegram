@@ -34,6 +34,8 @@ Không bao giờ đoán UID khi evidence không đủ.
 """
 from __future__ import annotations
 import asyncio
+import base64
+import binascii
 import html as html_lib
 import json
 import logging
@@ -94,7 +96,6 @@ FACEBOOK_HOSTS = {
 TRACKING_PARAMS = {
     "fbclid",
     "rdid",
-    "share_url",
     "refsrc",
     "ref",
     "refid",
@@ -120,6 +121,8 @@ PRESERVE_PARAMS = {
     "set",
     "album_id",
     "photo_id",
+    "next",
+    "share_url",
 }
 GENERIC_NAMES = {
     "",
@@ -412,6 +415,103 @@ def extract_numeric_ids(
             text,
         )
     )
+def decode_facebook_opaque_token(token: str) -> Dict[str, str]:
+    """Decode known public Facebook opaque/base64 Story tokens."""
+    token = clean_text(token).strip().strip("/?#&\"'")
+    if not token or len(token) < 8 or len(token) > 500:
+        return {}
+    compact = re.sub(r"\s+", "", token).replace("-", "+").replace("_", "/")
+    compact += "=" * ((4 - len(compact) % 4) % 4)
+    try:
+        decoded = base64.b64decode(compact, validate=False).decode(
+            "utf-8", errors="strict"
+        ).strip()
+    except (ValueError, UnicodeError, binascii.Error):
+        return {}
+    if not decoded:
+        return {}
+    info = {"token": token, "decoded": decoded, "type": "", "id": ""}
+    m = re.fullmatch(r"S:_ISC:(\d{5,30})", decoded, re.I)
+    if m:
+        info["type"] = "STORY"
+        info["id"] = m.group(1)
+        return info
+    m = re.search(r"(?<!\d)(\d{5,30})(?!\d)$", decoded)
+    if m:
+        info["id"] = m.group(1)
+    if decoded[:2].upper() == "S:":
+        info["type"] = "STORY"
+    return info
+
+
+def extract_story_token_info(url: str) -> Dict[str, str]:
+    """Extract/decode Story tokens from direct or nested public FB URLs."""
+    if not url:
+        return {}
+    queue = [str(url)]
+    seen: Set[str] = set()
+    while queue and len(seen) < 16:
+        raw = html_lib.unescape(unquote(queue.pop(0)))
+        if raw in seen:
+            continue
+        seen.add(raw)
+        try:
+            parsed = urlparse(raw)
+        except Exception:
+            parsed = None
+        if not parsed:
+            continue
+        # Raw-text route scan handles index.php?next=<URL> where the nested
+        # URL itself contains unescaped "&" parameters and parse_qs truncates it.
+        raw_story = re.search(
+            r'/stories/([^/?&#\\s]+)/([A-Za-z0-9_-]{10,200}={0,2})(?:[/?&#\\s]|$)',
+            raw,
+            re.I,
+        )
+        if raw_story:
+            owner = unquote(raw_story.group(1))
+            token = raw_story.group(2)
+            info = decode_facebook_opaque_token(token)
+            if info:
+                info["owner_id"] = owner if is_numeric_id(owner) else ""
+                info["story_route"] = raw_story.group(0).rstrip("/?#&")
+                if info.get("type") == "STORY" and info.get("id"):
+                    return info
+
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        for key in ("next", "share_url", "url", "target", "redirect"):
+            for value in query.get(key, []):
+                value = html_lib.unescape(unquote(value))
+                if value and value not in seen:
+                    queue.append(value)
+        parts = [unquote(x) for x in (parsed.path or "").split("/") if x]
+        lower = [x.lower() for x in parts]
+        if "stories" in lower:
+            idx = lower.index("stories")
+            tail = parts[idx + 1:]
+            owner = tail[0] if tail else ""
+            token = tail[1] if len(tail) >= 2 else ""
+            if token:
+                info = decode_facebook_opaque_token(token)
+                if info:
+                    info["owner_id"] = owner if is_numeric_id(owner) else ""
+                    info["story_route"] = raw
+                    if info.get("type") == "STORY" and info.get("id"):
+                        return info
+        for key in ("story_fbid", "fbid", "story_id", "story_token"):
+            for value in query.get(key, []):
+                info = decode_facebook_opaque_token(value)
+                if info:
+                    info["owner_id"] = query.get("id", [""])[0]
+                    if info.get("type") == "STORY" and info.get("id"):
+                        return info
+        for token in re.findall(r"\b[A-Za-z0-9_-]{20,120}={0,2}\b", raw):
+            info = decode_facebook_opaque_token(token)
+            if info.get("type") == "STORY" and info.get("id"):
+                return info
+    return {}
+
+
 def generic_name(value: str) -> bool:
     value = clean_text(value)
     if not value:
@@ -487,6 +587,9 @@ class URLShape:
     reel_id: str = ""
     photo_id: str = ""
     story_id: str = ""
+    story_token: str = ""
+    story_token_decoded: str = ""
+    story_token_type: str = ""
     group_id: str = ""
     page_id: str = ""
     album_id: str = ""
@@ -576,6 +679,19 @@ class URLParser:
             if x
         ]
         shape.segments = segments
+        story_info = extract_story_token_info(url)
+        if story_info:
+            shape.story_token = story_info.get("token", "")
+            shape.story_token_decoded = story_info.get("decoded", "")
+            shape.story_token_type = story_info.get("type", "")
+            if story_info.get("id") and not shape.story_id:
+                shape.story_id = story_info["id"]
+            if is_numeric_id(story_info.get("owner_id", "")):
+                shape.numeric_path_id = story_info["owner_id"]
+                shape.route_entity = "USER"
+            if shape.story_token_type == "STORY":
+                shape.kind = "STORY"
+                shape.route_confidence = max(shape.route_confidence, 99)
         lower = [
             x.lower()
             for x in segments
@@ -4967,6 +5083,9 @@ class ResolveResult:
     reel_id: str = ""
     photo_id: str = ""
     story_id: str = ""
+    story_token: str = ""
+    story_token_decoded: str = ""
+    story_token_type: str = ""
     album_id: str = ""
     publisher_id: str = ""
     uid: str = ""
@@ -5092,6 +5211,24 @@ class FacebookResolver:
             canonical_url=url,
             content_url=url,
         )
+        story_info = extract_story_token_info(url)
+        if story_info:
+            result.story_token = story_info.get("token", "")
+            result.story_token_decoded = story_info.get("decoded", "")
+            result.story_token_type = story_info.get("type", "")
+            if story_info.get("id"):
+                result.story_id = story_info["id"]
+            if is_numeric_id(story_info.get("owner_id", "")):
+                shape.numeric_path_id = story_info["owner_id"]
+                shape.route_entity = "USER"
+            if story_info.get("type") == "STORY":
+                shape.kind = "STORY"
+                shape.story_id = story_info.get("id", "") or shape.story_id
+                result.content_type = "STORY"
+                result.signals.append("base64 story token → decoded STORY ID")
+                result.notes.append(
+                    "Decoded Story token từ URL gốc; Story ID được giữ độc lập với UID publisher."
+                )
         snapshot = self.fetcher.fetch(
             url
         )
@@ -5609,7 +5746,9 @@ class FacebookResolver:
         )
         result.bio = profile.bio
         result.content_type = (
-            content.content_type
+            "STORY"
+            if result.story_token_type == "STORY"
+            else content.content_type
         )
         result.post_id = (
             content.post_id
@@ -5625,6 +5764,15 @@ class FacebookResolver:
         )
         result.story_id = (
             content.story_id
+            or result.story_id
+            or shape.story_id
+        )
+        result.story_token = result.story_token or shape.story_token
+        result.story_token_decoded = (
+            result.story_token_decoded or shape.story_token_decoded
+        )
+        result.story_token_type = (
+            result.story_token_type or shape.story_token_type
         )
         result.album_id = (
             content.album_id
@@ -6108,6 +6256,16 @@ def format_result(
             lines.append(
                 "│ Story ID  : "
                 f"<code>{tg_escape(result.story_id)}</code>"
+            )
+        if result.story_token:
+            lines.append(
+                "│ Story token: "
+                f"<code>{tg_escape(result.story_token)}</code>"
+            )
+        if result.story_token_decoded:
+            lines.append(
+                "│ Decoded   : "
+                f"<code>{tg_escape(truncate(result.story_token_decoded, 180))}</code>"
             )
         if result.album_id:
             lines.append(

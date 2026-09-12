@@ -384,26 +384,30 @@ def looks_like_url(value: str) -> bool:
         )
     )
 def extract_urls(text: str) -> List[str]:
+    """Extract Facebook URLs, including concatenated URLs without newlines."""
     if not text:
         return []
+
     pattern = re.compile(
-        r"https?://[^\s<>\[\]{}]+",
+        r"https?://(?:(?!https?://)[^\s<>\[\]{}])+",
         re.I,
     )
+
     found = []
-    for match in pattern.findall(text):
-        url = match.strip()
-        url = url.rstrip(
-            ".,!?;:)]}'\""
-        )
+    for match in pattern.finditer(text):
+        url = match.group(0).strip()
+        url = url.rstrip(".,!?;:)]}'\"")
         if looks_like_url(url):
             found.append(url)
+
     return unique_keep_order(
         [
             normalize_facebook_url(x)
             for x in found
+            if x
         ]
     )
+
 def extract_numeric_ids(
     text: str,
 ) -> List[str]:
@@ -6912,140 +6916,136 @@ def register(
                         :MAX_INPUT_URLS
                     ]
 
-                processing = await event.reply(
-                    (
-                        "🔬 <b>ĐANG PHÂN TÍCH "
-                        "FACEBOOK</b>\n\n"
-                        f"🔗 URL: <b>{len(urls)}</b>\n"
-                        "↪️ Redirect / canonical\n"
-                        "🧩 Route classification\n"
-                        "📄 HTML / Meta\n"
-                        "🧠 JSON / JSON-LD\n"
-                        "🎯 Identity correlation\n"
-                        "🛡 Strict UID verification"
-                    ),
-                    parse_mode="html",
-                )
+                # Mỗi URL có một message riêng. Chạy song song và gửi ngay
+                # kết quả của URL nào hoàn thành trước, không dồn report.
+                resolve_tasks = {}
 
-                try:
-                    results = await resolve_many(
-                        urls
-                    )
-                except asyncio.CancelledError:
-                    raise
+                for index, url in enumerate(urls, start=1):
+                    if stop_event.is_set():
+                        return
 
-                if stop_event.is_set():
-                    return
-
-                blocks = []
-
-                for index, result in enumerate(
-                    results,
-                    start=1,
-                ):
-                    try:
-                        block = format_result(
-                            index,
-                            result,
-                        )
-                    except Exception:
-                        LOGGER.exception(
-                            "format_result failed"
-                        )
-                        block = (
-                            "╭──────────────────────────\n"
-                            f"│ 🔎 <b>FACEBOOK "
-                            f"RESOLVER #{index}</b>\n"
-                            "├──────────────────────────\n"
-                            "│ ❌ Không thể định dạng kết quả.\n"
-                            "│ UID đã được bảo vệ, không suy đoán.\n"
-                            "╰──────────────────────────"
-                        )
-
-                    blocks.append(block)
-
-                verified_count = sum(
-                    1
-                    for result in results
-                    if result.verified
-                )
-
-                header = (
-                    "🔎 <b>FACEBOOK FORENSIC RESULT</b>\n"
-                    f"📊 Đã kiểm tra: <b>{len(results)}</b>\n"
-                    f"✅ Verified: <b>{verified_count}</b>\n"
-                    f"⏱ Tổng thời gian: "
-                    f"<b>{time.perf_counter() - started:.2f}s</b>"
-                )
-
-                if skipped:
-                    header += (
-                        "\n⚠️ Bỏ qua: "
-                        f"<b>{skipped}</b> URL vượt giới hạn."
-                    )
-
-                final_text = (
-                    header
-                    + "\n\n"
-                    + "\n\n".join(blocks)
-                )
-
-                if len(final_text) <= 3900:
-                    await processing.edit(
-                        final_text,
+                    started_one = time.perf_counter()
+                    processing = await event.reply(
+                        (
+                            "🔬 <b>ĐANG PHÂN TÍCH FACEBOOK</b>\n\n"
+                            f"🔎 Resolver #{index}\n"
+                            "↪️ Redirect / canonical\n"
+                            "🧩 Route classification\n"
+                            "📄 HTML / Meta\n"
+                            "🧠 JSON / JSON-LD\n"
+                            "🎯 Identity correlation\n"
+                            "🛡 Strict UID verification"
+                        ),
                         parse_mode="html",
                     )
-                else:
-                    chunks = []
-                    current = header
 
-                    for block in blocks:
-                        candidate = (
-                            current
-                            + "\n\n"
-                            + block
+                    task = asyncio.create_task(resolve_async(url))
+                    resolve_tasks[task] = (
+                        index,
+                        url,
+                        processing,
+                        started_one,
+                    )
+
+                stop_wait_task = asyncio.create_task(stop_event.wait())
+
+                try:
+                    while resolve_tasks:
+                        done, _ = await asyncio.wait(
+                            [*resolve_tasks.keys(), stop_wait_task],
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
 
-                        if len(candidate) > 3900:
-                            if current.strip():
-                                chunks.append(
-                                    current
-                                )
-                            current = block
-                        else:
-                            current = candidate
-
-                    if current.strip():
-                        chunks.append(
-                            current
-                        )
-
-                    if chunks:
-                        await processing.edit(
-                            chunks[0],
-                            parse_mode="html",
-                        )
-
-                        for chunk in chunks[1:]:
-                            await event.respond(
-                                chunk,
-                                parse_mode="html",
+                        if stop_wait_task in done or stop_event.is_set():
+                            for pending_task in resolve_tasks:
+                                if not pending_task.done():
+                                    pending_task.cancel()
+                            await asyncio.gather(
+                                *resolve_tasks.keys(),
+                                return_exceptions=True,
                             )
+                            return
 
-                if notify_bot:
+                        for task in done:
+                            if task is stop_wait_task:
+                                continue
+
+                            info = resolve_tasks.pop(task, None)
+                            if info is None:
+                                continue
+
+                            index, url, processing, started_one = info
+
+                            try:
+                                result = task.result()
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                LOGGER.exception("Resolver worker failed: %s", url)
+                                result = ResolveResult(
+                                    input_url=url,
+                                    canonical_url=url,
+                                    content_url=url,
+                                    status="FETCH_LIMITED",
+                                    notes=["Không thể hoàn tất kiểm tra URL."],
+                                )
+
+                            if stop_event.is_set():
+                                return
+
+                            try:
+                                block = format_result(index, result)
+                            except Exception:
+                                LOGGER.exception("format_result failed")
+                                block = (
+                                    "╭──────────────────────────\n"
+                                    f"│ 🔎 <b>FACEBOOK RESOLVER #{index}</b>\n"
+                                    "├──────────────────────────\n"
+                                    "│ ❌ Không thể định dạng kết quả.\n"
+                                    "│ UID đã được bảo vệ, không suy đoán.\n"
+                                    "╰──────────────────────────"
+                                )
+
+                            verified_count = 1 if result.verified else 0
+                            elapsed_one = time.perf_counter() - started_one
+                            header = (
+                                "🔎 <b>FACEBOOK FORENSIC RESULT</b>\n"
+                                "📊 Đã kiểm tra: <b>1</b>\n"
+                                f"✅ Verified: <b>{verified_count}</b>\n"
+                                f"⏱ Tổng thời gian: <b>{elapsed_one:.2f}s</b>"
+                            )
+                            final_text = header + "\n\n" + block
+
+                            if len(final_text) <= 3900:
+                                await processing.edit(final_text, parse_mode="html")
+                            else:
+                                await processing.edit(header, parse_mode="html")
+                                await event.respond(block, parse_mode="html")
+
+                            if notify_bot:
+                                try:
+                                    await notify_bot(
+                                        event,
+                                        f"getuidfb | 1 URL | {verified_count} verified",
+                                    )
+                                except Exception:
+                                    LOGGER.debug("notify_bot failed", exc_info=True)
+
+                finally:
+                    if not stop_wait_task.done():
+                        stop_wait_task.cancel()
                     try:
-                        await notify_bot(
-                            event,
-                            (
-                                "getuidfb | "
-                                f"{len(results)} URL | "
-                                f"{verified_count} verified"
-                            ),
-                        )
-                    except Exception:
-                        LOGGER.debug(
-                            "notify_bot failed",
-                            exc_info=True,
+                        await stop_wait_task
+                    except asyncio.CancelledError:
+                        pass
+
+                    if resolve_tasks:
+                        for pending_task in resolve_tasks:
+                            if not pending_task.done():
+                                pending_task.cancel()
+                        await asyncio.gather(
+                            *resolve_tasks.keys(),
+                            return_exceptions=True,
                         )
 
                 if stop_event.is_set():

@@ -31,10 +31,41 @@ from telethon import Button, events
 logger = logging.getLogger("commands.download")
 
 COMMAND_INFO = {
-    "name": "download",
-    "command": "/download",
-    "description": "Multi-platform downloader • quality intelligence",
+    "command": "download",
+    "category": "📥 DOWNLOAD",
+    "title": "Tải Video",
+
+    "description": (
+        "Tải video từ nhiều nền tảng bằng yt-dlp "
+        "và module TikTok riêng."
+    ),
+
     "usage": "/download",
+
+    "examples": [
+        "/download",
+    ],
+
+    "details": [
+        "Gửi /download để mở menu tải.",
+        "TikTok video dùng yt-dlp.",
+        "TikTok profile/playlist dùng commands/tiktok.py.",
+        "YouTube video dùng yt-dlp.",
+        "YouTube playlist/channel dùng yt-dlp.",
+        "Dùng /stop để dừng tiến trình.",
+    ],
+
+    "supported": [
+        "TikTok",
+        "YouTube",
+        "Facebook",
+        "Instagram",
+        "X",
+        "Reddit",
+        "Pinterest",
+        "Twitch",
+        "Vimeo",
+    ],
 }
 
 BASE_DIR = Path(os.getenv("DOWNLOAD_DIR", "/tmp/dragon_downloads"))

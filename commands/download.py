@@ -1197,7 +1197,14 @@ def batch_done_text(total: int, completed: int, failed: int, elapsed: float) -> 
         "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
     )
 
-
+async def cancel_tasks(user_id: int):
+    tasks = list(USER_TASKS.get(user_id, set()))
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    USER_TASKS.pop(user_id, None)
 async def start_download(event):
     user_id = event.sender_id
     cleanup_jobs(user_id)

@@ -1081,142 +1081,355 @@ async def run_probe_batch(event, urls):
             USER_TASKS.get(user_id, set()).discard(t)
 
 
+# ============================================================================
+# DOWNLOAD SESSION CONTROLLER
+# ============================================================================
+# IMPORTANT:
+# - URL messages are NEVER handled globally.
+# - A user must explicitly enter /download mode first.
+# - /stop closes that user's download session immediately.
+# - One batch uses ONE status message; it is edited in-place as progress changes.
+# ============================================================================
+
+DOWNLOAD_SESSIONS: dict[int, dict[str, Any]] = {}
+DOWNLOAD_STATUS_MESSAGES: dict[int, Any] = {}
+
+
+def download_session_active(user_id: int) -> bool:
+    session = DOWNLOAD_SESSIONS.get(user_id)
+    if not session:
+        return False
+    return bool(session.get("active"))
+
+
+def close_download_session(user_id: int) -> None:
+    session = DOWNLOAD_SESSIONS.pop(user_id, None)
+    if session:
+        session["active"] = False
+
+
+async def safe_edit_status(message, text: str, **kwargs):
+    if not message:
+        return
+    try:
+        await message.edit(text, **kwargs)
+    except Exception as exc:
+        # Telegram may reject an edit when the content is identical or stale.
+        logger.debug("status edit ignored: %s", exc)
+
+
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    total = max(1, total)
+    done = max(0, min(done, total))
+    filled = round(width * done / total)
+    return "●" * filled + "○" * (width - filled)
+
+
+def batch_header(total: int) -> str:
+    return (
+        "╭━━━〔 📥 DRAGON DOWNLOAD 〕━━━╮\n"
+        "┃\n"
+        f"┃ 🔗 <b>{total}</b> link trong hàng đợi\n"
+        "┃ ⚡ Chế độ: <b>Batch Download</b>\n"
+        "┃ 🎯 Chất lượng: <b>BEST khả dụng</b>\n"
+        "┃ 🔍 yt-dlp + fallback public\n"
+        "┃\n"
+        "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+    )
+
+
+def batch_progress_text(
+    total: int,
+    current: int,
+    url: str,
+    platform: str,
+    completed: int,
+    failed: int,
+    cancelled: bool = False,
+) -> str:
+    if cancelled:
+        title = "🛑 <b>ĐÃ DỪNG</b>"
+    elif current >= total:
+        title = "✅ <b>HOÀN TẤT</b>"
+    else:
+        title = "⏳ <b>ĐANG TẢI</b>"
+
+    bar = progress_bar(completed + failed, total)
+    safe_url = html.escape(url[:180])
+    return (
+        "╭━━━〔 📥 DRAGON DOWNLOAD 〕━━━╮\n"
+        "┃\n"
+        f"┃ {title}\n"
+        f"┃ 📦 Tiến độ: <b>{current}/{total}</b>\n"
+        f"┃ [{bar}] <b>{completed + failed}/{total}</b>\n"
+        "┃\n"
+        f"┃ 🔗 Link hiện tại: <b>{current}</b>/<b>{total}</b>\n"
+        f"┃ 🌐 Nền tảng: <b>{html.escape(platform.upper())}</b>\n"
+        f"┃ 🔎 {safe_url}\n"
+        "┃\n"
+        f"┃ ✅ Thành công: <b>{completed}</b>\n"
+        f"┃ ❌ Lỗi: <b>{failed}</b>\n"
+        "┃\n"
+        "┃ 🛑 Dùng <b>/stop</b> để dừng ngay\n"
+        "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+    )
+
+
+def batch_done_text(total: int, completed: int, failed: int, elapsed: float) -> str:
+    if failed == 0:
+        icon = "🎉"
+        title = "HOÀN TẤT"
+    else:
+        icon = "⚠️"
+        title = "HOÀN TẤT CÓ LỖI"
+
+    return (
+        "╭━━━〔 📥 DRAGON DOWNLOAD 〕━━━╮\n"
+        "┃\n"
+        f"┃ {icon} <b>{title}</b>\n"
+        "┃\n"
+        f"┃ 🔗 Tổng link: <b>{total}</b>\n"
+        f"┃ ✅ Thành công: <b>{completed}</b>\n"
+        f"┃ ❌ Thất bại: <b>{failed}</b>\n"
+        f"┃ ⏱ Thời gian: <b>{elapsed:.1f}s</b>\n"
+        "┃\n"
+        "┃ 💡 Muốn tải tiếp: gửi <b>/download</b>\n"
+        "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+    )
+
+
 async def start_download(event):
-    cleanup_jobs(event.sender_id)
+    user_id = event.sender_id
+    cleanup_jobs(user_id)
+
+    # Re-opening /download creates a fresh, isolated session for this user.
+    await cancel_tasks(user_id)
+    for token in list(USER_JOBS.get(user_id, set())):
+        JOBS.pop(token, None)
+    USER_JOBS.pop(user_id, None)
+
+    DOWNLOAD_SESSIONS[user_id] = {
+        "active": True,
+        "started_at": time.monotonic(),
+        "batch": 0,
+    }
+
     await event.respond(
-        "╭━━━━━━━━━━━━━━━━━━━━━━╮\n"
-        "┃ 🚀 <b>DRAGON DOWNLOAD INTELLIGENCE</b>\n"
-        "┃ <i>Probe → Quality → Download → Verify</i>\n"
-        "╰━━━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        "Gửi một hoặc nhiều link.\n"
-        "Bot sẽ <b>phân tích format thật</b> trước, "
-        "chỉ hiện những độ phân giải thực sự có.\n\n"
-        "🔵 Facebook • 🎵 TikTok • 🔴 YouTube • 🌐 yt-dlp",
+        "╭━━━〔 📥 DRAGON DOWNLOAD 〕━━━╮\n"
+        "┃\n"
+        "┃ 🚀 <b>DOWNLOAD MODE ĐÃ BẬT</b>\n"
+        "┃\n"
+        "┃ Gửi <b>1 hoặc nhiều link</b> Facebook,\n"
+        "┃ TikTok, YouTube, Instagram...\n"
+        "┃\n"
+        "┃ 🔎 Bot sẽ tự kiểm tra media\n"
+        "┃ 🎯 Tự chọn chất lượng tốt nhất\n"
+        "┃ 📦 Nhiều link → xử lý theo hàng đợi\n"
+        "┃\n"
+        "┃ 🛑 <b>/stop</b> = dừng + thoát chế độ\n"
+        "┃\n"
+        "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
         parse_mode="html",
     )
 
 
+async def process_download_batch(event, urls: list[str], status_message):
+    user_id = event.sender_id
+    total = len(urls)
+    completed = 0
+    failed = 0
+    started = time.monotonic()
+
+    session = DOWNLOAD_SESSIONS.get(user_id)
+    if not session or not session.get("active"):
+        return
+
+    session["batch"] = session.get("batch", 0) + 1
+    batch_id = session["batch"]
+
+    # Probe sequentially at batch level so the user sees a deterministic
+    # 1/total, 2/total, 3/total flow in exactly one Telegram message.
+    for index, url in enumerate(urls, 1):
+        session = DOWNLOAD_SESSIONS.get(user_id)
+        if not session or not session.get("active"):
+            await safe_edit_status(
+                status_message,
+                batch_progress_text(
+                    total, index - 1, url, platform_of(url),
+                    completed, failed, cancelled=True,
+                ),
+                parse_mode="html",
+            )
+            return
+
+        await safe_edit_status(
+            status_message,
+            batch_progress_text(
+                total, index, url, platform_of(url),
+                completed, failed,
+            ),
+            parse_mode="html",
+        )
+
+        try:
+            # Each URL gets its own ProbeResult and isolated working directory.
+            p = await probe_one(user_id, url)
+
+            session = DOWNLOAD_SESSIONS.get(user_id)
+            if not session or not session.get("active"):
+                raise asyncio.CancelledError
+
+            register_job(p)
+
+            # Batch mode deliberately uses BEST. The quality inventory/fallback
+            # still decides the best actual source available for the URL.
+            await download_regular(event, p, "best")
+            completed += 1
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failed += 1
+            logger.exception("Batch download failed: %s", url)
+            await safe_edit_status(
+                status_message,
+                (
+                    batch_progress_text(
+                        total, index, url, platform_of(url),
+                        completed, failed,
+                    )
+                    + "\n\n"
+                    "┗ ❌ <b>Link này lỗi:</b> "
+                    f"{html.escape(str(exc)[:500])}"
+                ),
+                parse_mode="html",
+            )
+        finally:
+            # The job is no longer needed after this URL has been processed.
+            for token in list(USER_JOBS.get(user_id, set())):
+                JOBS.pop(token, None)
+            USER_JOBS.pop(user_id, None)
+
+    elapsed = time.monotonic() - started
+
+    # Only replace the same status message; never send a second progress card.
+    if download_session_active(user_id) and session.get("batch") == batch_id:
+        await safe_edit_status(
+            status_message,
+            batch_done_text(total, completed, failed, elapsed),
+            parse_mode="html",
+        )
+
+
 async def handle_links(event):
+    """
+    URL handler is intentionally gated by DOWNLOAD_SESSIONS.
+
+    This handler may remain registered with Telethon, but it is completely
+    inert unless the same user explicitly activated /download.
+    """
     text = event.raw_text or ""
     if not text or text.startswith("/"):
+        return
+
+    user_id = event.sender_id
+
+    # THE critical isolation gate:
+    # plain Facebook/TikTok/YouTube URLs do absolutely nothing unless the
+    # sender previously issued /download and has not issued /stop.
+    if not download_session_active(user_id):
         return
 
     urls = extract_urls(text)
     if not urls:
         return
 
-    user_id = event.sender_id
+    # One active batch per user. A new batch cancels the previous batch.
     await cancel_tasks(user_id)
 
-    task = asyncio.create_task(run_probe_batch(event, urls))
+    # Remove stale quality-selection jobs belonging to this user.
+    for token in list(USER_JOBS.get(user_id, set())):
+        JOBS.pop(token, None)
+    USER_JOBS.pop(user_id, None)
+
+    # One message only for the entire batch.
+    status = await event.respond(
+        batch_header(len(urls)),
+        parse_mode="html",
+    )
+    DOWNLOAD_STATUS_MESSAGES[user_id] = status
+
+    task = asyncio.create_task(
+        process_download_batch(event, urls, status)
+    )
     USER_TASKS.setdefault(user_id, set()).add(task)
 
     def done(t):
         USER_TASKS.get(user_id, set()).discard(t)
-    task.add_done_callback(done)
-
-
-async def callback(event):
-    data = event.data.decode("utf-8", "ignore")
-    if not data.startswith("q:"):
-        return
-
-    _, token, choice = data.split(":", 2)
-    p = JOBS.get(token)
-
-    if not p or p.user_id != event.sender_id:
-        await event.answer("Job không còn tồn tại.", alert=True)
-        return
-
-    if choice == "cancel":
-        JOBS.pop(token, None)
-        USER_JOBS.get(event.sender_id, set()).discard(token)
-        await event.edit("❌ Đã hủy lựa chọn.")
-        return
-
-    JOBS.pop(token, None)
-    USER_JOBS.get(event.sender_id, set()).discard(token)
-
-    try:
-        await event.edit(
-            "⏳ <b>Đang tải...</b>\n"
-            f"🌐 {p.platform.upper()}\n"
-            f"🎯 {html.escape(choice)}",
-            parse_mode="html",
-        )
-    except Exception:
-        pass
-
-    task = asyncio.create_task(
-        download_regular(event, p, choice)
-    )
-    USER_TASKS.setdefault(event.sender_id, set()).add(task)
-
-    def done(t):
-        USER_TASKS.get(event.sender_id, set()).discard(t)
+        if not USER_TASKS.get(user_id):
+            USER_TASKS.pop(user_id, None)
 
     task.add_done_callback(done)
-
-    try:
-        await task
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        await event.respond(
-            "❌ <b>DOWNLOAD FAILED</b>\n"
-            f"🔎 {html.escape(str(exc))}",
-            parse_mode="html",
-        )
-
-
-async def cancel_tasks(user_id: int):
-    tasks = list(USER_TASKS.get(user_id, set()))
-    for task in tasks:
-        if not task.done():
-            task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    USER_TASKS.pop(user_id, None)
 
 
 async def stop_download(event):
-    await cancel_tasks(event.sender_id)
+    user_id = event.sender_id
 
-    for token in list(USER_JOBS.get(event.sender_id, set())):
+    # Close the session FIRST so no new URL can enter while cancellation is
+    # waiting for running yt-dlp/aiohttp tasks to unwind.
+    close_download_session(user_id)
+
+    await cancel_tasks(user_id)
+
+    for token in list(USER_JOBS.get(user_id, set())):
         JOBS.pop(token, None)
-    USER_JOBS.pop(event.sender_id, None)
+    USER_JOBS.pop(user_id, None)
 
-    directory = BASE_DIR / str(event.sender_id)
+    DOWNLOAD_STATUS_MESSAGES.pop(user_id, None)
+
+    directory = BASE_DIR / str(user_id)
     shutil.rmtree(directory, ignore_errors=True)
 
     await event.respond(
-        "🛑 <b>Đã dừng toàn bộ download jobs.</b>",
+        "╭━━━〔 🛑 DOWNLOAD STOPPED 〕━━━╮\n"
+        "┃\n"
+        "┃ <b>Đã dừng hoàn toàn.</b>\n"
+        "┃\n"
+        "┃ ✓ Đã hủy task đang chạy\n"
+        "┃ ✓ Đã đóng download session\n"
+        "┃ ✓ Đã xóa job chờ\n"
+        "┃ ✓ Đã dọn thư mục tạm\n"
+        "┃ ✓ URL gửi sau đây sẽ <b>không được xử lý</b>\n"
+        "┃\n"
+        "┃ 📥 Muốn tải lại → <b>/download</b>\n"
+        "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
         parse_mode="html",
     )
 
 
 def register(client, *args, **kwargs):
+    # Explicit command entry point.
     client.add_event_handler(
         start_download,
         events.NewMessage(pattern=r"^/download$"),
     )
+
+    # Explicit hard-stop entry point.
     client.add_event_handler(
         stop_download,
         events.NewMessage(pattern=r"^/stop$"),
     )
+
+    # URL handler is gated by DOWNLOAD_SESSIONS, so it is inert outside
+    # /download mode. No automatic URL downloading exists.
     client.add_event_handler(
         handle_links,
         events.NewMessage(
             func=lambda e: not (e.raw_text or "").startswith("/")
         ),
     )
-    client.add_event_handler(
-        callback,
-        events.CallbackQuery(),
-    )
 
-    logger.info("Download Intelligence registered")
-
+    logger.info("Download Intelligence registered: explicit /download mode only")
 
 # ============================================================================
 # DRAGON DOWNLOAD INTELLIGENCE V3 — ADVANCED ENGINE

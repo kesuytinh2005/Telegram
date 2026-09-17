@@ -3201,84 +3201,281 @@ async def _cleanup_youtube_collection_artifacts(out: Path, archive: Path | None 
 
 _GOOGLE_DRIVE_SERVICE = None
 _GOOGLE_DRIVE_LOCK = asyncio.Lock()
+_GOOGLE_DRIVE_OAUTH = None
 
 
-def _google_drive_service_sync():
-    """Create a Drive v3 client using OAuth token.json or service-account JSON."""
-    from googleapiclient.discovery import build
-    creds = None
-    # OAuth token.json is preferred for a personal Google Drive because files
-    # belong to the authenticated Google user and use that user's Drive quota.
-    if GOOGLE_DRIVE_TOKEN_FILE:
-        from google.oauth2.credentials import Credentials
-        token_path = os.path.expanduser(GOOGLE_DRIVE_TOKEN_FILE)
-        if os.path.exists(token_path):
-            creds = Credentials.from_authorized_user_file(token_path, GOOGLE_DRIVE_SCOPES)
-            if creds and creds.expired and creds.refresh_token:
-                from google.auth.transport.requests import Request
-                creds.refresh(Request())
-                try:
-                    Path(token_path).write_text(creds.to_json(), encoding="utf-8")
-                except Exception:
-                    logger.warning("Could not refresh Google Drive token file", exc_info=True)
+def _google_drive_token_sync() -> dict[str, Any]:
+    """Load/refresh the OAuth token without google-api-python-client.
 
-    # Service-account JSON is supported as an alternative, especially for a
-    # Shared Drive or a folder explicitly shared with the service account.
-    if creds is None and GOOGLE_DRIVE_CREDENTIALS_FILE:
-        from google.oauth2 import service_account
-        cred_path = os.path.expanduser(GOOGLE_DRIVE_CREDENTIALS_FILE)
-        creds = service_account.Credentials.from_service_account_file(
-            cred_path, scopes=GOOGLE_DRIVE_SCOPES
-        )
+    The Drive uploader uses the official Drive v3 HTTP API directly. This keeps
+    the bot working in small Termux/Docker images where googleapiclient is not
+    installed, while still supporting the normal token.json produced by the
+    OAuth setup helper.
+    """
+    global _GOOGLE_DRIVE_OAUTH
+    if _GOOGLE_DRIVE_OAUTH:
+        return _GOOGLE_DRIVE_OAUTH
+    if not GOOGLE_DRIVE_TOKEN_FILE:
+        raise RuntimeError("Google Drive chưa có DOWNLOAD_GOOGLE_DRIVE_TOKEN")
 
-    if creds is None:
-        raise RuntimeError(
-            "Google Drive chưa được cấu hình: cần DOWNLOAD_GOOGLE_DRIVE_TOKEN "
-            "hoặc DOWNLOAD_GOOGLE_DRIVE_CREDENTIALS"
-        )
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    token_path = Path(os.path.expanduser(GOOGLE_DRIVE_TOKEN_FILE))
+    if not token_path.exists():
+        raise RuntimeError(f"Không tìm thấy Google Drive token: {token_path}")
+    try:
+        data = json.loads(token_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Google Drive token.json không hợp lệ: {exc}") from exc
+
+    access_token = str(data.get("token") or data.get("access_token") or "").strip()
+    refresh_token = str(data.get("refresh_token") or "").strip()
+    expires_at = float(data.get("expiry_epoch") or 0)
+    if not expires_at and data.get("expiry"):
+        try:
+            expires_at = datetime.fromisoformat(str(data["expiry"]).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            expires_at = 0
+
+    # Refresh a little early so a long resumable upload never starts with a
+    # token that is about to expire.
+    if access_token and (not expires_at or expires_at > time.time() + 90):
+        _GOOGLE_DRIVE_OAUTH = {"access_token": access_token, "token": data}
+        return _GOOGLE_DRIVE_OAUTH
+
+    if not refresh_token:
+        if access_token:
+            _GOOGLE_DRIVE_OAUTH = {"access_token": access_token, "token": data}
+            return _GOOGLE_DRIVE_OAUTH
+        raise RuntimeError("Google Drive token đã hết hạn và không có refresh_token")
+
+    client_id = str(data.get("client_id") or os.getenv("GOOGLE_CLIENT_ID") or "").strip()
+    client_secret = str(data.get("client_secret") or os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
+    if not client_id or not client_secret:
+        # google-auth token.json normally stores these fields. If this bot was
+        # configured with a client file instead, keep the error explicit.
+        raise RuntimeError("Google Drive token thiếu client_id/client_secret để tự refresh")
+
+    import urllib.parse
+    import urllib.request
+    payload = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            refreshed = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Không refresh được Google Drive OAuth token: {exc}") from exc
+
+    new_token = str(refreshed.get("access_token") or "").strip()
+    if not new_token:
+        raise RuntimeError(f"Google Drive OAuth refresh không trả access_token: {refreshed}")
+    data["token"] = new_token
+    data["access_token"] = new_token
+    data["refresh_token"] = refresh_token
+    data["client_id"] = client_id
+    data["client_secret"] = client_secret
+    if refreshed.get("expires_in"):
+        try:
+            data["expiry_epoch"] = time.time() + float(refreshed["expires_in"])
+        except Exception:
+            pass
+    try:
+        token_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logger.warning("Could not persist refreshed Google Drive token", exc_info=True)
+    _GOOGLE_DRIVE_OAUTH = {"access_token": new_token, "token": data}
+    return _GOOGLE_DRIVE_OAUTH
 
 
 async def _google_drive_service():
+    """Return a lightweight Drive HTTP auth context (no googleapiclient)."""
     global _GOOGLE_DRIVE_SERVICE
     if _GOOGLE_DRIVE_SERVICE is not None:
         return _GOOGLE_DRIVE_SERVICE
     async with _GOOGLE_DRIVE_LOCK:
         if _GOOGLE_DRIVE_SERVICE is None:
-            _GOOGLE_DRIVE_SERVICE = await asyncio.to_thread(_google_drive_service_sync)
+            # Personal Drive OAuth is the normal bot configuration and needs no
+            # third-party Google client package.
+            if GOOGLE_DRIVE_TOKEN_FILE:
+                _GOOGLE_DRIVE_SERVICE = await asyncio.to_thread(_google_drive_token_sync)
+            elif GOOGLE_DRIVE_CREDENTIALS_FILE:
+                # Service-account mode still uses google-auth when explicitly
+                # configured. Keep it isolated so OAuth deployments remain
+                # dependency-light.
+                try:
+                    from google.oauth2 import service_account
+                except ModuleNotFoundError as exc:
+                    raise RuntimeError(
+                        "Google Drive service-account cần google-auth; "
+                        "hãy dùng DOWNLOAD_GOOGLE_DRIVE_TOKEN cho OAuth cá nhân"
+                    ) from exc
+                cred_path = os.path.expanduser(GOOGLE_DRIVE_CREDENTIALS_FILE)
+                creds = await asyncio.to_thread(
+                    service_account.Credentials.from_service_account_file,
+                    cred_path,
+                    scopes=GOOGLE_DRIVE_SCOPES,
+                )
+                _GOOGLE_DRIVE_SERVICE = {"service_account_credentials": creds}
+            else:
+                raise RuntimeError(
+                    "Google Drive chưa được cấu hình: cần DOWNLOAD_GOOGLE_DRIVE_TOKEN "
+                    "hoặc DOWNLOAD_GOOGLE_DRIVE_CREDENTIALS"
+                )
     return _GOOGLE_DRIVE_SERVICE
 
 
+def _drive_http_json(url: str, *, method="GET", token=None, body=None, headers=None, timeout=60):
+    import urllib.request
+    h = {"Accept": "application/json"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    if headers:
+        h.update(headers)
+    data = None
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        h.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            return resp.status, dict(resp.headers), json.loads(raw.decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Drive API HTTP {exc.code}: {raw[:500]}") from exc
+
+
 def _google_drive_upload_sync(service, path: Path, progress_callback=None) -> dict[str, Any]:
-    from googleapiclient.http import MediaFileUpload
+    """Resumable multipart upload through Drive v3 REST API."""
+    import mimetypes
+    import urllib.request
+    from urllib.parse import quote as _quote
+
+    # Service-account compatibility path, only when explicitly configured.
+    if service.get("service_account_credentials") is not None:
+        creds = service["service_account_credentials"]
+        try:
+            from google.auth.transport.requests import Request
+            if creds.expired or not creds.valid:
+                creds.refresh(Request())
+        except Exception as exc:
+            raise RuntimeError(f"Google Drive service-account auth lỗi: {exc}") from exc
+        token = str(creds.token or "")
+    else:
+        token = str(service.get("access_token") or "")
+    if not token:
+        raise RuntimeError("Google Drive không có access token")
+
+    total = int(path.stat().st_size)
     metadata = {"name": path.name}
     if GOOGLE_DRIVE_FOLDER_ID:
         metadata["parents"] = [GOOGLE_DRIVE_FOLDER_ID]
-    media = MediaFileUpload(
-        str(path),
-        mimetype="application/zip",
-        resumable=True,
-        chunksize=GOOGLE_DRIVE_CHUNK_MB * 1024 * 1024,
+    boundary = "===============FBRESOLVER_DRIVE_BOUNDARY==="
+    meta_bytes = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+    preamble = (
+        f"--{boundary}\r\n"
+        "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+    ).encode() + meta_bytes + f"\r\n--{boundary}\r\nContent-Type: application/zip\r\n\r\n".encode()
+    ending = f"\r\n--{boundary}--\r\n".encode()
+
+    # Start a resumable session. The initial request contains metadata only;
+    # file bytes are sent in fixed chunks so Telegram/Termux can survive a
+    # transient network hiccup without rebuilding the ZIP.
+    init_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true"
+    init_req = urllib.request.Request(
+        init_url,
+        data=meta_bytes,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "application/zip",
+            "X-Upload-Content-Length": str(total),
+        },
+        method="POST",
     )
-    request = service.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id,name,size,webViewLink,webContentLink",
-        supportsAllDrives=True,
-    )
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-        if status is not None and progress_callback is not None:
-            try:
-                progress_callback(int(status.resumable_progress or 0), int(path.stat().st_size))
-            except Exception:
-                pass
-    return dict(response or {})
+    try:
+        with urllib.request.urlopen(init_req, timeout=60) as resp:
+            session_url = resp.headers.get("Location")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Drive resumable init HTTP {exc.code}: {raw[:500]}") from exc
+    if not session_url:
+        raise RuntimeError("Google Drive không trả resumable session URL")
+
+    chunk_size = max(256 * 1024, int(GOOGLE_DRIVE_CHUNK_MB) * 1024 * 1024)
+    sent = 0
+    with path.open("rb") as fh:
+        while sent < total:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            end = sent + len(chunk) - 1
+            req = urllib.request.Request(
+                session_url,
+                data=chunk,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {sent}-{end}/{total}",
+                    "Content-Type": "application/zip",
+                },
+                method="PUT",
+            )
+            last_error = None
+            for attempt in range(4):
+                try:
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        raw = resp.read()
+                        status = resp.status
+                        if status in (200, 201):
+                            result = json.loads(raw.decode("utf-8") or "{}")
+                            sent = end + 1
+                            break
+                        if status == 308:
+                            sent = end + 1
+                            break
+                        raise RuntimeError(f"Drive chunk HTTP {status}")
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 308:
+                        sent = end + 1
+                        break
+                    last_error = exc
+                    if exc.code not in (408, 429, 500, 502, 503, 504) or attempt == 3:
+                        raw = exc.read().decode("utf-8", errors="replace")
+                        raise RuntimeError(f"Drive chunk HTTP {exc.code}: {raw[:500]}") from exc
+                    time.sleep(0.75 * (attempt + 1))
+                except Exception as exc:
+                    last_error = exc
+                    if attempt == 3:
+                        raise RuntimeError(f"Drive chunk upload failed: {exc}") from exc
+                    time.sleep(0.75 * (attempt + 1))
+            else:
+                raise RuntimeError(f"Drive chunk upload failed: {last_error}")
+            if progress_callback is not None:
+                try:
+                    progress_callback(sent, total)
+                except Exception:
+                    pass
+    if sent != total:
+        raise RuntimeError(f"Google Drive upload dở dang: {sent}/{total} bytes")
+
+    result = dict(result or {})
+    if not result.get("id"):
+        # Defensive lookup if Drive returned an empty body after the final 200.
+        raise RuntimeError("Google Drive không trả file ID sau khi upload")
+    return result
 
 
 async def upload_zip_to_google_drive(path: Path, progress_callback=None) -> dict[str, Any]:
-    """Resumably upload one ZIP to Drive and return a shareable download link."""
+    """Upload one ZIP to Drive with resumable HTTP; no googleapiclient needed."""
     if not GOOGLE_DRIVE_ENABLED:
         raise RuntimeError("Google Drive fallback đang bị tắt")
     service = await _google_drive_service()
@@ -3288,20 +3485,30 @@ async def upload_zip_to_google_drive(path: Path, progress_callback=None) -> dict
         raise RuntimeError("Google Drive không trả về file ID sau khi upload")
 
     if GOOGLE_DRIVE_PUBLIC:
-        await asyncio.to_thread(
-            lambda: service.permissions().create(
-                fileId=file_id,
+        if service.get("service_account_credentials") is not None:
+            creds = service["service_account_credentials"]
+            try:
+                from google.auth.transport.requests import AuthorizedSession
+                session = AuthorizedSession(creds)
+                session.post(
+                    f"https://www.googleapis.com/drive/v3/files/{_quote(file_id, safe='')}/permissions?supportsAllDrives=true",
+                    json={"type": "anyone", "role": "reader"},
+                    timeout=60,
+                ).raise_for_status()
+            except Exception as exc:
+                raise RuntimeError(f"Không tạo được quyền chia sẻ Google Drive: {exc}") from exc
+        else:
+            token = str(service.get("access_token") or "")
+            _drive_http_json(
+                f"https://www.googleapis.com/drive/v3/files/{quote(file_id, safe='')}/permissions?supportsAllDrives=true",
+                method="POST",
+                token=token,
                 body={"type": "anyone", "role": "reader"},
-                fields="id",
-                supportsAllDrives=True,
-            ).execute()
-        )
+            )
 
     link = str(result.get("webContentLink") or result.get("webViewLink") or "").strip()
     if not link:
         link = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
-    # A stable browser download URL. Google may still show its own large-file
-    # confirmation page for very large archives; that is controlled by Drive.
     direct_link = f"https://drive.google.com/uc?export=download&id={quote(file_id)}"
     result["download_link"] = direct_link
     result["view_link"] = link

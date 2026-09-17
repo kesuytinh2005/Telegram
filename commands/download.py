@@ -3237,12 +3237,37 @@ def _google_drive_token_sync(*, force_refresh: bool = False) -> dict[str, Any]:
     # causes OSError [Errno 36] "File name too long".
     raw_json = GOOGLE_DRIVE_TOKEN_JSON
     legacy_token_value = GOOGLE_DRIVE_TOKEN_FILE
+
+    # Railway/other env managers may preserve surrounding quotes or escape
+    # the JSON value. Normalize it before deciding whether it is JSON or a
+    # filesystem path. NEVER pass a huge JSON blob to pathlib.Path().
+    for _ in range(2):
+        candidate = str(raw_json or legacy_token_value or "").strip()
+        if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {"\"", "'"}:
+            candidate = candidate[1:-1].strip()
+            if raw_json:
+                raw_json = candidate
+            else:
+                legacy_token_value = candidate
+            continue
+        break
     if not raw_json and legacy_token_value:
         candidate = legacy_token_value.strip()
         if candidate.startswith("{") and candidate.endswith("}"):
             raw_json = candidate
             # It is JSON content, not a local path.
             legacy_token_value = ""
+
+    # Also accept JSON even when whitespace/escaping makes the cheap braces
+    # test fail. If it parses as an object, it is token data, never a path.
+    if not raw_json and legacy_token_value and len(legacy_token_value) > 512:
+        try:
+            parsed_candidate = json.loads(legacy_token_value)
+            if isinstance(parsed_candidate, dict):
+                data = parsed_candidate
+                legacy_token_value = ""
+        except Exception:
+            pass
     if not raw_json and GOOGLE_DRIVE_TOKEN_B64:
         try:
             import base64
@@ -3261,6 +3286,15 @@ def _google_drive_token_sync(*, force_refresh: bool = False) -> dict[str, Any]:
     # This fixes deployments where an Android path was copied into an env var:
     # do not fail merely because /storage/emulated/0/... is absent remotely.
     if not data and legacy_token_value:
+        # Guard against malformed/oversized environment values. A token JSON
+        # blob is not a path; never call Path.exists() on an arbitrary long
+        # secret string because Linux raises OSError [Errno 36].
+        if len(legacy_token_value) >= 4096:
+            raise RuntimeError(
+                "Google Drive DOWNLOAD_GOOGLE_DRIVE_TOKEN quá dài và không phải "
+                "đường dẫn hợp lệ. Hãy dùng DOWNLOAD_GOOGLE_DRIVE_TOKEN_JSON hoặc "
+                "DOWNLOAD_GOOGLE_DRIVE_REFRESH_TOKEN + CLIENT_ID + CLIENT_SECRET."
+            )
         token_path = Path(os.path.expanduser(legacy_token_value))
         if token_path.exists():
             try:

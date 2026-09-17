@@ -2153,9 +2153,21 @@ async def download_youtube_collection_direct(event, p: ProbeResult, requested="b
     # Download already-present items are skipped.  This makes retries fast and
     # also means a previous interrupted run does not redownload good files.
     def file_ids():
+        """Return source IDs represented by already-promoted media files.
+
+        TikTok direct downloads use ``tiktok_<video_id>.mp4``.  The old
+        implementation only understood yt-dlp's ``[id]`` filename convention,
+        so the post-download recovery pass believed every TikTok video was still
+        missing and downloaded the whole profile a second time.
+        """
         ids = set()
         for f in media_files():
-            m = re.search(r"\[([^\[\]]+)\]\.[^.]+$", f.name)
+            name = f.name
+            m = re.search(r"\[([^\[\]]+)\]\.[^.]+$", name)
+            if m:
+                ids.add(m.group(1))
+                continue
+            m = re.match(r"^tiktok_(.+?)\.(?:mp4|mkv|webm|mov|avi|m4v|ts)$", name, re.I)
             if m:
                 ids.add(m.group(1))
         return ids
@@ -4090,8 +4102,12 @@ async def download_profile(event, p: ProbeResult, requested="best"):
                 for refresh_no in range(3):
                     fresh = await tikwm_probe(url)
                     if fresh:
+                        # Use the real TikTok video ID as the temporary filename
+                        # token.  This makes the final filename deterministic and
+                        # lets the resume/recovery pass recognize that this video
+                        # was already downloaded.
                         fallback_p = ProbeResult(
-                            token=uuid.uuid4().hex[:10], user_id=user_id,
+                            token=vid, user_id=user_id,
                             url=url, platform="tiktok", kind="VIDEO",
                             tikwm=fresh, info=fresh,
                         )
@@ -4136,14 +4152,22 @@ async def download_profile(event, p: ProbeResult, requested="best"):
                     raise RuntimeError("Không tạo được file media TikTok sau khi phục hồi")
 
                 for src in item_files:
-                    dest = out / src.name
+                    # One deterministic destination per TikTok video.  Never
+                    # create ``__2``, ``__3`` copies for a retry of the same ID.
+                    dest = out / f"tiktok_{re.sub(r'[^A-Za-z0-9_.-]+', '_', vid)}{src.suffix.lower()}"
                     if dest.exists():
-                        stem, suffix = src.stem, src.suffix
-                        n = 2
-                        while dest.exists():
-                            dest = out / f"{stem}__{n}{suffix}"
-                            n += 1
-                    shutil.move(str(src), str(dest))
+                        # A previous successful attempt wins unless the newly
+                        # downloaded file is larger/healthier.  Either way, keep
+                        # exactly one file for this source ID.
+                        try:
+                            if src.stat().st_size > dest.stat().st_size:
+                                src.replace(dest)
+                            else:
+                                src.unlink(missing_ok=True)
+                        except OSError:
+                            src.unlink(missing_ok=True)
+                    else:
+                        shutil.move(str(src), str(dest))
 
                 downloaded_ids.add(vid)
                 finished_ids.add(vid)

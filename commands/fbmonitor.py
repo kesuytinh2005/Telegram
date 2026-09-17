@@ -273,7 +273,17 @@ def register(bot, notify_bot=None):
             return
         if _PENDING.get(event.sender_id) != "add":
             return
-        uid = event.raw_text.strip().split()[0]
+        raw = event.raw_text.strip()
+        uid = raw.split()[0] if raw else ""
+
+        # This handler is only for the explicit /fbadd -> "send UID next"
+        # flow.  It must never reject URLs that belong to other commands
+        # (especially TikTok/YouTube/Facebook download links).  Telethon
+        # delivers NewMessage events to all matching handlers, so returning
+        # here lets the dedicated downloader continue processing the URL.
+        if re.match(r"^(?:https?://|www\\.)", raw, re.IGNORECASE):
+            return
+
         if not UID_RE.fullmatch(uid):
             await event.reply("❌ UID không hợp lệ. Cần 5–30 chữ số.")
             return

@@ -131,6 +131,16 @@ DOWNLOAD_UPLOAD_USER_SESSION_TTL = max(60, int(os.getenv("DOWNLOAD_UPLOAD_USER_S
 GOOGLE_DRIVE_ENABLED = os.getenv("DOWNLOAD_GOOGLE_DRIVE_ENABLED", "1") == "1"
 GOOGLE_DRIVE_CREDENTIALS_FILE = os.getenv("DOWNLOAD_GOOGLE_DRIVE_CREDENTIALS", "").strip()
 GOOGLE_DRIVE_TOKEN_FILE = os.getenv("DOWNLOAD_GOOGLE_DRIVE_TOKEN", "").strip()
+# Cloud deployments cannot see a Termux/Android absolute path such as
+# /storage/emulated/0/... .  OAuth may therefore be supplied directly through
+# environment variables.  Prefer a refresh-token based configuration so no
+# short-lived access token needs to be copied into the deployment.
+GOOGLE_DRIVE_TOKEN_JSON = os.getenv("DOWNLOAD_GOOGLE_DRIVE_TOKEN_JSON", "").strip()
+GOOGLE_DRIVE_TOKEN_B64 = os.getenv("DOWNLOAD_GOOGLE_DRIVE_TOKEN_B64", "").strip()
+GOOGLE_DRIVE_ACCESS_TOKEN = os.getenv("DOWNLOAD_GOOGLE_DRIVE_ACCESS_TOKEN", "").strip()
+GOOGLE_DRIVE_REFRESH_TOKEN = os.getenv("DOWNLOAD_GOOGLE_DRIVE_REFRESH_TOKEN", "").strip()
+GOOGLE_DRIVE_CLIENT_ID = os.getenv("DOWNLOAD_GOOGLE_DRIVE_CLIENT_ID", os.getenv("GOOGLE_CLIENT_ID", "")).strip()
+GOOGLE_DRIVE_CLIENT_SECRET = os.getenv("DOWNLOAD_GOOGLE_DRIVE_CLIENT_SECRET", os.getenv("GOOGLE_CLIENT_SECRET", "")).strip()
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("DOWNLOAD_GOOGLE_DRIVE_FOLDER_ID", "").strip()
 GOOGLE_DRIVE_PUBLIC = False  # Always Restricted: never grant public/anyone access.
 GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
@@ -3205,26 +3215,71 @@ _GOOGLE_DRIVE_OAUTH = None
 
 
 def _google_drive_token_sync() -> dict[str, Any]:
-    """Load/refresh the OAuth token without google-api-python-client.
+    """Load/refresh OAuth without google-api-python-client.
 
-    The Drive uploader uses the official Drive v3 HTTP API directly. This keeps
-    the bot working in small Termux/Docker images where googleapiclient is not
-    installed, while still supporting the normal token.json produced by the
-    OAuth setup helper.
+    Supports both a local token.json and cloud-safe environment variables.
+    A local Android/Termux path must never be assumed to exist in a cloud
+    container.  Refresh-token mode is preferred because the access token is
+    short-lived and is automatically renewed when necessary.
     """
     global _GOOGLE_DRIVE_OAUTH
     if _GOOGLE_DRIVE_OAUTH:
         return _GOOGLE_DRIVE_OAUTH
-    if not GOOGLE_DRIVE_TOKEN_FILE:
-        raise RuntimeError("Google Drive chưa có DOWNLOAD_GOOGLE_DRIVE_TOKEN")
 
-    token_path = Path(os.path.expanduser(GOOGLE_DRIVE_TOKEN_FILE))
-    if not token_path.exists():
-        raise RuntimeError(f"Không tìm thấy Google Drive token: {token_path}")
-    try:
-        data = json.loads(token_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"Google Drive token.json không hợp lệ: {exc}") from exc
+    data: dict[str, Any] = {}
+
+    # 1) Cloud-safe token JSON. Accept either plain JSON or base64 JSON.
+    raw_json = GOOGLE_DRIVE_TOKEN_JSON
+    if not raw_json and GOOGLE_DRIVE_TOKEN_B64:
+        try:
+            import base64
+            raw_json = base64.b64decode(GOOGLE_DRIVE_TOKEN_B64).decode("utf-8")
+        except Exception as exc:
+            raise RuntimeError(f"Google Drive TOKEN_B64 không hợp lệ: {exc}") from exc
+    if raw_json:
+        try:
+            data = json.loads(raw_json)
+            if not isinstance(data, dict):
+                raise ValueError("token JSON phải là object")
+        except Exception as exc:
+            raise RuntimeError(f"Google Drive token JSON không hợp lệ: {exc}") from exc
+
+    # 2) Local token file, only if it is actually present in this container.
+    # This fixes deployments where an Android path was copied into an env var:
+    # do not fail merely because /storage/emulated/0/... is absent remotely.
+    if not data and GOOGLE_DRIVE_TOKEN_FILE:
+        token_path = Path(os.path.expanduser(GOOGLE_DRIVE_TOKEN_FILE))
+        if token_path.exists():
+            try:
+                data = json.loads(token_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise RuntimeError(f"Google Drive token.json không hợp lệ: {exc}") from exc
+        else:
+            # Try common container locations before declaring it missing.
+            candidates = [
+                Path("/app/token.json"),
+                Path("/app/BOT/token.json"),
+                Path.cwd() / "token.json",
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    try:
+                        data = json.loads(candidate.read_text(encoding="utf-8"))
+                        break
+                    except Exception as exc:
+                        raise RuntimeError(f"Google Drive token.json không hợp lệ: {exc}") from exc
+
+    # 3) Direct environment OAuth fields. This is the recommended Railway/
+    # Render/Docker setup when token.json cannot be mounted.
+    if GOOGLE_DRIVE_ACCESS_TOKEN:
+        data.setdefault("token", GOOGLE_DRIVE_ACCESS_TOKEN)
+        data.setdefault("access_token", GOOGLE_DRIVE_ACCESS_TOKEN)
+    if GOOGLE_DRIVE_REFRESH_TOKEN:
+        data.setdefault("refresh_token", GOOGLE_DRIVE_REFRESH_TOKEN)
+    if GOOGLE_DRIVE_CLIENT_ID:
+        data.setdefault("client_id", GOOGLE_DRIVE_CLIENT_ID)
+    if GOOGLE_DRIVE_CLIENT_SECRET:
+        data.setdefault("client_secret", GOOGLE_DRIVE_CLIENT_SECRET)
 
     access_token = str(data.get("token") or data.get("access_token") or "").strip()
     refresh_token = str(data.get("refresh_token") or "").strip()
@@ -3235,8 +3290,7 @@ def _google_drive_token_sync() -> dict[str, Any]:
         except Exception:
             expires_at = 0
 
-    # Refresh a little early so a long resumable upload never starts with a
-    # token that is about to expire.
+    # A valid long-lived-enough access token can be used immediately.
     if access_token and (not expires_at or expires_at > time.time() + 90):
         _GOOGLE_DRIVE_OAUTH = {"access_token": access_token, "token": data}
         return _GOOGLE_DRIVE_OAUTH
@@ -3245,14 +3299,27 @@ def _google_drive_token_sync() -> dict[str, Any]:
         if access_token:
             _GOOGLE_DRIVE_OAUTH = {"access_token": access_token, "token": data}
             return _GOOGLE_DRIVE_OAUTH
-        raise RuntimeError("Google Drive token đã hết hạn và không có refresh_token")
+        configured = bool(raw_json or GOOGLE_DRIVE_TOKEN_FILE or GOOGLE_DRIVE_ACCESS_TOKEN or GOOGLE_DRIVE_REFRESH_TOKEN)
+        if configured and GOOGLE_DRIVE_TOKEN_FILE:
+            raise RuntimeError(
+                "Google Drive token không tồn tại trong container. "
+                "Đường dẫn Android/Termux không dùng được trên cloud; "
+                "hãy cấu hình DOWNLOAD_GOOGLE_DRIVE_TOKEN_JSON/B64 hoặc "
+                "DOWNLOAD_GOOGLE_DRIVE_REFRESH_TOKEN + CLIENT_ID + CLIENT_SECRET."
+            )
+        raise RuntimeError(
+            "Google Drive chưa có OAuth token. Cấu hình DOWNLOAD_GOOGLE_DRIVE_TOKEN_JSON/B64 "
+            "hoặc DOWNLOAD_GOOGLE_DRIVE_REFRESH_TOKEN + DOWNLOAD_GOOGLE_DRIVE_CLIENT_ID + "
+            "DOWNLOAD_GOOGLE_DRIVE_CLIENT_SECRET."
+        )
 
-    client_id = str(data.get("client_id") or os.getenv("GOOGLE_CLIENT_ID") or "").strip()
-    client_secret = str(data.get("client_secret") or os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
+    client_id = str(data.get("client_id") or GOOGLE_DRIVE_CLIENT_ID).strip()
+    client_secret = str(data.get("client_secret") or GOOGLE_DRIVE_CLIENT_SECRET).strip()
     if not client_id or not client_secret:
-        # google-auth token.json normally stores these fields. If this bot was
-        # configured with a client file instead, keep the error explicit.
-        raise RuntimeError("Google Drive token thiếu client_id/client_secret để tự refresh")
+        raise RuntimeError(
+            "Google Drive OAuth thiếu client_id/client_secret để refresh. "
+            "Hãy thêm DOWNLOAD_GOOGLE_DRIVE_CLIENT_ID và DOWNLOAD_GOOGLE_DRIVE_CLIENT_SECRET."
+        )
 
     import urllib.parse
     import urllib.request
@@ -3287,10 +3354,16 @@ def _google_drive_token_sync() -> dict[str, Any]:
             data["expiry_epoch"] = time.time() + float(refreshed["expires_in"])
         except Exception:
             pass
-    try:
-        token_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        logger.warning("Could not persist refreshed Google Drive token", exc_info=True)
+
+    # Persist only when a real local token file exists. Never try to write an
+    # Android path from a cloud container and never log the token contents.
+    if GOOGLE_DRIVE_TOKEN_FILE:
+        token_path = Path(os.path.expanduser(GOOGLE_DRIVE_TOKEN_FILE))
+        if token_path.exists():
+            try:
+                token_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                logger.warning("Could not persist refreshed Google Drive token", exc_info=True)
     _GOOGLE_DRIVE_OAUTH = {"access_token": new_token, "token": data}
     return _GOOGLE_DRIVE_OAUTH
 
@@ -3304,7 +3377,8 @@ async def _google_drive_service():
         if _GOOGLE_DRIVE_SERVICE is None:
             # Personal Drive OAuth is the normal bot configuration and needs no
             # third-party Google client package.
-            if GOOGLE_DRIVE_TOKEN_FILE:
+            if (GOOGLE_DRIVE_TOKEN_FILE or GOOGLE_DRIVE_TOKEN_JSON or GOOGLE_DRIVE_TOKEN_B64
+                    or GOOGLE_DRIVE_ACCESS_TOKEN or GOOGLE_DRIVE_REFRESH_TOKEN):
                 _GOOGLE_DRIVE_SERVICE = await asyncio.to_thread(_google_drive_token_sync)
             elif GOOGLE_DRIVE_CREDENTIALS_FILE:
                 # Service-account mode still uses google-auth when explicitly

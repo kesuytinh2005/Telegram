@@ -3734,37 +3734,63 @@ async def download_profile(event, p: ProbeResult, requested="best"):
         item_out.mkdir(parents=True, exist_ok=True)
         try:
             async with worker_semaphore:
-                state.phase = "DOWNLOAD"
-                state.status = "starting"
-                recovery_selector = selector
-                # Same resilient yt-dlp ladder as YouTube collections. For BEST,
-                # direct TikTok fallback is attempted only after yt-dlp fails.
-                await download_ytdlp_resilient(
-                    url, item_out, recovery_selector, state, "tiktok"
-                )
+                state.phase = "RESOLVE"
+                state.status = "đang lấy nguồn media TikTok"
+
+                # TikTok's current yt-dlp extractor can return HTTP/status 0 even
+                # for public videos.  A profile must therefore use the same
+                # collection lifecycle as YouTube, but the child-media transport
+                # is TikTok's fresh public-media resolver first.  This is NOT a
+                # metadata probe: it only asks for a playable media URL, so the
+                # profile still avoids probing formats for every child.
+                direct = None
+                for refresh_no in range(3):
+                    fresh = await tikwm_probe(url)
+                    if fresh:
+                        fallback_p = ProbeResult(
+                            token=uuid.uuid4().hex[:10], user_id=user_id,
+                            url=url, platform="tiktok", kind="VIDEO",
+                            tikwm=fresh, info=fresh,
+                        )
+                        state.phase = "DOWNLOAD"
+                        state.status = f"đang tải media trực tiếp • nguồn {refresh_no + 1}/3"
+                        direct = await download_tiktok_direct_fallback(
+                            event, fallback_p, item_out, state
+                        )
+                        if direct:
+                            recovered_ids.add(vid) if refresh_no else None
+                            break
+                    if refresh_no < 2:
+                        await asyncio.sleep(0.35 + random.random() * 0.35)
+
                 item_files = [
                     f for f in files_in(item_out)
                     if f.suffix.lower() in media_exts and f.stat().st_size > 0
                 ]
+
+                # Only if the direct public-media route fails do we ask yt-dlp
+                # to recover.  This keeps the fallback available without making
+                # the broken TikTok extractor the primary path.
                 if not item_files:
-                    # Keep the fallback only for BEST: a direct fallback cannot
-                    # guarantee the requested ceiling without probing the media.
-                    if requested != "best":
-                        raise RuntimeError("yt-dlp không tạo được media ở chất lượng mục tiêu")
-                    fallback_p = ProbeResult(
-                        token=uuid.uuid4().hex[:10], user_id=user_id,
-                        url=url, platform="tiktok", kind="VIDEO",
-                    )
-                    direct = await download_tiktok_direct_fallback(
-                        event, fallback_p, item_out, state
-                    )
+                    state.phase = "RECOVERY"
+                    state.status = "nguồn trực tiếp lỗi • đang phục hồi"
+                    recovery_selector = selector
+                    try:
+                        await download_ytdlp_resilient(
+                            url, item_out, recovery_selector, state, "tiktok"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "TikTok profile direct+yt-dlp recovery failed id=%s: %s",
+                            vid, exc,
+                        )
                     item_files = [
                         f for f in files_in(item_out)
                         if f.suffix.lower() in media_exts and f.stat().st_size > 0
                     ]
-                    if not direct or not item_files:
-                        raise RuntimeError("Không tạo được file media")
-                    recovered_ids.add(vid)
+
+                if not item_files:
+                    raise RuntimeError("Không tạo được file media TikTok sau khi phục hồi")
 
                 for src in item_files:
                     dest = out / src.name

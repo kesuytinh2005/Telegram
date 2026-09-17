@@ -1,0 +1,11 @@
+telethon>=1.42.0
+rich>=14.0.0
+yt-dlp>=2025.01.01
+requests>=2.32.0
+aiohttp>=3.10.0
+httpx
+pydub>=0.25.1
+SpeechRecognition>=3.10.0
+ffmpeg-python>=0.2.0
+python-dotenv
+beautifulsoup4

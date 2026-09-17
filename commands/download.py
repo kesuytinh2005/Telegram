@@ -3214,7 +3214,7 @@ _GOOGLE_DRIVE_LOCK = asyncio.Lock()
 _GOOGLE_DRIVE_OAUTH = None
 
 
-def _google_drive_token_sync() -> dict[str, Any]:
+def _google_drive_token_sync(*, force_refresh: bool = False) -> dict[str, Any]:
     """Load/refresh OAuth without google-api-python-client.
 
     Supports both a local token.json and cloud-safe environment variables.
@@ -3223,8 +3223,10 @@ def _google_drive_token_sync() -> dict[str, Any]:
     short-lived and is automatically renewed when necessary.
     """
     global _GOOGLE_DRIVE_OAUTH
-    if _GOOGLE_DRIVE_OAUTH:
+    if _GOOGLE_DRIVE_OAUTH and not force_refresh:
         return _GOOGLE_DRIVE_OAUTH
+    if force_refresh:
+        _GOOGLE_DRIVE_OAUTH = None
 
     data: dict[str, Any] = {}
 
@@ -3301,8 +3303,9 @@ def _google_drive_token_sync() -> dict[str, Any]:
         except Exception:
             expires_at = 0
 
-    # A valid long-lived-enough access token can be used immediately.
-    if access_token and (not expires_at or expires_at > time.time() + 90):
+    # A valid access token can be used immediately unless the caller explicitly
+    # requested a refresh (for example after Drive returned HTTP 401).
+    if access_token and not force_refresh and (not expires_at or expires_at > time.time() + 90):
         _GOOGLE_DRIVE_OAUTH = {"access_token": access_token, "token": data}
         return _GOOGLE_DRIVE_OAUTH
 
@@ -3379,18 +3382,21 @@ def _google_drive_token_sync() -> dict[str, Any]:
     return _GOOGLE_DRIVE_OAUTH
 
 
-async def _google_drive_service():
+async def _google_drive_service(*, force_refresh: bool = False):
     """Return a lightweight Drive HTTP auth context (no googleapiclient)."""
     global _GOOGLE_DRIVE_SERVICE
-    if _GOOGLE_DRIVE_SERVICE is not None:
+    if _GOOGLE_DRIVE_SERVICE is not None and not force_refresh:
         return _GOOGLE_DRIVE_SERVICE
     async with _GOOGLE_DRIVE_LOCK:
+        if force_refresh:
+            _GOOGLE_DRIVE_SERVICE = None
+            _GOOGLE_DRIVE_OAUTH = None
         if _GOOGLE_DRIVE_SERVICE is None:
             # Personal Drive OAuth is the normal bot configuration and needs no
             # third-party Google client package.
             if (GOOGLE_DRIVE_TOKEN_FILE or GOOGLE_DRIVE_TOKEN_JSON or GOOGLE_DRIVE_TOKEN_B64
                     or GOOGLE_DRIVE_ACCESS_TOKEN or GOOGLE_DRIVE_REFRESH_TOKEN):
-                _GOOGLE_DRIVE_SERVICE = await asyncio.to_thread(_google_drive_token_sync)
+                _GOOGLE_DRIVE_SERVICE = await asyncio.to_thread(_google_drive_token_sync, force_refresh=force_refresh)
             elif GOOGLE_DRIVE_CREDENTIALS_FILE:
                 # Service-account mode still uses google-auth when explicitly
                 # configured. Keep it isolated so OAuth deployments remain
@@ -3564,7 +3570,18 @@ async def upload_zip_to_google_drive(path: Path, progress_callback=None) -> dict
     if not GOOGLE_DRIVE_ENABLED:
         raise RuntimeError("Google Drive fallback đang bị tắt")
     service = await _google_drive_service()
-    result = await asyncio.to_thread(_google_drive_upload_sync, service, path, progress_callback)
+    try:
+        result = await asyncio.to_thread(_google_drive_upload_sync, service, path, progress_callback)
+    except RuntimeError as exc:
+        # Access tokens are short-lived. If a deployment supplied a token.json
+        # whose expiry field is missing/stale, Drive may be the first component
+        # to notice and return 401. Force one OAuth refresh and retry the upload
+        # once instead of failing the whole completed ZIP.
+        if "HTTP 401" not in str(exc) and "401:" not in str(exc):
+            raise
+        logger.warning("Google Drive returned 401; refreshing OAuth token and retrying upload")
+        service = await _google_drive_service(force_refresh=True)
+        result = await asyncio.to_thread(_google_drive_upload_sync, service, path, progress_callback)
     file_id = str(result.get("id") or "").strip()
     if not file_id:
         raise RuntimeError("Google Drive không trả về file ID sau khi upload")

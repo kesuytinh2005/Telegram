@@ -3228,8 +3228,19 @@ def _google_drive_token_sync() -> dict[str, Any]:
 
     data: dict[str, Any] = {}
 
-    # 1) Cloud-safe token JSON. Accept either plain JSON or base64 JSON.
+    # 1) Cloud-safe token JSON. Accept either the dedicated JSON variables
+    # or a legacy DOWNLOAD_GOOGLE_DRIVE_TOKEN value that actually contains
+    # JSON. A common deployment mistake is pasting token.json into
+    # DOWNLOAD_GOOGLE_DRIVE_TOKEN; treating that value as a filesystem path
+    # causes OSError [Errno 36] "File name too long".
     raw_json = GOOGLE_DRIVE_TOKEN_JSON
+    legacy_token_value = GOOGLE_DRIVE_TOKEN_FILE
+    if not raw_json and legacy_token_value:
+        candidate = legacy_token_value.strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            raw_json = candidate
+            # It is JSON content, not a local path.
+            legacy_token_value = ""
     if not raw_json and GOOGLE_DRIVE_TOKEN_B64:
         try:
             import base64
@@ -3247,8 +3258,8 @@ def _google_drive_token_sync() -> dict[str, Any]:
     # 2) Local token file, only if it is actually present in this container.
     # This fixes deployments where an Android path was copied into an env var:
     # do not fail merely because /storage/emulated/0/... is absent remotely.
-    if not data and GOOGLE_DRIVE_TOKEN_FILE:
-        token_path = Path(os.path.expanduser(GOOGLE_DRIVE_TOKEN_FILE))
+    if not data and legacy_token_value:
+        token_path = Path(os.path.expanduser(legacy_token_value))
         if token_path.exists():
             try:
                 data = json.loads(token_path.read_text(encoding="utf-8"))
@@ -3299,8 +3310,8 @@ def _google_drive_token_sync() -> dict[str, Any]:
         if access_token:
             _GOOGLE_DRIVE_OAUTH = {"access_token": access_token, "token": data}
             return _GOOGLE_DRIVE_OAUTH
-        configured = bool(raw_json or GOOGLE_DRIVE_TOKEN_FILE or GOOGLE_DRIVE_ACCESS_TOKEN or GOOGLE_DRIVE_REFRESH_TOKEN)
-        if configured and GOOGLE_DRIVE_TOKEN_FILE:
+        configured = bool(raw_json or legacy_token_value or GOOGLE_DRIVE_ACCESS_TOKEN or GOOGLE_DRIVE_REFRESH_TOKEN)
+        if configured and legacy_token_value:
             raise RuntimeError(
                 "Google Drive token không tồn tại trong container. "
                 "Đường dẫn Android/Termux không dùng được trên cloud; "
@@ -3357,8 +3368,8 @@ def _google_drive_token_sync() -> dict[str, Any]:
 
     # Persist only when a real local token file exists. Never try to write an
     # Android path from a cloud container and never log the token contents.
-    if GOOGLE_DRIVE_TOKEN_FILE:
-        token_path = Path(os.path.expanduser(GOOGLE_DRIVE_TOKEN_FILE))
+    if legacy_token_value:
+        token_path = Path(os.path.expanduser(legacy_token_value))
         if token_path.exists():
             try:
                 token_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

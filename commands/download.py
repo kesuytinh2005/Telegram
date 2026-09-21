@@ -1526,7 +1526,7 @@ def smart_link_kind(url: str) -> str:
     h = host(u)
     path = urlparse(u).path.lower().rstrip("/")
 
-    if "tiktok.com" in h:
+    if "tiktok.com" in h or "v.douyin.com" in h:
         if is_tiktok_photo(u):
             return "PHOTO"
         if re.search(r"/video/[^/]+", path):
